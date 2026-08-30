@@ -5,8 +5,6 @@ Branch management is Admin-only. Managers can read their own branch (the
 sidebar and receipts show its name) but never list or modify branches.
 """
 
-from decimal import Decimal
-
 from drf_spectacular.utils import extend_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -21,6 +19,7 @@ from apps.branches.serializers import (
     BranchWriteSerializer,
 )
 from apps.common.permissions import IsAdmin
+from apps.reporting.services import patient_directory_summary, transactions_summary
 
 
 class BranchViewSet(viewsets.ModelViewSet):
@@ -110,12 +109,11 @@ class BranchViewSet(viewsets.ModelViewSet):
         return Response(BranchOverviewSerializer(self._build_overview(branch)).data)
 
     def _build_overview(self, branch: Branch) -> dict:
-        # TODO(Phase 2-3): replace with real counts/sums once Patient and
-        # Payment exist. Deliberately zero rather than fabricated, so a wrong
-        # number never reaches a screen.
+        patients = patient_directory_summary(branch_id=branch.id)
+        revenue = transactions_summary(branch_id=branch.id)
         return {
             "branch": branch,
-            "patientCount": 0,
-            "totalCollected": Decimal("0.00"),
-            "monthlyRevenue": Decimal("0.00"),
+            "patientCount": patients["total"],
+            "totalCollected": revenue["totalCollected"],
+            "monthlyRevenue": revenue["monthCollected"],
         }

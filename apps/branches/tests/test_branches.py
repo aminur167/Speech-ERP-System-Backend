@@ -352,6 +352,59 @@ class TestBranchOverview:
         assert body["totalCollected"] == "0.00"
         assert body["monthlyRevenue"] == "0.00"
 
+    @pytest.mark.money
+    def test_overview_reflects_real_patients_and_revenue(
+        self, admin_client, manager, branch, patient_factory
+    ):
+        """
+        Pins the fix for a real bug: `_build_overview` returned hardcoded
+        zeros from a Phase 1 placeholder ("TODO once Patient and Payment
+        exist") that was never wired up to the real aggregates once those
+        modules were built. Every branch's Admin overview card silently
+        showed 0 patients and ৳0 collected regardless of actual activity.
+        """
+        from decimal import Decimal
+
+        from apps.payments import services as payment_services
+
+        patient_factory()
+        patient_factory()
+        payment_services.create_payment(
+            actor=manager, branch=branch, patient=patient_factory(),
+            amount=Decimal("1500.00"), method="cash",
+        )
+
+        response = admin_client.get(
+            reverse("branches:branch-overview-detail", args=[branch.id])
+        )
+
+        body = response.json()
+        assert body["patientCount"] == 3
+        assert Decimal(body["totalCollected"]) == Decimal("1500.00")
+        assert Decimal(body["monthlyRevenue"]) == Decimal("1500.00")
+
+    @pytest.mark.isolation
+    def test_overview_does_not_leak_another_branchs_activity(
+        self, admin_client, branch, other_branch, other_manager, patient_factory
+    ):
+        from decimal import Decimal
+
+        from apps.payments import services as payment_services
+
+        payment_services.create_payment(
+            actor=other_manager, branch=other_branch,
+            patient=patient_factory(branch=other_branch),
+            amount=Decimal("9999.00"), method="cash",
+        )
+
+        response = admin_client.get(
+            reverse("branches:branch-overview-detail", args=[branch.id])
+        )
+
+        body = response.json()
+        assert body["patientCount"] == 0
+        assert Decimal(body["totalCollected"]) == Decimal("0.00")
+
 
 class TestBranchModel:
     def test_short_code_extracted_for_per_branch_sequences(self, branch):
