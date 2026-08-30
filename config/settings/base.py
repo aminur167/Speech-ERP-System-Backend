@@ -199,6 +199,15 @@ MONTHLY_BILL_DUE_DAY = env.int("MONTHLY_BILL_DUE_DAY", default=5)
 # Age below which guardian details are required on patient registration.
 PATIENT_MINOR_AGE = env.int("PATIENT_MINOR_AGE", default=18)
 
+# Online booking advance = this fraction of the service fee, always computed
+# server-side -- never trusted from the client.
+BOOKING_ADVANCE_RATIO = env.float("BOOKING_ADVANCE_RATIO", default=0.5)
+
+# Bookable hours, inclusive at both ends. Enforced server-side even though
+# the picker already constrains it in the UI.
+BOOKING_WINDOW_START_HOUR = env.int("BOOKING_WINDOW_START_HOUR", default=10)
+BOOKING_WINDOW_END_HOUR = env.int("BOOKING_WINDOW_END_HOUR", default=18)
+
 # --------------------------------------------------------------------------
 # Cloudinary (material images — docs/06-materials.md)
 # --------------------------------------------------------------------------

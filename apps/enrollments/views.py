@@ -259,17 +259,19 @@ class BookingViewSet(_EnrollmentBase):
                 {"detail": "Patient or service not found."}, status=status.HTTP_404_NOT_FOUND
             )
 
-        booking, payment = services.create_booking(
-            actor=request.user,
-            branch=branch,
-            patient=patient,
-            service=service,
-            booking_date=data["date"],
-            booking_time=data["time"],
-            advance_amount=data["advanceAmount"],
-            method=data["method"],
-            idempotency_key=data.get("idempotencyKey") or None,
-        )
+        try:
+            booking, payment = services.create_booking(
+                actor=request.user,
+                branch=branch,
+                patient=patient,
+                service=service,
+                booking_date=data["date"],
+                booking_time=data["time"],
+                method=data["method"],
+                idempotency_key=data.get("idempotencyKey") or None,
+            )
+        except services.EnrollmentError as exc:
+            return _error(exc)
 
         return Response(
             {

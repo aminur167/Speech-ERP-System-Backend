@@ -16,6 +16,7 @@ The rules that matter most here, all confirmed in docs/05:
 from datetime import date
 from decimal import ROUND_DOWN, Decimal
 
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
@@ -402,15 +403,61 @@ def generate_due_bills(*, up_to: date | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _validate_booking_slot(booking_date: date, booking_time: str) -> None:
+    """
+    Re-validate the date and time server-side.
+
+    The picker already constrains both in the UI, but that is a convenience,
+    not a control -- a direct API call bypasses it entirely.
+    """
+    if booking_date < timezone.localdate():
+        raise EnrollmentError("Bookings cannot be made for a past date.", code="past_date")
+
+    try:
+        hour_str, minute_str = booking_time.split(":")
+        hour, minute = int(hour_str), int(minute_str)
+        if not (0 <= hour < 24 and 0 <= minute < 60):
+            raise ValueError
+    except (ValueError, AttributeError):
+        raise EnrollmentError(
+            f'"{booking_time}" is not a valid time.', code="invalid_time"
+        ) from None
+
+    minutes_of_day = hour * 60 + minute
+    window_start = settings.BOOKING_WINDOW_START_HOUR * 60
+    window_end = settings.BOOKING_WINDOW_END_HOUR * 60
+    if not (window_start <= minutes_of_day <= window_end):
+        raise EnrollmentError(
+            f"Bookings are only available between "
+            f"{settings.BOOKING_WINDOW_START_HOUR:02d}:00 and "
+            f"{settings.BOOKING_WINDOW_END_HOUR:02d}:00.",
+            code="outside_booking_window",
+        )
+
+
 @transaction.atomic
 def create_booking(
     *, actor, branch, patient, service, booking_date, booking_time,
-    advance_amount, method: str, idempotency_key: str | None = None,
+    method: str, idempotency_key: str | None = None,
 ):
-    """Book an online session and take the advance in one transaction."""
+    """
+    Book an online session and take the advance in one transaction.
+
+    The advance is always `BOOKING_ADVANCE_RATIO` of the service fee,
+    computed here and never accepted from the client -- the same reason
+    material-sale pricing is server-side (docs/06). A tampered or stale
+    client-supplied amount could otherwise undercharge, or overcharge, a
+    patient at the moment of booking.
+    """
+    _validate_booking_slot(booking_date, booking_time)
+
     year = timezone.localdate().year
     value = next_value(f"booking:{branch.code}", year)
     code = f"BKG-{branch.short_code}-{year}-{str(value).zfill(5)}"
+
+    advance_amount = (
+        service.fee * Decimal(str(settings.BOOKING_ADVANCE_RATIO))
+    ).quantize(Decimal("0.01"))
 
     booking = Booking.objects.create(
         booking_code=code,

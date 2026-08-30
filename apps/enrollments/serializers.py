@@ -136,10 +136,15 @@ class BookingSerializer(serializers.ModelSerializer):
 
 
 class BookingCreateSerializer(serializers.Serializer):
+    """
+    Deliberately no `advanceAmount` field -- see the module docstring on
+    `create_booking`. The server computes it from the service fee; there is
+    nothing here for a client to tamper with.
+    """
+
     patient = serializers.IntegerField()
     service = serializers.IntegerField()
     date = serializers.DateField()
     time = serializers.CharField(max_length=16)
-    advanceAmount = serializers.DecimalField(max_digits=12, decimal_places=2)
     method = serializers.ChoiceField(choices=PaymentMethod.choices)
     idempotencyKey = serializers.CharField(required=False, allow_blank=True, max_length=64)
