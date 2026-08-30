@@ -49,7 +49,7 @@ class PaymentCreateSerializer(serializers.Serializer):
     authenticated user, never the request body.
     """
 
-    patient = serializers.UUIDField()
+    patient = serializers.IntegerField()
     amount = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=MIN_AMOUNT)
     method = serializers.ChoiceField(choices=PaymentMethod.choices)
     category = serializers.CharField(required=False, allow_blank=True)
@@ -71,7 +71,7 @@ class VoidSerializer(serializers.Serializer):
 
 
 class RefundItemSerializer(serializers.Serializer):
-    material = serializers.UUIDField()
+    material = serializers.IntegerField()
     quantity = serializers.IntegerField(min_value=1)
 
 

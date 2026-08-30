@@ -36,8 +36,14 @@ class PaymentViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
     http_method_names = ["get", "post", "head", "options"]  # never PUT/DELETE money
 
     def get_permissions(self):
-        if self.action in {"create", "void", "request_refund"}:
-            return [IsAuthenticated()]
+        # Collecting a payment and opening a refund request are branch-desk
+        # actions -- Admin can see every payment but doesn't transact on a
+        # branch's behalf (docs/04, docs/07). Void is different: Manager may
+        # void same-day only, Admin may void any day (docs/04) -- both roles
+        # reach the endpoint and void_payment() enforces the day cutoff
+        # itself. Approve/reject a refund carries its own IsAdmin via @action.
+        if self.action in {"create", "request_refund"}:
+            return [IsManager()]
         return [IsAuthenticated()]
 
     def create(self, request, *args, **kwargs):

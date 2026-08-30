@@ -24,13 +24,19 @@ def day_summary(*, branch, day: date | None = None) -> dict:
     """
     What the manager reconciles against, plus what moved money against them.
 
-    `total` counts only `paid`, matching the revenue rule in reporting — the
-    closing screen and the reports must never disagree.
+    `total` is cash-drawer reconciliation, not accrual revenue: it counts only
+    `paid` payments, excluding refunded/partial/void, because a payment taken
+    and then refunded put no net cash in the drawer. This is a different
+    question from reporting's period revenue (docs/10), which keeps a
+    refunded payment in the month it was collected and books the refund
+    separately by approval date — the two are expected to diverge on any day
+    that had a refund, and agree on any day that didn't.
 
-    But excluding refunds silently isn't enough: if ৳3,000 was refunded today,
-    the drawer is short by that much and the manager needs to know why. So the
-    day's refunds and voids come back itemised alongside. Reconcile against one
-    clean number; show every event that moved money.
+    Refunds and voids don't vanish from the manager's view just because
+    they're excluded from the reconciliation figure: if ৳3,000 was refunded
+    today, the drawer is short by that much and the manager needs to know
+    why. So the day's refunds and voids come back itemised alongside.
+    Reconcile against one clean number; show every event that moved money.
 
     Deliberately *not* auto-adjusting the expected cash for refunds: a cash
     refund reduces the drawer, a bKash one doesn't, and encoding a guess about

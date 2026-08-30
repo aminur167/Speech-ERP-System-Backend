@@ -5,14 +5,18 @@ Branch scoping comes from BranchScopedQuerySetMixin, which also covers the
 detail route — so a manager guessing another branch's patient id gets a 404
 rather than a leaked record.
 
-The Patient Directory endpoint is specified in docs/02-patients.md but depends
-on enrollments and payments, so it lands in Phase 5 (see ROADMAP). Building it
-against models that don't exist yet would mean guessing at the joins.
+The Patient Directory is the heavy read here: a denormalized listing joining
+enrollments, plans and payments. Its assembly lives in `directory.py`, which
+explains why it is built the way it is.
 """
+
+from datetime import datetime
 
 from django.db.models import Q
 from rest_framework import status, viewsets
+from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
@@ -20,13 +24,19 @@ from apps.branches.models import Branch
 from apps.common.mixins import BranchScopedQuerySetMixin
 from apps.common.permissions import IsManager
 from apps.common.validators import normalize_phone
-from apps.patients import services
+from apps.enrollments.models import EnrollmentStatus
+from apps.enrollments.serializers import (
+    InstallmentPlanSerializer,
+    MonthlyEnrollmentSerializer,
+)
+from apps.patients import directory, services
 from apps.patients.models import Patient
 from apps.patients.serializers import (
     PatientListSerializer,
     PatientSerializer,
     PatientWriteSerializer,
 )
+from apps.reporting.services import patient_directory_summary
 
 
 class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
@@ -83,6 +93,83 @@ class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
 
         return lookup
 
+    @action(detail=False, methods=["get"])
+    def directory(self, request):
+        """
+        GET /api/patients/directory/
+
+        The page is sliced before the joins happen — denormalizing the whole
+        table to render ten rows would defeat the point of paginating.
+        """
+        queryset = directory.filter_queryset(
+            self.get_queryset(), request.query_params
+        ).order_by("-created_at")
+
+        paginator = PageNumberPagination()
+        paginator.page_size = int(request.query_params.get("pageSize", 10) or 10)
+        page = paginator.paginate_queryset(queryset, request)
+
+        return paginator.get_paginated_response(directory.build_rows(list(page)))
+
+    @action(detail=False, methods=["get"], url_path="directory/summary")
+    def directory_summary(self, request):
+        """
+        Care-status counts for the dashboard cards.
+
+        `date` scopes `intake` to that date's month rather than the current
+        one — the dashboard's date picker needs a past month to report that
+        month's intake, not today's.
+        """
+        branch_id = (
+            request.user.branch_id
+            if request.user.is_manager
+            else request.query_params.get("branch") or None
+        )
+        return Response(
+            patient_directory_summary(
+                branch_id=branch_id,
+                as_of=_parse_date(request.query_params.get("date")),
+            )
+        )
+
+    @action(detail=True, methods=["get"], url_path="active-services")
+    def active_services(self, request, pk=None):
+        """
+        Every active service the patient holds, newest first.
+
+        A list rather than one-of-each: a patient can be in monthly therapy
+        and paying off an installment package at the same time, and the
+        profile screen has to show both.
+        """
+        patient = self.get_object()
+
+        items = [
+            {
+                "type": "monthly",
+                "id": str(enrollment.id),
+                "serviceName": enrollment.service.name,
+                "createdAt": enrollment.created_at,
+                "enrollment": MonthlyEnrollmentSerializer(enrollment).data,
+            }
+            for enrollment in patient.monthly_enrollments.filter(
+                status=EnrollmentStatus.ACTIVE
+            ).select_related("service").prefetch_related("bills")
+        ] + [
+            {
+                "type": "installment",
+                "id": str(plan.id),
+                "serviceName": plan.service.name,
+                "createdAt": plan.created_at,
+                "plan": InstallmentPlanSerializer(plan).data,
+            }
+            for plan in patient.installment_plans.filter(
+                status=EnrollmentStatus.ACTIVE
+            ).select_related("service").prefetch_related("installments")
+        ]
+
+        items.sort(key=lambda item: item["createdAt"], reverse=True)
+        return Response(items)
+
     def create(self, request, *args, **kwargs):
         serializer = PatientWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -115,3 +202,12 @@ class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         patient = self.get_object()
         patient.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+def _parse_date(value):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None

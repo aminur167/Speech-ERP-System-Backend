@@ -40,14 +40,26 @@ class ServiceViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """
-        Inactive services are hidden by default.
+        Inactive services are hidden from the listing by default.
 
-        The enrollment wizards call this endpoint to populate their pickers, so
-        a retired package must not appear there. The Admin catalog opts back in
-        with ?includeInactive=true — and only Admin, since a manager has no
-        reason to see retired packages.
+        The enrollment wizards call GET /services/ to populate their pickers,
+        so a retired package must not appear there. The Admin catalog opts
+        back in with ?includeInactive=true — and only Admin, since a manager
+        has no reason to see retired packages.
+
+        This filter applies to `list` only. A deactivated service must stay
+        directly reachable by id -- retrieve, update, destroy, and above all
+        `activate` all call get_object(), which builds on this same queryset;
+        filtering it everywhere would make reactivating a service permanently
+        impossible; the moment `deactivate` succeeded, the object would drop
+        out of its own lookup queryset and `activate` could never find it
+        again. docs/03 is explicit that a deactivated service "is still
+        visible in the Admin catalog... so it can be reactivated."
         """
         queryset = super().get_queryset()
+
+        if self.action != "list":
+            return queryset
 
         include_inactive = (
             self.request.query_params.get("includeInactive", "").lower() == "true"

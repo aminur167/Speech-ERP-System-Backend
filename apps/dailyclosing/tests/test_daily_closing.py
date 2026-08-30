@@ -263,27 +263,28 @@ class TestAdjustments:
         adjustments = manager_client.get(SUMMARY_URL).json()["adjustments"]
         assert adjustments["items"] == []
 
-    def test_closing_system_total_matches_the_transactions_summary(
-        self, manager_client, manager, admin_user, pay
+    def test_closing_system_total_matches_the_transactions_summary_on_a_clean_day(
+        self, manager_client, pay
     ):
         """
-        Two screens, one number. If the revenue rule ever diverges between
-        them, the clinic gets two different answers for the same day and
-        stops trusting both.
+        Two screens, one number -- on a day with nothing to reconcile away.
+
+        The two totals answer different questions in general: closing is cash
+        in the drawer (excludes a same-day refund entirely, since no net cash
+        arrived), reporting is period revenue (keeps that same payment in its
+        collection month and books the refund separately by approval date).
+        They are only guaranteed to agree when there is no refund or void to
+        tell them apart, which is exactly what this test seeds.
         """
         pay("1000.00")
         pay("2500.00", method="bkash")
-        refunded = pay("3000.00")
-        refund_fully(refunded, requester=manager, approver=admin_user, reason="cancelled")
-        voided = pay("400.00")
-        payment_services.void_payment(actor=manager, payment=voided, reason="duplicate")
 
         closing_total = Decimal(manager_client.get(SUMMARY_URL).json()["total"])
         reporting_total = Decimal(
             manager_client.get(reverse("reporting:summary")).json()["todayCollected"]
         )
 
-        assert closing_total == reporting_total
+        assert closing_total == reporting_total == Decimal("3500.00")
 
 
 @pytest.mark.money

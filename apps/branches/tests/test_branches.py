@@ -128,7 +128,7 @@ class TestBranchCreation:
 
 
 class TestBranchUpdate:
-    def test_admin_updates_branch_details(self, admin_client, branch):
+    def test_admin_updates_branch_details(self, admin_client, branch, manager):
         payload = branch_payload(
             name="Dhaka Main Branch (Renamed)",
             code=branch.code,
@@ -248,7 +248,7 @@ class TestBranchPermissions:
         assert response.status_code == 200
         results = response.json()["results"]
         assert len(results) == 1
-        assert results[0]["id"] == str(branch.id)
+        assert results[0]["id"] == branch.id
 
     @pytest.mark.isolation
     def test_manager_cannot_retrieve_another_branch_by_id(
@@ -323,7 +323,7 @@ class TestBranchOverview:
         )
 
         assert response.status_code == 200
-        assert response.json()["branch"]["id"] == str(branch.id)
+        assert response.json()["branch"]["id"] == branch.id
 
     @pytest.mark.isolation
     def test_manager_denied_overview(self, manager_client):

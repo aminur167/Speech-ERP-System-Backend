@@ -548,7 +548,7 @@ class TestFilters:
         ).json()
 
         assert body["count"] == 1
-        assert body["results"][0]["id"] == str(old.pk)
+        assert body["results"][0]["id"] == old.pk
 
 
 class TestValidationAndCodes:

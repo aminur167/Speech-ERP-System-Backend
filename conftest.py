@@ -197,13 +197,26 @@ def _authenticate(client: APIClient, user: User) -> APIClient:
 
 
 @pytest.fixture
-def admin_client(api_client, admin_user):
-    return _authenticate(api_client, admin_user)
+def admin_client(admin_user):
+    """
+    Its own APIClient instance, not the shared `api_client` fixture.
+
+    A test that requests both `admin_client` and `manager_client` would
+    otherwise get the *same* underlying APIClient() back for both names
+    (pytest caches one instance of `api_client` per test) — whichever
+    fixture's _authenticate() ran second would silently overwrite the other's
+    Authorization header, so "the manager's client" would actually be
+    authenticated as the admin. That produced real false negatives here: a
+    manager-only action would appear to succeed for admin_client, not because
+    the permission was wrong but because the request went out with the wrong
+    token.
+    """
+    return _authenticate(APIClient(), admin_user)
 
 
 @pytest.fixture
-def manager_client(api_client, manager):
-    return _authenticate(api_client, manager)
+def manager_client(manager):
+    return _authenticate(APIClient(), manager)
 
 
 @pytest.fixture

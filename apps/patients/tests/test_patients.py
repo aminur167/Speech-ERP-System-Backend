@@ -176,7 +176,17 @@ class TestPatientCreation:
 
 @pytest.mark.slow
 @pytest.mark.money
+@pytest.mark.django_db(transaction=True)
 class TestPatientCodeConcurrency:
+    """
+    transaction=True, overriding the module-level default: worker threads use
+    their own DB connections, which can only see committed rows. Under the
+    normal per-test atomic wrapper, `branch` and `manager` exist only inside
+    the outer test's uncommitted transaction and are invisible to those
+    threads -- every worker fails with a foreign-key violation before the
+    concurrency behaviour this test exists to check ever runs.
+    """
+
     def test_concurrent_registrations_get_unique_codes(self, branch, manager, django_db_blocker):
         """
         The mock's in-memory counter passes every sequential test and still

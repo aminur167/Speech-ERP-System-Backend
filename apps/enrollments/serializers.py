@@ -99,13 +99,13 @@ class InstallmentPlanSerializer(serializers.ModelSerializer):
 
 
 class MonthlyEnrollmentCreateSerializer(serializers.Serializer):
-    patient = serializers.UUIDField()
-    service = serializers.UUIDField()
+    patient = serializers.IntegerField()
+    service = serializers.IntegerField()
 
 
 class InstallmentPlanCreateSerializer(serializers.Serializer):
-    patient = serializers.UUIDField()
-    service = serializers.UUIDField()
+    patient = serializers.IntegerField()
+    service = serializers.IntegerField()
     numberOfInstallments = serializers.IntegerField(min_value=2, max_value=12)
 
 
@@ -136,8 +136,8 @@ class BookingSerializer(serializers.ModelSerializer):
 
 
 class BookingCreateSerializer(serializers.Serializer):
-    patient = serializers.UUIDField()
-    service = serializers.UUIDField()
+    patient = serializers.IntegerField()
+    service = serializers.IntegerField()
     date = serializers.DateField()
     time = serializers.CharField(max_length=16)
     advanceAmount = serializers.DecimalField(max_digits=12, decimal_places=2)

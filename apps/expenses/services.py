@@ -81,6 +81,12 @@ def review_expense(*, actor, expense: Expense, approve: bool, review_note: str =
     was_reviewed = expense.status != Expense.Status.PENDING
     new_status = Expense.Status.APPROVED if approve else Expense.Status.REJECTED
 
+    # Checked first, ahead of the reason requirements below: re-approving an
+    # already-approved expense isn't a reversal at all, so demanding a reason
+    # for a change that isn't happening would be confusing rather than safe.
+    if expense.status == new_status:
+        raise ExpenseError(f"This expense is already {new_status}.", code="no_change")
+
     if not approve and not review_note.strip():
         raise ExpenseError(
             "A reason is required when rejecting an expense.", code="note_required"
@@ -91,9 +97,6 @@ def review_expense(*, actor, expense: Expense, approve: bool, review_note: str =
             "A reason is required when changing a decision that was already made.",
             code="note_required",
         )
-
-    if expense.status == new_status:
-        raise ExpenseError(f"This expense is already {new_status}.", code="no_change")
 
     previous = expense.status
     expense.status = new_status

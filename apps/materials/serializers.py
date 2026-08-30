@@ -100,12 +100,12 @@ class AdjustStockSerializer(serializers.Serializer):
 class SaleItemSerializer(serializers.Serializer):
     """Deliberately no price field — see the module docstring."""
 
-    material = serializers.UUIDField()
+    material = serializers.IntegerField()
     quantity = serializers.IntegerField(min_value=1)
 
 
 class SellMaterialsSerializer(serializers.Serializer):
-    patient = serializers.UUIDField()
+    patient = serializers.IntegerField()
     items = SaleItemSerializer(many=True)
     method = serializers.ChoiceField(choices=PaymentMethod.choices)
     idempotencyKey = serializers.CharField(required=False, allow_blank=True, max_length=64)

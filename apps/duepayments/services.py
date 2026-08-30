@@ -45,6 +45,27 @@ def _was_outstanding_at(payable, cutoff) -> bool:
     return payable.paid_at > cutoff
 
 
+def _outstanding_at(payable, cutoff) -> Decimal:
+    """
+    What was still owed as of `cutoff`, for an item `_was_outstanding_at`
+    already confirmed was unpaid then.
+
+    `amount_paid` is current state, not history: if the payment landed after
+    `cutoff`, nothing had been paid toward this item yet as of that date, so
+    the full original amount was owed -- not `amount - amount_paid`, which
+    would use tomorrow's paid-in-full figure to answer a question about
+    yesterday and silently report the item as already settled.
+
+    A payment that happened at or before `cutoff` did contribute, so its
+    current `amount_paid` correctly stood at that point too (nothing since
+    then can have reduced it without also clearing `paid_at`, which would
+    have made `_was_outstanding_at` true for a different reason).
+    """
+    if payable.paid_at is not None and payable.paid_at > cutoff:
+        return payable.amount
+    return payable.amount - payable.amount_paid
+
+
 def collect_due_items(*, branch_id=None, as_of: date | None = None) -> list[dict]:
     """
     Every currently-payable item, one per enrollment/plan.
@@ -175,14 +196,19 @@ def due_summary(*, branch_id=None, as_of: date | None = None) -> dict:
     for bill in bills:
         if bill.enrollment_id in seen:
             continue
-        # A bill that hadn't been issued yet on the target date can't have
-        # been owed then.
-        if bill.due_date.replace(day=1) > as_of.replace(day=1):
+        # All of an enrollment's bills are created together, upfront
+        # (create_monthly_enrollment bulk_creates months_ahead of them, most
+        # with status "upcoming"), not lazily as each month arrives. So a
+        # bill's due_date being in a future month says nothing about whether
+        # the row existed yet -- it already does. What decides existence is
+        # when the enrollment itself was created; mirrors the installment
+        # loop's `plan.created_at` check below for the same reason.
+        if bill.enrollment.created_at > cutoff:
             continue
         if not _was_outstanding_at(bill, cutoff):
             continue
         seen.add(bill.enrollment_id)
-        monthly_total += bill.amount - bill.amount_paid
+        monthly_total += _outstanding_at(bill, cutoff)
 
     installment_total = Decimal("0.00")
     installments = (
@@ -202,7 +228,7 @@ def due_summary(*, branch_id=None, as_of: date | None = None) -> dict:
         if not _was_outstanding_at(installment, cutoff):
             continue
         seen_plans.add(installment.plan_id)
-        installment_total += installment.amount - installment.amount_paid
+        installment_total += _outstanding_at(installment, cutoff)
 
     return {
         "totalDue": monthly_total + installment_total,

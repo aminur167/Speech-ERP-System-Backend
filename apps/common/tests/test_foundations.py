@@ -106,6 +106,15 @@ class TestCodeSequenceConcurrency:
     """
 
     def test_concurrent_callers_never_get_the_same_number(self, django_db_blocker):
+        # A fresh scope per run, not a fixed name: this test commits real rows
+        # (real threads need committed visibility for select_for_update to mean
+        # anything), so under --reuse-db a fixed scope like "concurrent"/2026
+        # would carry a counter forward from the previous run and the fixed
+        # "starts at 1" assertion below would fail for reasons that have
+        # nothing to do with concurrency.
+        import uuid
+
+        scope = f"concurrent-{uuid.uuid4()}"
         results = []
         errors = []
         worker_count = 10
@@ -114,7 +123,7 @@ class TestCodeSequenceConcurrency:
             try:
                 with django_db_blocker.unblock():
                     with transaction.atomic():
-                        results.append(next_value("concurrent", 2026))
+                        results.append(next_value(scope, 2026))
             except Exception as exc:  # surfaced below rather than swallowed
                 errors.append(exc)
             finally:

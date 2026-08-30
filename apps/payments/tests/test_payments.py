@@ -211,7 +211,16 @@ class TestIdempotency:
 
 @pytest.mark.slow
 @pytest.mark.money
+@pytest.mark.django_db(transaction=True)
 class TestConcurrentReceiptNumbers:
+    """
+    transaction=True: worker threads open their own DB connections, which can
+    only see committed rows. Under the default atomic-per-test wrapper,
+    `manager`/`branch`/the patients from `patient_factory` exist only inside
+    the outer test's uncommitted transaction, so every worker would fail on a
+    foreign-key violation before the row-locking behaviour under test ever runs.
+    """
+
     def test_concurrent_payments_never_share_a_receipt_number(
         self, manager, branch, patient_factory, django_db_blocker
     ):

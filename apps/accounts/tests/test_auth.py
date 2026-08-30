@@ -157,13 +157,23 @@ class TestLoginThrottling:
     """
 
     @pytest.fixture(autouse=True)
-    def enable_throttle(self, settings):
+    def enable_throttle(self, settings, monkeypatch):
         settings.REST_FRAMEWORK = {
             **settings.REST_FRAMEWORK,
             "DEFAULT_THROTTLE_RATES": {"login": "5/min"},
         }
-        # Rates are read at class construction; clear any cached throttle
-        # history so counts start from zero for this test.
+        # DRF reads DEFAULT_THROTTLE_RATES exactly once, into a plain class
+        # attribute, the first time rest_framework.throttling is imported —
+        # not a live setting. Whichever test in the suite happens to import
+        # it first freezes that value for the rest of the process, so the
+        # settings override above only works if nothing already triggered
+        # that import (e.g. by resolving a URL) using the disabled test-suite
+        # default. Patch the class attribute directly so this test doesn't
+        # depend on being the first to touch it.
+        from rest_framework.throttling import ScopedRateThrottle
+
+        monkeypatch.setattr(ScopedRateThrottle, "THROTTLE_RATES", {"login": "5/min"})
+
         from django.core.cache import cache
 
         cache.clear()

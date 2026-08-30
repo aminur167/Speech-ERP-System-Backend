@@ -155,6 +155,20 @@ class TestHistoricalReconstruction:
     def test_a_bill_paid_today_still_counts_as_outstanding_yesterday(
         self, manager, branch, enrollment
     ):
+        """
+        Backdate the enrollment itself, not just the payment: a bill's row
+        can only have been outstanding "yesterday" if it already existed
+        then. Without this the enrollment (created moments ago by the
+        `enrollment` fixture) genuinely didn't exist as of yesterday, and the
+        correct answer would be zero for a reason unrelated to what this test
+        is checking.
+        """
+        from apps.enrollments.models import MonthlyEnrollment
+
+        MonthlyEnrollment.objects.filter(pk=enrollment.pk).update(
+            created_at=timezone.now() - timedelta(days=30)
+        )
+
         enrollment_services.collect_bill_payment(
             actor=manager, branch=branch,
             bill=enrollment.oldest_unpaid_bill(), method="cash",
@@ -163,7 +177,7 @@ class TestHistoricalReconstruction:
         yesterday = timezone.localdate() - timedelta(days=1)
         historical = due_services.due_summary(branch_id=branch.id, as_of=yesterday)
 
-        assert historical["totalDue"] > Decimal("0.00")
+        assert historical["totalDue"] == Decimal("5000.00")
 
     def test_a_bill_paid_this_afternoon_is_not_outstanding_today(
         self, manager, branch, enrollment
