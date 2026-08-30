@@ -22,7 +22,7 @@ from apps.common.models import AuditLog
 from apps.dailyclosing import services
 from apps.dailyclosing.models import DailyClosing
 from apps.payments import services as payment_services
-from apps.payments.models import Payment, PaymentStatus
+from apps.payments.models import Payment, PaymentStatus, RefundRequest
 
 pytestmark = pytest.mark.django_db
 
@@ -62,6 +62,24 @@ def move_to(payment, when):
     Payment.all_objects.filter(pk=payment.pk).update(created_at=when)
     payment.refresh_from_db()
     return payment
+
+
+def refund_fully(payment, *, requester, approver, reason="Session cancelled"):
+    """
+    Put a payment through the full two-step refund control.
+
+    A refund is never a single call by design — a manager requests, an admin
+    approves — so tests that need a refunded payment have to go through both
+    steps rather than flipping the status directly.
+    """
+    request = payment_services.request_refund(
+        actor=requester, payment=payment, amount=payment.amount, reason=reason
+    )
+    payment_services.approve_refund(
+        actor=approver, request=request, bill_action=RefundRequest.BillAction.REOPEN
+    )
+    payment.refresh_from_db()
+    return request
 
 
 @pytest.mark.money
@@ -168,10 +186,7 @@ class TestAdjustments:
     ):
         pay("1000.00")
         refunded = pay("3000.00")
-        payment_services.request_refund(
-            actor=manager, payment=refunded, reason="Session cancelled"
-        )
-        payment_services.approve_refund(actor=admin_user, payment=refunded)
+        refund_fully(refunded, requester=manager, approver=admin_user, reason="Session cancelled")
 
         body = manager_client.get(SUMMARY_URL).json()
 
@@ -182,8 +197,7 @@ class TestAdjustments:
         self, manager_client, manager, admin_user, pay
     ):
         refunded = pay("3000.00", method="bkash")
-        payment_services.request_refund(actor=manager, payment=refunded, reason="cancelled")
-        payment_services.approve_refund(actor=admin_user, payment=refunded)
+        refund_fully(refunded, requester=manager, approver=admin_user, reason="cancelled")
 
         body = manager_client.get(SUMMARY_URL).json()
         assert all(row["method"] != "bkash" for row in body["byMethod"])
@@ -205,8 +219,7 @@ class TestAdjustments:
         voided = pay("500.00")
         payment_services.void_payment(actor=manager, payment=voided, reason="Wrong patient")
         refunded = pay("3000.00", method="bkash")
-        payment_services.request_refund(actor=manager, payment=refunded, reason="cancelled")
-        payment_services.approve_refund(actor=admin_user, payment=refunded)
+        refund_fully(refunded, requester=manager, approver=admin_user, reason="cancelled")
 
         items = manager_client.get(SUMMARY_URL).json()["adjustments"]["items"]
         by_receipt = {item["receiptNumber"]: item for item in items}
@@ -224,8 +237,7 @@ class TestAdjustments:
         voided = pay("500.00")
         payment_services.void_payment(actor=manager, payment=voided, reason="wrong")
         refunded = pay("3000.00")
-        payment_services.request_refund(actor=manager, payment=refunded, reason="cancelled")
-        payment_services.approve_refund(actor=admin_user, payment=refunded)
+        refund_fully(refunded, requester=manager, approver=admin_user, reason="cancelled")
 
         adjustments = manager_client.get(SUMMARY_URL).json()["adjustments"]
 
@@ -262,8 +274,7 @@ class TestAdjustments:
         pay("1000.00")
         pay("2500.00", method="bkash")
         refunded = pay("3000.00")
-        payment_services.request_refund(actor=manager, payment=refunded, reason="cancelled")
-        payment_services.approve_refund(actor=admin_user, payment=refunded)
+        refund_fully(refunded, requester=manager, approver=admin_user, reason="cancelled")
         voided = pay("400.00")
         payment_services.void_payment(actor=manager, payment=voided, reason="duplicate")
 
