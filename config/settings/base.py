@@ -1,0 +1,223 @@
+"""
+Settings shared by every environment.
+
+Environment-specific modules (development / production / test) import * from
+here and override. Nothing here may assume a particular environment — anything
+that differs between local and production belongs in those modules or in .env.
+"""
+
+from datetime import timedelta
+from pathlib import Path
+
+import environ
+
+# config/settings/base.py -> config/settings -> config -> project root
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
+env = environ.Env(
+    DJANGO_DEBUG=(bool, False),
+    DJANGO_ALLOWED_HOSTS=(list, []),
+    CORS_ALLOWED_ORIGINS=(list, []),
+)
+
+# Read .env if present. Absent in CI/production, where real env vars are used.
+env_file = BASE_DIR / ".env"
+if env_file.exists():
+    environ.Env.read_env(str(env_file))
+
+SECRET_KEY = env("DJANGO_SECRET_KEY", default="insecure-dev-key-override-in-env")
+DEBUG = env("DJANGO_DEBUG")
+ALLOWED_HOSTS = env("DJANGO_ALLOWED_HOSTS")
+
+# --------------------------------------------------------------------------
+# Applications
+# --------------------------------------------------------------------------
+
+DJANGO_APPS = [
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+]
+
+THIRD_PARTY_APPS = [
+    "rest_framework",
+    "corsheaders",
+    "django_filters",
+]
+
+LOCAL_APPS = [
+    "apps.common",
+    "apps.accounts",
+    "apps.branches",
+]
+
+INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
+
+MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware",
+    "django.middleware.security.SecurityMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
+]
+
+ROOT_URLCONF = "config.urls"
+
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
+            ],
+        },
+    },
+]
+
+WSGI_APPLICATION = "config.wsgi.application"
+
+# --------------------------------------------------------------------------
+# Database
+# --------------------------------------------------------------------------
+# PostgreSQL only. The money logic depends on real row-level locking
+# (select_for_update) and sequences; SQLite silently no-ops the former, which
+# would give false confidence in the concurrency tests.
+
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": env("POSTGRES_DB", default="speech_erp"),
+        "USER": env("POSTGRES_USER", default="postgres"),
+        "PASSWORD": env("POSTGRES_PASSWORD", default=""),
+        "HOST": env("POSTGRES_HOST", default="localhost"),
+        "PORT": env("POSTGRES_PORT", default="5432"),
+        "ATOMIC_REQUESTS": False,  # transactions are declared explicitly where needed
+    }
+}
+
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+AUTH_USER_MODEL = "accounts.User"
+
+AUTH_PASSWORD_VALIDATORS = [
+    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+]
+
+# --------------------------------------------------------------------------
+# Internationalization
+# --------------------------------------------------------------------------
+# Asia/Dhaka is deliberate and load-bearing: "today's collection", daily
+# closing, the 5th-of-month due date, and every date-filtered report are
+# computed against this zone. Storing UTC with USE_TZ keeps history correct
+# while day boundaries follow the clinic's actual working day.
+
+LANGUAGE_CODE = "en-us"
+TIME_ZONE = "Asia/Dhaka"
+USE_I18N = True
+USE_TZ = True
+
+STATIC_URL = "static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+
+# --------------------------------------------------------------------------
+# REST framework
+# --------------------------------------------------------------------------
+# Defaults chosen to match what the frontend already expects (see
+# docs/00-OVERVIEW.md): DRF's standard pagination envelope
+# {count, next, previous, results} and its standard error shapes.
+
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": (
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ),
+    "DEFAULT_PERMISSION_CLASSES": (
+        "rest_framework.permissions.IsAuthenticated",
+    ),
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 10,
+    "DEFAULT_FILTER_BACKENDS": (
+        "django_filters.rest_framework.DjangoFilterBackend",
+        "rest_framework.filters.SearchFilter",
+        "rest_framework.filters.OrderingFilter",
+    ),
+    "DEFAULT_THROTTLE_RATES": {
+        # Brute-force protection on login (docs/01-auth-and-branches.md).
+        "login": "10/min",
+    },
+    "TEST_REQUEST_DEFAULT_FORMAT": "json",
+}
+
+# Short-lived access tokens with refresh rotation and blacklisting, so a stolen
+# access token has a small window and a rotated refresh token can't be replayed.
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+    "UPDATE_LAST_LOGIN": True,
+    "USER_ID_FIELD": "id",
+    "USER_ID_CLAIM": "user_id",
+}
+
+CORS_ALLOWED_ORIGINS = env("CORS_ALLOWED_ORIGINS")
+CORS_ALLOW_CREDENTIALS = True
+
+# --------------------------------------------------------------------------
+# Business rules
+# --------------------------------------------------------------------------
+# Configurable rather than hardcoded — a clinic will eventually want to change
+# these, and a code deploy for that is poor design over a 10-year life.
+
+# Expenses at or above this amount need Admin approval; below, auto-approved.
+EXPENSE_AUTO_APPROVE_THRESHOLD = env.int("EXPENSE_AUTO_APPROVE_THRESHOLD", default=5000)
+
+# Day of month a monthly bill falls due.
+MONTHLY_BILL_DUE_DAY = env.int("MONTHLY_BILL_DUE_DAY", default=5)
+
+# Age below which guardian details are required on patient registration.
+PATIENT_MINOR_AGE = env.int("PATIENT_MINOR_AGE", default=18)
+
+# --------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "verbose": {
+            "format": "{levelname} {asctime} {name} {message}",
+            "style": "{",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "verbose",
+        },
+    },
+    "root": {
+        "handlers": ["console"],
+        "level": "INFO",
+    },
+    "loggers": {
+        "django.db.backends": {
+            "handlers": ["console"],
+            "level": "WARNING",  # raise to DEBUG locally to inspect SQL
+            "propagate": False,
+        },
+    },
+}

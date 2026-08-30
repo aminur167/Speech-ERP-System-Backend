@@ -1,0 +1,8 @@
+# Production. Includes everything in base.
+-r base.txt
+
+# WSGI server.
+gunicorn==23.0.0
+
+# Error tracking — configured via SENTRY_DSN (docs/00-OVERVIEW.md).
+sentry-sdk==2.44.1

@@ -1,0 +1,12 @@
+# Development and CI. Includes everything in base.
+-r base.txt
+
+pytest==9.1.1
+pytest-django==4.14.0
+pytest-cov==7.1.0
+factory-boy==3.3.3
+
+# Deterministic control of "now" — the monthly billing job, the 5th-of-month
+# due date, and the historical due/refund reporting rules all need time to be
+# pinned in tests rather than depending on when the suite happens to run.
+freezegun==1.5.5
