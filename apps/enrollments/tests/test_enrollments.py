@@ -476,3 +476,241 @@ class TestEnrollmentBranchIsolation:
             {"patient": str(foreign.id), "service": str(monthly_service.id)},
         )
         assert response.status_code == 404
+
+
+class TestPayAndTerminateEndpoints:
+    """
+    Everything above this class exercises the service functions directly
+    (services.collect_bill_payment, services.terminate, ...), which is the
+    right way to pin business logic but never once dispatches a real HTTP
+    request through pay_bill / pay_installment / terminate on the viewsets.
+    That gap is exactly the shape of bug the DB test run found elsewhere in
+    this project (PaymentViewSet.get_permissions() silently never applying
+    IsManager) — a bug that lives in the view layer is invisible to tests
+    that only ever call the service layer. These hit the actual endpoints.
+    """
+
+    def pay_bill_url(self, enrollment, bill):
+        return reverse(
+            "enrollments:monthly-enrollment-pay-bill", args=[enrollment.id, bill.id]
+        )
+
+    def terminate_monthly_url(self, enrollment):
+        return reverse("enrollments:monthly-enrollment-terminate", args=[enrollment.id])
+
+    def pay_installment_url(self, plan, installment):
+        return reverse(
+            "enrollments:installment-plan-pay-installment", args=[plan.id, installment.id]
+        )
+
+    def terminate_installment_url(self, plan):
+        return reverse("enrollments:installment-plan-terminate", args=[plan.id])
+
+    def test_pay_bill_endpoint_settles_the_bill_and_advances_the_next(
+        self, manager_client, enrollment
+    ):
+        bill = enrollment.oldest_unpaid_bill()
+
+        response = manager_client.post(
+            self.pay_bill_url(enrollment, bill), {"method": "cash"}, format="json"
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["payment"]["category"] == "monthly"
+        assert Decimal(body["payment"]["amount"]) == Decimal("5000.00")
+
+        bill.refresh_from_db()
+        assert bill.status == BillStatus.PAID
+        assert bill.paid_at is not None
+
+        next_bill = enrollment.bills.exclude(pk=bill.pk).order_by("month").first()
+        assert next_bill.status == BillStatus.DUE
+
+    def test_pay_bill_endpoint_rejects_paying_out_of_order(
+        self, manager_client, enrollment
+    ):
+        september = enrollment.bills.order_by("month")[1]
+
+        response = manager_client.post(
+            self.pay_bill_url(enrollment, september), {"method": "cash"}, format="json"
+        )
+
+        assert response.status_code == 400
+        assert "code" in response.json()
+        assert Payment.objects.count() == 0
+
+    def test_pay_bill_endpoint_404s_for_a_bill_id_from_another_enrollment(
+        self, manager_client, manager, branch, patient_factory, monthly_service, enrollment
+    ):
+        other_enrollment = services.create_monthly_enrollment(
+            actor=manager, branch=branch,
+            patient=patient_factory(), service=monthly_service,
+        )
+        foreign_bill = other_enrollment.oldest_unpaid_bill()
+
+        response = manager_client.post(
+            self.pay_bill_url(enrollment, foreign_bill), {"method": "cash"}, format="json"
+        )
+
+        assert response.status_code == 404
+
+    def test_pay_bill_endpoint_requires_manager(self, admin_client, enrollment):
+        bill = enrollment.oldest_unpaid_bill()
+
+        response = admin_client.post(
+            self.pay_bill_url(enrollment, bill), {"method": "cash"}, format="json"
+        )
+
+        assert response.status_code == 403
+
+    def test_pay_bill_endpoint_validates_the_method_choice(
+        self, manager_client, enrollment
+    ):
+        bill = enrollment.oldest_unpaid_bill()
+
+        response = manager_client.post(
+            self.pay_bill_url(enrollment, bill), {"method": "not-a-method"}, format="json"
+        )
+
+        assert response.status_code == 400
+
+    def test_terminate_endpoint_blocks_an_unpaid_bill(self, manager_client, enrollment):
+        response = manager_client.post(self.terminate_monthly_url(enrollment), format="json")
+
+        assert response.status_code == 400
+        enrollment.refresh_from_db()
+        assert enrollment.status == EnrollmentStatus.ACTIVE
+
+    def test_terminate_endpoint_succeeds_once_settled(
+        self, manager_client, manager, branch, enrollment
+    ):
+        for bill in enrollment.bills.order_by("month"):
+            services.collect_bill_payment(
+                actor=manager, branch=branch, bill=bill, method="cash"
+            )
+
+        response = manager_client.post(self.terminate_monthly_url(enrollment), format="json")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == EnrollmentStatus.TERMINATED
+
+    def test_terminate_endpoint_requires_manager(self, admin_client, enrollment):
+        response = admin_client.post(self.terminate_monthly_url(enrollment), format="json")
+        assert response.status_code == 403
+
+    def test_pay_installment_endpoint_settles_and_advances(
+        self, manager_client, manager, branch, patient, installment_service
+    ):
+        plan = services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient,
+            service=installment_service, number_of_installments=3,
+        )
+        first = plan.installments.order_by("index").first()
+
+        response = manager_client.post(
+            self.pay_installment_url(plan, first), {"method": "bkash"}, format="json"
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["payment"]["category"] == "installment"
+
+        first.refresh_from_db()
+        assert first.status == BillStatus.PAID
+
+        second = plan.installments.exclude(pk=first.pk).order_by("index").first()
+        assert second.status == BillStatus.DUE
+
+    def test_pay_installment_endpoint_rejects_paying_out_of_order(
+        self, manager_client, manager, branch, patient, installment_service
+    ):
+        plan = services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient,
+            service=installment_service, number_of_installments=3,
+        )
+        second = plan.installments.order_by("index")[1]
+
+        response = manager_client.post(
+            self.pay_installment_url(plan, second), {"method": "bkash"}, format="json"
+        )
+
+        assert response.status_code == 400
+        assert Payment.objects.count() == 0
+
+    def test_pay_installment_endpoint_404s_for_an_installment_from_another_plan(
+        self, manager_client, manager, branch, patient_factory, installment_service
+    ):
+        plan_a = services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient_factory(),
+            service=installment_service, number_of_installments=2,
+        )
+        plan_b = services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient_factory(),
+            service=installment_service, number_of_installments=2,
+        )
+        foreign_installment = plan_b.installments.order_by("index").first()
+
+        response = manager_client.post(
+            self.pay_installment_url(plan_a, foreign_installment),
+            {"method": "cash"}, format="json",
+        )
+
+        assert response.status_code == 404
+
+    def test_terminate_installment_endpoint_blocks_unpaid(
+        self, manager_client, manager, branch, patient, installment_service
+    ):
+        plan = services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient,
+            service=installment_service, number_of_installments=2,
+        )
+
+        response = manager_client.post(
+            self.terminate_installment_url(plan), format="json"
+        )
+
+        assert response.status_code == 400
+        plan.refresh_from_db()
+        assert plan.status == EnrollmentStatus.ACTIVE
+
+    def test_terminate_installment_endpoint_succeeds_once_settled(
+        self, manager_client, manager, branch, patient, installment_service
+    ):
+        plan = services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient,
+            service=installment_service, number_of_installments=2,
+        )
+        for installment in plan.installments.order_by("index"):
+            services.collect_installment_payment(
+                actor=manager, branch=branch, installment=installment, method="cash"
+            )
+
+        response = manager_client.post(
+            self.terminate_installment_url(plan), format="json"
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == EnrollmentStatus.TERMINATED
+
+    @pytest.mark.isolation
+    def test_pay_bill_endpoint_is_branch_scoped(
+        self, other_manager_client, enrollment
+    ):
+        bill = enrollment.oldest_unpaid_bill()
+
+        response = other_manager_client.post(
+            self.pay_bill_url(enrollment, bill), {"method": "cash"}, format="json"
+        )
+
+        assert response.status_code == 404
+
+    @pytest.mark.isolation
+    def test_terminate_endpoint_is_branch_scoped(
+        self, other_manager_client, enrollment
+    ):
+        response = other_manager_client.post(
+            self.terminate_monthly_url(enrollment), format="json"
+        )
+
+        assert response.status_code == 404

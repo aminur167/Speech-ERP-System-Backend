@@ -549,6 +549,261 @@ class TestRefundRequestFlow:
         assert AuditLog.Action.REFUND_APPROVE in actions
 
 
+@pytest.mark.money
+class TestPartialMaterialRefund:
+    """
+    Line-item refunds on a material sale (`_resolve_refund_amount`).
+
+    Had zero coverage until now despite being one of the most sensitive paths
+    in the system: it recomputes the refund total from the sale's own
+    recorded prices rather than trusting the client, and it has to track how
+    much of each line was already refunded across prior requests so a second
+    refund can't double-return stock or money for the same units.
+    """
+
+    @pytest.fixture
+    def sale(self, manager, branch, patient, material_factory):
+        from apps.materials import services as material_services
+
+        kit = material_factory(
+            name="Assessment Kit", code="MAT-KIT-01", selling_price=Decimal("2500.00")
+        )
+        flashcards = material_factory(
+            name="Flashcards", code="MAT-FC-01", selling_price=Decimal("100.00")
+        )
+        payment, sale_items, _ = material_services.sell_materials(
+            actor=manager, branch=branch, patient=patient,
+            items=[
+                {"material_id": kit.id, "quantity": 2},
+                {"material_id": flashcards.id, "quantity": 3},
+            ],
+            method="cash",
+        )
+        return payment, kit, flashcards
+
+    def request_url(self, payment):
+        return reverse("payments:payment-request-refund", args=[payment.id])
+
+    def approve_url(self, request_id):
+        return reverse("payments:refund-request-approve", args=[request_id])
+
+    def test_amount_is_recomputed_from_the_sales_recorded_price(
+        self, manager_client, sale
+    ):
+        payment, kit, _ = sale
+
+        response = manager_client.post(
+            self.request_url(payment),
+            {"reason": "One kit returned", "items": [{"material": kit.id, "quantity": 1}]},
+            format="json",
+        )
+
+        assert response.status_code == 201
+        assert Decimal(response.json()["amount"]) == Decimal("2500.00")
+
+    def test_a_posted_amount_is_ignored_when_items_are_supplied(
+        self, manager_client, sale
+    ):
+        """
+        The escalation this guards against: claim the refund is worth 1 taka
+        while returning a 2,500 taka kit. The `amount` field is ignored the
+        moment `items` is present.
+        """
+        payment, kit, _ = sale
+
+        response = manager_client.post(
+            self.request_url(payment),
+            {
+                "amount": "1.00",
+                "reason": "One kit returned",
+                "items": [{"material": kit.id, "quantity": 1}],
+            },
+            format="json",
+        )
+
+        assert Decimal(response.json()["amount"]) == Decimal("2500.00")
+
+    def test_multiple_lines_sum_correctly(self, manager_client, sale):
+        payment, kit, flashcards = sale
+
+        response = manager_client.post(
+            self.request_url(payment),
+            {
+                "reason": "Partial return",
+                "items": [
+                    {"material": kit.id, "quantity": 1},
+                    {"material": flashcards.id, "quantity": 2},
+                ],
+            },
+            format="json",
+        )
+
+        # 1 kit (2,500.00) + 2 flashcards (100.00 each) = 2,700.00
+        assert Decimal(response.json()["amount"]) == Decimal("2700.00")
+
+    def test_a_line_not_in_the_sale_is_refused(self, manager_client, sale, material_factory):
+        payment, _, _ = sale
+        other_material = material_factory(name="Unrelated Item", code="MAT-OTHER-01")
+
+        response = manager_client.post(
+            self.request_url(payment),
+            {"reason": "test", "items": [{"material": other_material.id, "quantity": 1}]},
+            format="json",
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "item_not_in_sale"
+
+    def test_a_nonpositive_quantity_is_refused(self, manager_client, sale):
+        """
+        Caught by RefundItemSerializer's min_value=1 before it ever reaches
+        _resolve_refund_amount's own invalid_quantity check -- both layers
+        refuse it, so the request never gets past validation either way.
+        """
+        payment, kit, _ = sale
+
+        response = manager_client.post(
+            self.request_url(payment),
+            {"reason": "test", "items": [{"material": kit.id, "quantity": 0}]},
+            format="json",
+        )
+
+        assert response.status_code == 400
+        assert "items" in response.json()
+
+    def test_refunding_more_than_was_sold_is_refused(self, manager_client, sale):
+        payment, kit, _ = sale
+
+        response = manager_client.post(
+            self.request_url(payment),
+            {"reason": "test", "items": [{"material": kit.id, "quantity": 3}]},  # only 2 sold
+            format="json",
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "exceeds_sold_quantity"
+
+    def test_a_payment_with_no_sale_lines_cannot_be_refunded_by_item(
+        self, manager_client, payment, material_factory
+    ):
+        """`payment` here is the plain daily-service fixture, not a material sale."""
+        kit = material_factory(name="Kit", code="MAT-UNRELATED-01")
+
+        response = manager_client.post(
+            self.request_url(payment),
+            {"reason": "test", "items": [{"material": kit.id, "quantity": 1}]},
+            format="json",
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "no_sale_items"
+
+    def test_approving_a_partial_refund_restores_only_that_quantity(
+        self, manager_client, admin_client, sale
+    ):
+        from apps.materials.models import Material
+
+        payment, kit, flashcards = sale
+        before = Material.objects.get(pk=kit.pk).quantity
+
+        created = manager_client.post(
+            self.request_url(payment),
+            {"reason": "One returned", "items": [{"material": kit.id, "quantity": 1}]},
+            format="json",
+        ).json()
+        admin_client.post(self.approve_url(created["id"]), {"billAction": "reopen"})
+
+        kit.refresh_from_db()
+        assert kit.quantity == before + 1
+
+    def test_approving_a_partial_refund_leaves_the_payment_partial(
+        self, manager_client, admin_client, sale
+    ):
+        payment, kit, flashcards = sale
+
+        created = manager_client.post(
+            self.request_url(payment),
+            {"reason": "One returned", "items": [{"material": kit.id, "quantity": 1}]},
+            format="json",
+        ).json()
+        admin_client.post(self.approve_url(created["id"]), {"billAction": "reopen"})
+
+        payment.refresh_from_db()
+        assert payment.status == PaymentStatus.PARTIAL
+
+    def test_a_second_refund_cannot_exceed_what_the_first_left_behind(
+        self, manager_client, admin_client, sale
+    ):
+        """
+        The tracking rule: once 1 of 2 kits has been refunded (and approved),
+        only 1 remains -- attempting to refund 2 more must fail rather than
+        returning more stock/money than was ever sold.
+        """
+        payment, kit, _ = sale
+
+        first = manager_client.post(
+            self.request_url(payment),
+            {"reason": "First return", "items": [{"material": kit.id, "quantity": 1}]},
+            format="json",
+        ).json()
+        admin_client.post(self.approve_url(first["id"]), {"billAction": "reopen"})
+
+        second = manager_client.post(
+            self.request_url(payment),
+            {"reason": "Second return", "items": [{"material": kit.id, "quantity": 2}]},
+            format="json",
+        )
+
+        assert second.status_code == 400
+        assert second.json()["code"] == "exceeds_sold_quantity"
+
+    def test_a_second_refund_for_exactly_the_remainder_succeeds(
+        self, manager_client, admin_client, sale
+    ):
+        payment, kit, _ = sale
+
+        first = manager_client.post(
+            self.request_url(payment),
+            {"reason": "First return", "items": [{"material": kit.id, "quantity": 1}]},
+            format="json",
+        ).json()
+        admin_client.post(self.approve_url(first["id"]), {"billAction": "reopen"})
+
+        second = manager_client.post(
+            self.request_url(payment),
+            {"reason": "Second return", "items": [{"material": kit.id, "quantity": 1}]},
+            format="json",
+        )
+
+        assert second.status_code == 201
+        assert Decimal(second.json()["amount"]) == Decimal("2500.00")
+
+    def test_a_pending_unapproved_request_also_blocks_over_refunding(
+        self, manager_client, admin_client, sale
+    ):
+        """
+        A second request can't even open while the first is pending -- the
+        payment-level "one pending request at a time" rule is what actually
+        prevents two pending requests from each claiming the same units.
+        """
+        payment, kit, _ = sale
+
+        manager_client.post(
+            self.request_url(payment),
+            {"reason": "First return", "items": [{"material": kit.id, "quantity": 2}]},
+            format="json",
+        )
+
+        second = manager_client.post(
+            self.request_url(payment),
+            {"reason": "Second return", "items": [{"material": kit.id, "quantity": 1}]},
+            format="json",
+        )
+
+        assert second.status_code == 400
+        assert second.json()["code"] == "already_pending"
+
+
 class TestRevenueExclusion:
     def test_refunded_payment_stops_counting_as_revenue(
         self, manager_client, admin_client, payment
