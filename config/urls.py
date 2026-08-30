@@ -8,17 +8,23 @@ Everything is mounted under /api/ to match the frontend's configured base URL
 from django.contrib import admin
 from django.urls import include, path
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
+from rest_framework.permissions import AllowAny
 
 urlpatterns = [
     path("admin/", admin.site.urls),
-    # Raw OpenAPI schema, and the interactive Swagger UI built from it. Both
-    # require an authenticated request like any other endpoint here — the API
-    # has no public signup path, so there's no reason its shape should be
-    # world-readable.
-    path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
+    # Raw OpenAPI schema, and the interactive Swagger UI built from it.
+    # Publicly viewable, like most APIs' docs (Stripe, GitHub, ...) — it only
+    # describes request/response shapes, not data. Every actual endpoint
+    # reached through Swagger's "Try it out" still needs a real token; viewing
+    # the docs is not the same as calling the API.
+    path(
+        "api/schema/",
+        SpectacularAPIView.as_view(permission_classes=[AllowAny]),
+        name="schema",
+    ),
     path(
         "api/docs/",
-        SpectacularSwaggerView.as_view(url_name="schema"),
+        SpectacularSwaggerView.as_view(url_name="schema", permission_classes=[AllowAny]),
         name="swagger-ui",
     ),
     path("api/auth/", include("apps.accounts.urls")),

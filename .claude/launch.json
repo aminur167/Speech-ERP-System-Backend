@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "speech-erp-backend",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["manage.py", "runserver", "0.0.0.0:8000"],
+      "port": 8000,
+      "url": "http://localhost:8000/api/docs/"
+    }
+  ]
+}

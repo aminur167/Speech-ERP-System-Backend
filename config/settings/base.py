@@ -184,6 +184,13 @@ SPECTACULAR_SETTINGS = {
     ),
     "VERSION": "1.0.0",
     "SERVE_INCLUDE_SCHEMA": False,
+    # Every path here shares a literal "/api/" prefix. Without stripping it
+    # first, drf-spectacular's tag auto-inference picks THAT shared segment
+    # as the tag for any view not explicitly tagged -- every endpoint below
+    # would group under a single meaningless "api" tag instead of by module,
+    # and Swagger UI would show empty sections for every declared TAG entry
+    # below since nothing actually carries those tag names.
+    "SCHEMA_PATH_PREFIX": "/api/",
     # Every endpoint is namespaced under one of these; grouping by prefix
     # keeps the docs organised by module instead of one flat list.
     "TAGS": [
