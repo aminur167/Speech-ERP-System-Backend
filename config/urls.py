@@ -7,9 +7,20 @@ Everything is mounted under /api/ to match the frontend's configured base URL
 
 from django.contrib import admin
 from django.urls import include, path
+from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
 urlpatterns = [
     path("admin/", admin.site.urls),
+    # Raw OpenAPI schema, and the interactive Swagger UI built from it. Both
+    # require an authenticated request like any other endpoint here — the API
+    # has no public signup path, so there's no reason its shape should be
+    # world-readable.
+    path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
+    path(
+        "api/docs/",
+        SpectacularSwaggerView.as_view(url_name="schema"),
+        name="swagger-ui",
+    ),
     path("api/auth/", include("apps.accounts.urls")),
     path("api/branches/", include("apps.branches.urls")),
     path("api/patients/", include("apps.patients.urls")),

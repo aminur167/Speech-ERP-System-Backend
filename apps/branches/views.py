@@ -7,6 +7,7 @@ sidebar and receipts show its name) but never list or modify branches.
 
 from decimal import Decimal
 
+from drf_spectacular.utils import extend_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -86,6 +87,7 @@ class BranchViewSet(viewsets.ModelViewSet):
         branch.delete()  # SoftDeleteModel.delete
         return Response(status=status.HTTP_204_NO_CONTENT)
 
+    @extend_schema(operation_id="branches_overview_list")
     @action(detail=False, methods=["get"], url_path="overview")
     def overview(self, request):
         """
@@ -100,6 +102,7 @@ class BranchViewSet(viewsets.ModelViewSet):
         data = [self._build_overview(branch) for branch in branches]
         return Response(BranchOverviewSerializer(data, many=True).data)
 
+    @extend_schema(operation_id="branches_overview_retrieve")
     @action(detail=True, methods=["get"], url_path="overview")
     def overview_detail(self, request, pk=None):
         """GET /api/branches/{id}/overview/ — one branch's figures."""

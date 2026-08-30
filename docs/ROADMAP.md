@@ -92,8 +92,17 @@ The frontend is a demo, so these are expected. Each is recorded in context in it
 | Offline: sync indicator, pending count, failed-sync surfacing | `00` |
 
 ## Phase 10 — Production readiness
+- ✅ CI: `.github/workflows/ci.yml` runs the full suite against a real Postgres
+  service container, plus `manage.py check` and `makemigrations --check`, on
+  every push and PR to `main`.
+- ✅ API documentation: OpenAPI schema at `/api/schema/`, interactive docs at
+  `/api/docs/` (drf-spectacular). A dedicated test
+  (`apps/common/tests/test_openapi_schema.py`) asserts the schema generates
+  with zero errors, so a view that silently drops out of the docs fails CI.
+- ✅ Sentry wired up in `config/settings/production.py` — enabled the moment
+  `SENTRY_DSN` is set, PII scrubbed by default, a modest trace sample rate.
 - Automated off-server backups **plus a tested restore**
-- Sentry + uptime monitoring
+- Uptime monitoring
 - SSL with auto-renewal
 - Seeded performance benchmark on production-like hardware
 - Client handover: documentation and training

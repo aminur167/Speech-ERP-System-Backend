@@ -1,6 +1,7 @@
 """Auth endpoints: login, refresh, logout, current user, profile."""
 
 from django.contrib.auth import get_user_model
+from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.generics import GenericAPIView
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -13,6 +14,8 @@ from apps.accounts.serializers import (
     ChangePasswordSerializer,
     LoginSerializer,
     ProfileUpdateSerializer,
+    RefreshRequestSerializer,
+    RefreshResponseSerializer,
     UserSerializer,
 )
 from apps.common import audit
@@ -60,6 +63,11 @@ class RefreshView(GenericAPIView):
     permission_classes = [AllowAny]
     serializer_class = None
 
+    @extend_schema(
+        tags=["auth"],
+        request=RefreshRequestSerializer,
+        responses=RefreshResponseSerializer,
+    )
     def post(self, request):
         raw_token = request.data.get("refreshToken") or request.data.get("refresh")
         if not raw_token:
@@ -106,6 +114,7 @@ class LogoutView(GenericAPIView):
     permission_classes = [IsAuthenticated]
     serializer_class = None
 
+    @extend_schema(tags=["auth"], request=None, responses=None)
     def post(self, request):
         raw_token = request.data.get("refreshToken") or request.data.get("refresh")
         if raw_token:

@@ -8,11 +8,17 @@ second chance to get that wrong.
 
 from datetime import datetime
 
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.duepayments import services
+from apps.duepayments.serializers import DuePaymentListSerializer, DueSummarySerializer
+
+_BRANCH_PARAM = OpenApiParameter(
+    "branch", str, description="Admin only — narrow to one branch's data."
+)
 
 
 def _branch_id_for(request):
@@ -36,6 +42,17 @@ class DuePaymentListView(APIView):
 
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        tags=["due-payments"],
+        parameters=[
+            _BRANCH_PARAM,
+            OpenApiParameter("type", str, description='"monthly" or "installment".'),
+            OpenApiParameter("search", str),
+            OpenApiParameter("page", int),
+            OpenApiParameter("pageSize", int),
+        ],
+        responses=DuePaymentListSerializer,
+    )
     def get(self, request):
         items = services.collect_due_items(branch_id=_branch_id_for(request))
 
@@ -85,6 +102,14 @@ class DuePaymentSummaryView(APIView):
 
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        tags=["due-payments"],
+        parameters=[
+            _BRANCH_PARAM,
+            OpenApiParameter("date", str, description="ISO date; reconstructs that day's total."),
+        ],
+        responses=DueSummarySerializer,
+    )
     def get(self, request):
         return Response(
             services.due_summary(

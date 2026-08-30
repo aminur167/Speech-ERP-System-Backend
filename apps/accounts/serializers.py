@@ -108,3 +108,16 @@ class ChangePasswordSerializer(serializers.Serializer):
         user.set_password(self.validated_data["new_password"])
         user.save(update_fields=["password"])
         return user
+
+
+class RefreshRequestSerializer(serializers.Serializer):
+    """Documentation-only shape for RefreshView's request body."""
+
+    refreshToken = serializers.CharField()
+
+
+class RefreshResponseSerializer(serializers.Serializer):
+    """Documentation-only shape for RefreshView's response."""
+
+    accessToken = serializers.CharField()
+    refreshToken = serializers.CharField()

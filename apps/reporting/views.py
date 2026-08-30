@@ -8,6 +8,7 @@ usual rule — manager sees their own, admin sees all or narrows with ?branch=.
 from datetime import datetime
 
 from django.db.models import Q
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -16,6 +17,24 @@ from rest_framework.views import APIView
 from apps.payments.models import Payment, PaymentStatus
 from apps.payments.serializers import PaymentSerializer
 from apps.reporting import services
+from apps.reporting.serializers import (
+    CollectionForDateSerializer,
+    DashboardMetricsSerializer,
+    NetRevenueSerializer,
+    RefundOrVoidRowSerializer,
+    RevenueByCategoryRowSerializer,
+    RevenueTrendPointSerializer,
+    TransactionsSummarySerializer,
+)
+
+# Shared across every view below: Admin narrows to one branch, Manager is
+# always scoped to their own and this param is ignored for them.
+_BRANCH_PARAM = OpenApiParameter(
+    "branch", str, description="Admin only — narrow to one branch's data."
+)
+_DATE_PARAM = OpenApiParameter(
+    "date", str, description="ISO date (YYYY-MM-DD). Defaults to today."
+)
 
 
 def _branch_id_for(request):
@@ -46,6 +65,19 @@ class TransactionListView(_ReportView):
     not from the record of what happened.
     """
 
+    @extend_schema(
+        tags=["reporting"],
+        parameters=[
+            _BRANCH_PARAM, _DATE_PARAM,
+            OpenApiParameter("patientId", str),
+            OpenApiParameter("method", str),
+            OpenApiParameter("status", str),
+            OpenApiParameter("period", str, description='"today" or "month"; `date` overrides.'),
+            OpenApiParameter("search", str),
+            OpenApiParameter("pageSize", int),
+        ],
+        responses=PaymentSerializer(many=True),
+    )
     def get(self, request):
         queryset = Payment.objects.select_related("patient", "branch", "collected_by")
 
@@ -96,6 +128,11 @@ class TransactionListView(_ReportView):
 
 
 class TransactionsSummaryView(_ReportView):
+    @extend_schema(
+        tags=["reporting"],
+        parameters=[_BRANCH_PARAM, _DATE_PARAM],
+        responses=TransactionsSummarySerializer,
+    )
     def get(self, request):
         return Response(
             services.transactions_summary(
@@ -106,6 +143,14 @@ class TransactionsSummaryView(_ReportView):
 
 
 class RevenueTrendView(_ReportView):
+    @extend_schema(
+        tags=["reporting"],
+        parameters=[
+            _BRANCH_PARAM,
+            OpenApiParameter("days", int, description="1-90, oldest first. Default 7."),
+        ],
+        responses=RevenueTrendPointSerializer(many=True),
+    )
     def get(self, request):
         try:
             days = min(90, max(1, int(request.query_params.get("days", 7))))
@@ -117,6 +162,11 @@ class RevenueTrendView(_ReportView):
 
 
 class RevenueByMethodView(_ReportView):
+    @extend_schema(
+        tags=["reporting"],
+        parameters=[_BRANCH_PARAM, _DATE_PARAM],
+        responses=RevenueByCategoryRowSerializer(many=True),
+    )
     def get(self, request):
         return Response(
             services.revenue_by_method(
@@ -127,6 +177,11 @@ class RevenueByMethodView(_ReportView):
 
 
 class RevenueByCategoryView(_ReportView):
+    @extend_schema(
+        tags=["reporting"],
+        parameters=[_BRANCH_PARAM, _DATE_PARAM],
+        responses=RevenueByCategoryRowSerializer(many=True),
+    )
     def get(self, request):
         return Response(
             services.revenue_by_category(
@@ -137,6 +192,11 @@ class RevenueByCategoryView(_ReportView):
 
 
 class DashboardMetricsView(_ReportView):
+    @extend_schema(
+        tags=["reporting"],
+        parameters=[_BRANCH_PARAM, _DATE_PARAM],
+        responses=DashboardMetricsSerializer,
+    )
     def get(self, request):
         return Response(
             services.dashboard_metrics(
@@ -147,6 +207,11 @@ class DashboardMetricsView(_ReportView):
 
 
 class CollectionForDateView(_ReportView):
+    @extend_schema(
+        tags=["reporting"],
+        parameters=[_BRANCH_PARAM, _DATE_PARAM],
+        responses=CollectionForDateSerializer,
+    )
     def get(self, request):
         from django.utils import timezone
 
@@ -162,11 +227,21 @@ class CollectionForDateView(_ReportView):
 
 
 class RefundsAndVoidsView(_ReportView):
+    @extend_schema(
+        tags=["reporting"],
+        parameters=[_BRANCH_PARAM],
+        responses=RefundOrVoidRowSerializer(many=True),
+    )
     def get(self, request):
         return Response(services.refunds_and_voids(branch_id=_branch_id_for(request)))
 
 
 class NetRevenueView(_ReportView):
+    @extend_schema(
+        tags=["reporting"],
+        parameters=[_BRANCH_PARAM, _DATE_PARAM],
+        responses=NetRevenueSerializer,
+    )
     def get(self, request):
         return Response(
             services.net_revenue(

@@ -46,6 +46,7 @@ THIRD_PARTY_APPS = [
     "rest_framework",
     "corsheaders",
     "django_filters",
+    "drf_spectacular",
 ]
 
 LOCAL_APPS = [
@@ -167,6 +168,37 @@ REST_FRAMEWORK = {
         "login": "10/min",
     },
     "TEST_REQUEST_DEFAULT_FORMAT": "json",
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+}
+
+# OpenAPI schema served at /api/schema/, interactive docs at /api/docs/
+# (config/urls.py). Kept enabled in every environment, including production —
+# the API has no public signup path, so the schema itself isn't sensitive,
+# and having it live in prod is what makes it trustworthy as a reference.
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Speech ERP API",
+    "DESCRIPTION": (
+        "Branch-scoped clinic management: patients, enrollments, payments, "
+        "materials, expenses, daily closing, and reporting. See docs/ in the "
+        "repository for the business rules behind each endpoint."
+    ),
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    # Every endpoint is namespaced under one of these; grouping by prefix
+    # keeps the docs organised by module instead of one flat list.
+    "TAGS": [
+        {"name": "auth", "description": "Login, tokens, and the current user"},
+        {"name": "branches", "description": "Branch CRUD and the Admin overview"},
+        {"name": "patients", "description": "Registration and the patient directory"},
+        {"name": "services", "description": "The service catalog"},
+        {"name": "payments", "description": "Payments, void, and refunds"},
+        {"name": "enrollments", "description": "Monthly, installment, and booking"},
+        {"name": "materials", "description": "Stock and the POS sale flow"},
+        {"name": "due-payments", "description": "Outstanding dues, current and historical"},
+        {"name": "expenses", "description": "Branch expenses and Admin approval"},
+        {"name": "daily-closing", "description": "Cash reconciliation and amendments"},
+        {"name": "reporting", "description": "Transactions, dashboards, and analytics"},
+    ],
 }
 
 # Short-lived access tokens with refresh rotation and blacklisting, so a stolen

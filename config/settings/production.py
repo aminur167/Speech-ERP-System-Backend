@@ -7,6 +7,9 @@ if unset, which is intentional: a missing secret should stop the deploy, not
 silently fall back to an insecure value.
 """
 
+import sentry_sdk
+from sentry_sdk.integrations.django import DjangoIntegration
+
 from .base import *  # noqa: F403
 
 DEBUG = False
@@ -42,7 +45,23 @@ CSRF_COOKIE_HTTPONLY = False  # the SPA must read the CSRF token
 
 CONN_MAX_AGE = 60  # persistent DB connections
 
-# Warn rather than crash if the error-tracking DSN isn't configured yet.
+# Warn rather than crash if the error-tracking DSN isn't configured yet — a
+# clinic's first deploy shouldn't be blocked on having Sentry set up.
 SENTRY_DSN = env("SENTRY_DSN", default="")  # noqa: F405
+
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        integrations=[DjangoIntegration()],
+        environment=env("SENTRY_ENVIRONMENT", default="production"),  # noqa: F405
+        release=env("SENTRY_RELEASE", default=None),  # noqa: F405
+        # A modest sample of request traces, not every request -- full tracing
+        # on a low-traffic clinic backend is pure overhead for no real signal.
+        traces_sample_rate=env.float("SENTRY_TRACES_SAMPLE_RATE", default=0.1),  # noqa: F405
+        # Patient names, phone numbers, and financial details pass through
+        # this app constantly. Never let Sentry capture request bodies,
+        # headers, or user PII by default.
+        send_default_pii=False,
+    )
 
 LOGGING["root"]["level"] = "WARNING"  # noqa: F405

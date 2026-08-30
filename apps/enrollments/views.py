@@ -5,6 +5,7 @@ Enrolling and collecting are branch-desk actions, so they're Manager-only:
 Admin can see everything but shouldn't transact on a branch's behalf.
 """
 
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -98,6 +99,7 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
             MonthlyEnrollmentSerializer(enrollment).data, status=status.HTTP_201_CREATED
         )
 
+    @extend_schema(parameters=[OpenApiParameter("bill_id", int, location="path")])
     @action(detail=True, methods=["post"], url_path="bills/(?P<bill_id>[^/.]+)/pay")
     def pay_bill(self, request, pk=None, bill_id=None):
         """
@@ -189,6 +191,7 @@ class InstallmentPlanViewSet(_EnrollmentBase):
 
         return Response(InstallmentPlanSerializer(plan).data, status=status.HTTP_201_CREATED)
 
+    @extend_schema(parameters=[OpenApiParameter("installment_id", int, location="path")])
     @action(
         detail=True, methods=["post"],
         url_path="installments/(?P<installment_id>[^/.]+)/pay",
