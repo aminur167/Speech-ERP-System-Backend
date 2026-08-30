@@ -1,0 +1,111 @@
+"""
+Auth and profile serializers.
+
+Response shapes mirror what the frontend already consumes (`AuthUser` in
+`src/types/domain.ts`): id, name, email, role, branchId.
+"""
+
+from django.contrib.auth import authenticate
+from rest_framework import serializers
+from rest_framework_simplejwt.tokens import RefreshToken
+
+from apps.accounts.models import User
+
+
+class UserSerializer(serializers.ModelSerializer):
+    """The authenticated user, as the frontend's `AuthUser` shape."""
+
+    branchId = serializers.CharField(source="branch_id", allow_null=True, read_only=True)
+    branchName = serializers.CharField(source="branch.name", read_only=True, default=None)
+
+    class Meta:
+        model = User
+        fields = ["id", "name", "email", "role", "branchId", "branchName", "staff_code"]
+        read_only_fields = fields
+
+
+class LoginSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    password = serializers.CharField(write_only=True, trim_whitespace=False)
+
+    def validate(self, attrs):
+        user = authenticate(
+            request=self.context.get("request"),
+            username=attrs["email"].lower().strip(),
+            password=attrs["password"],
+        )
+
+        # One message for both "no such user" and "wrong password" — telling
+        # them apart lets an attacker enumerate valid accounts.
+        if user is None:
+            raise serializers.ValidationError(
+                {"detail": "Invalid email or password."}, code="authorization"
+            )
+
+        if not user.is_active or user.is_deleted:
+            raise serializers.ValidationError(
+                {"detail": "This account has been deactivated."}, code="authorization"
+            )
+
+        # A manager with no branch would be scoped to nothing and see empty
+        # screens everywhere; fail clearly at login instead.
+        if user.is_manager and user.branch_id is None:
+            raise serializers.ValidationError(
+                {"detail": "This manager account is not assigned to a branch. Contact your administrator."},
+                code="authorization",
+            )
+
+        attrs["user"] = user
+        return attrs
+
+    def to_representation(self, instance):
+        user = instance["user"]
+        refresh = RefreshToken.for_user(user)
+        return {
+            "user": UserSerializer(user).data,
+            "accessToken": str(refresh.access_token),
+            "refreshToken": str(refresh),
+        }
+
+
+class ProfileUpdateSerializer(serializers.ModelSerializer):
+    """
+    Self-service profile edits.
+
+    Deliberately narrow: a user may change their display name, nothing else.
+    Role, branch, and email decide what they can see and do, so they are
+    changed by an Admin through branch management — not by the user themselves.
+    """
+
+    class Meta:
+        model = User
+        fields = ["name"]
+
+    def validate_name(self, value):
+        value = value.strip()
+        if len(value) < 2:
+            raise serializers.ValidationError("Name must be at least 2 characters.")
+        return value
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    current_password = serializers.CharField(write_only=True, trim_whitespace=False)
+    new_password = serializers.CharField(write_only=True, trim_whitespace=False, min_length=8)
+
+    def validate_current_password(self, value):
+        user = self.context["request"].user
+        if not user.check_password(value):
+            raise serializers.ValidationError("Current password is incorrect.")
+        return value
+
+    def validate_new_password(self, value):
+        from django.contrib.auth.password_validation import validate_password
+
+        validate_password(value, self.context["request"].user)
+        return value
+
+    def save(self, **kwargs):
+        user = self.context["request"].user
+        user.set_password(self.validated_data["new_password"])
+        user.save(update_fields=["password"])
+        return user
