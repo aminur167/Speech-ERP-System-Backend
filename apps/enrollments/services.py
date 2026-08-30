@@ -14,7 +14,7 @@ The rules that matter most here, all confirmed in docs/05:
 """
 
 from datetime import date
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from django.db import transaction
 from django.utils import timezone
@@ -124,7 +124,13 @@ def create_installment_plan(*, actor, branch, patient, service, number_of_instal
         )
 
     total = Decimal(service.fee)
-    base = (total / number_of_installments).quantize(Decimal("0.01"))
+
+    # ROUND_DOWN, not default rounding: the remainder must be non-negative so
+    # it lands on the *final* installment. With banker's rounding the base can
+    # round up (18,500/3 → 6,166.67 each = 18,500.01), making the remainder
+    # negative and the last installment smaller than the rest — the opposite
+    # of the documented behaviour, and it charges the patient more up front.
+    base = (total / number_of_installments).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     remainder = total - (base * number_of_installments)
 
     plan = InstallmentPlan.objects.create(
