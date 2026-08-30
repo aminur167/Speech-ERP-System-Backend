@@ -196,6 +196,23 @@ MONTHLY_BILL_DUE_DAY = env.int("MONTHLY_BILL_DUE_DAY", default=5)
 PATIENT_MINOR_AGE = env.int("PATIENT_MINOR_AGE", default=18)
 
 # --------------------------------------------------------------------------
+# Cloudinary (material images — docs/06-materials.md)
+# --------------------------------------------------------------------------
+# The cloud name is used to validate that a submitted image URL belongs to
+# this clinic's account, so a client can't point a material's image at
+# arbitrary external content. The secret is server-side only and must never be
+# exposed to the browser (no NEXT_PUBLIC_* equivalent).
+
+CLOUDINARY_CLOUD_NAME = env("CLOUDINARY_CLOUD_NAME", default="")
+CLOUDINARY_API_KEY = env("CLOUDINARY_API_KEY", default="")
+CLOUDINARY_API_SECRET = env("CLOUDINARY_API_SECRET", default="")
+
+# Upload constraints — a 12MP phone photo must not be served as-is to the POS.
+CLOUDINARY_UPLOAD_FOLDER = env("CLOUDINARY_UPLOAD_FOLDER", default="speech-erp/materials")
+CLOUDINARY_MAX_IMAGE_BYTES = env.int("CLOUDINARY_MAX_IMAGE_BYTES", default=5 * 1024 * 1024)
+CLOUDINARY_ALLOWED_FORMATS = ["jpg", "jpeg", "png", "webp"]
+
+# --------------------------------------------------------------------------
 # Logging
 # --------------------------------------------------------------------------
 
