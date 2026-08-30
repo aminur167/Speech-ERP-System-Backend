@@ -12,6 +12,7 @@ from django.conf import settings
 from rest_framework import serializers
 
 from apps.common.validators import normalize_phone, validate_bd_phone
+from apps.patients.directory import overdue_status_by_patient
 from apps.patients.models import Patient, calculate_age
 
 GUARDIAN_FIELDS = ("guardian_name", "guardian_relation", "guardian_phone")
@@ -38,6 +39,9 @@ class PatientSerializer(serializers.ModelSerializer):
     branchId = serializers.CharField(source="branch_id", read_only=True)
     branchName = serializers.CharField(source="branch.name", read_only=True)
     createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+    serviceStatus = serializers.SerializerMethodField()
+    overdueAmount = serializers.SerializerMethodField()
+    overdueSince = serializers.SerializerMethodField()
 
     class Meta:
         model = Patient
@@ -47,11 +51,34 @@ class PatientSerializer(serializers.ModelSerializer):
             "guardianName", "guardianRelation", "guardianPhone", "emergencyContact",
             "referredBy", "chiefComplaint", "nationalId", "notes",
             "status", "branchId", "branchName", "createdAt",
+            "serviceStatus", "overdueAmount", "overdueSince",
         ]
         read_only_fields = fields
 
     def get_age(self, obj) -> int | None:
         return obj.age
+
+    def _overdue_info(self, obj) -> dict | None:
+        """
+        Memoized per-instance -- the three fields below all need it, and this
+        serializer is only ever built for a single patient (retrieve, create,
+        update), so one small query here doesn't repeat the list endpoint's
+        N+1 risk.
+        """
+        if not hasattr(self, "_overdue_cache"):
+            self._overdue_cache = overdue_status_by_patient([obj.id]).get(obj.id)
+        return self._overdue_cache
+
+    def get_serviceStatus(self, obj) -> str:
+        return "overdue" if self._overdue_info(obj) else "active"
+
+    def get_overdueAmount(self, obj) -> str:
+        info = self._overdue_info(obj)
+        return str(info["amount"]) if info else "0.00"
+
+    def get_overdueSince(self, obj) -> str | None:
+        info = self._overdue_info(obj)
+        return info["since"].isoformat() if info else None
 
 
 class PatientListSerializer(serializers.ModelSerializer):

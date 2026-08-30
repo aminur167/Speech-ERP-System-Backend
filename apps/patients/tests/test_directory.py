@@ -19,7 +19,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from apps.enrollments import services as enrollment_services
-from apps.enrollments.models import EnrollmentStatus
+from apps.enrollments.models import EnrollmentStatus, Installment, MonthlyBill
 from apps.patients.directory import EMPTY, Status
 from apps.patients.models import Patient
 from apps.payments import services as payment_services
@@ -585,6 +585,134 @@ class TestDirectoryBranchIsolation:
 
         body = admin_client.get(DIRECTORY_URL, {"branch": str(branch.id)}).json()
         assert body["count"] == 1
+
+
+class TestOverdueServiceStatus:
+    """
+    docs/05: `serviceStatus` is `overdue` when a patient has any overdue bill
+    or installment on a non-terminated enrollment/plan -- derived at read
+    time, never stored, and must not block anything it merely flags.
+    """
+
+    def test_active_when_nothing_is_overdue(self, manager_client, patient_factory, enroll_monthly):
+        patient = patient_factory()
+        enrollment = enroll_monthly(patient)
+        # A fresh enrollment's current-month bill is due on the 5th, which may
+        # already be in the past for "today" -- push every bill's due date
+        # into the future so this test isolates "no overdue bill" rather than
+        # depending on which day of the month the suite happens to run.
+        MonthlyBill.objects.filter(enrollment=enrollment).update(
+            due_date=timezone.localdate() + timedelta(days=30)
+        )
+
+        row = row_for(manager_client, patient)
+
+        assert row["serviceStatus"] == "active"
+        assert Decimal(row["overdueAmount"]) == Decimal("0.00")
+        assert row["overdueSince"] is None
+
+    def test_overdue_once_a_bill_passes_its_due_date_unpaid(
+        self, manager_client, patient_factory, enroll_monthly
+    ):
+        patient = patient_factory()
+        enrollment = enroll_monthly(patient)
+        bill = enrollment.oldest_unpaid_bill()
+        MonthlyBill.objects.filter(pk=bill.pk).update(
+            due_date=timezone.localdate() - timedelta(days=10)
+        )
+
+        row = row_for(manager_client, patient)
+
+        assert row["serviceStatus"] == "overdue"
+        assert Decimal(row["overdueAmount"]) == bill.amount
+        assert row["overdueSince"] == (timezone.localdate() - timedelta(days=10)).isoformat()
+
+    def test_a_due_but_not_yet_overdue_bill_does_not_count(
+        self, manager_client, patient_factory, enroll_monthly
+    ):
+        """Due tomorrow -- unpaid, but not yet overdue."""
+        patient = patient_factory()
+        enrollment = enroll_monthly(patient)
+        MonthlyBill.objects.filter(enrollment=enrollment).update(
+            due_date=timezone.localdate() + timedelta(days=1)
+        )
+
+        row = row_for(manager_client, patient)
+
+        assert row["serviceStatus"] == "active"
+
+    def test_overdue_installment_counts_too(
+        self, manager_client, patient_factory, enroll_installment
+    ):
+        patient = patient_factory()
+        plan = enroll_installment(patient)
+        installment = plan.oldest_unpaid_installment()
+        Installment.objects.filter(pk=installment.pk).update(
+            due_date=timezone.localdate() - timedelta(days=5)
+        )
+
+        row = row_for(manager_client, patient)
+
+        assert row["serviceStatus"] == "overdue"
+        assert Decimal(row["overdueAmount"]) == installment.amount
+
+    def test_a_terminated_enrollments_overdue_bill_does_not_count(
+        self, manager_client, patient_factory, enroll_monthly
+    ):
+        patient = patient_factory()
+        enrollment = enroll_monthly(patient)
+        bill = enrollment.oldest_unpaid_bill()
+        MonthlyBill.objects.filter(pk=bill.pk).update(
+            due_date=timezone.localdate() - timedelta(days=10)
+        )
+        enrollment.status = EnrollmentStatus.TERMINATED
+        enrollment.save(update_fields=["status"])
+
+        row = row_for(manager_client, patient)
+
+        assert row["serviceStatus"] == "active"
+
+    def test_overdue_amount_sums_across_enrollments(
+        self, manager_client, patient_factory, enroll_monthly, enroll_installment
+    ):
+        patient = patient_factory()
+        enrollment = enroll_monthly(patient)
+        bill = enrollment.oldest_unpaid_bill()
+        MonthlyBill.objects.filter(pk=bill.pk).update(
+            due_date=timezone.localdate() - timedelta(days=10)
+        )
+        plan = enroll_installment(patient)
+        installment = plan.oldest_unpaid_installment()
+        Installment.objects.filter(pk=installment.pk).update(
+            due_date=timezone.localdate() - timedelta(days=3)
+        )
+
+        row = row_for(manager_client, patient)
+
+        assert Decimal(row["overdueAmount"]) == bill.amount + installment.amount
+        # The oldest overdue date wins, not the most recent.
+        assert row["overdueSince"] == (timezone.localdate() - timedelta(days=10)).isoformat()
+
+    def test_overdue_does_not_block_enrollment_booking_or_sale(
+        self, manager_client, patient_factory, enroll_monthly
+    ):
+        """
+        Confirmed rule: overdue is surfaced, never enforced. A regression that
+        adds blocking logic anywhere should fail a test like this one, not
+        silently change behaviour.
+        """
+        patient = patient_factory()
+        enrollment = enroll_monthly(patient)
+        bill = enrollment.oldest_unpaid_bill()
+        MonthlyBill.objects.filter(pk=bill.pk).update(
+            due_date=timezone.localdate() - timedelta(days=10)
+        )
+
+        assert row_for(manager_client, patient)["serviceStatus"] == "overdue"
+
+        response = manager_client.get(reverse("patients:patient-detail", args=[patient.pk]))
+        assert response.status_code == 200
+        assert response.json()["serviceStatus"] == "overdue"
 
 
 class TestDirectoryPerformance:

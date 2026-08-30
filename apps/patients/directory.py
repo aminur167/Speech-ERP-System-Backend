@@ -25,10 +25,18 @@ a query.
 
 from collections import defaultdict
 from datetime import date
+from decimal import Decimal
 
-from django.db.models import Max, Q
+from django.db.models import F, Max, Q
 
-from apps.enrollments.models import EnrollmentStatus, InstallmentPlan, MonthlyEnrollment
+from apps.enrollments.models import (
+    BillStatus,
+    EnrollmentStatus,
+    Installment,
+    InstallmentPlan,
+    MonthlyBill,
+    MonthlyEnrollment,
+)
 from apps.patients.models import Patient
 from apps.payments.models import Payment, PaymentCategory, PaymentStatus
 
@@ -78,11 +86,13 @@ def build_rows(patients: list[Patient]) -> list[dict]:
     monthly = _active_monthly_by_patient(ids)
     installment = _active_installment_by_patient(ids)
     methods, categories, latest_method = _payment_facts(ids)
+    overdue = overdue_status_by_patient(ids)
 
     rows = []
     for patient in patients:
         monthly_service = monthly.get(patient.id)
         installment_service = installment.get(patient.id)
+        overdue_info = overdue.get(patient.id)
 
         # Monthly wins over installment for both fields — a patient in
         # ongoing therapy is described by that therapy, even if they are also
@@ -117,9 +127,60 @@ def build_rows(patients: list[Patient]) -> list[dict]:
                 "serviceCategories": sorted(categories.get(patient.id, set())),
                 "paymentMethods": sorted(methods.get(patient.id, set())),
                 "createdAt": patient.created_at,
+                "serviceStatus": "overdue" if overdue_info else "active",
+                "overdueAmount": overdue_info["amount"] if overdue_info else Decimal("0.00"),
+                "overdueSince": overdue_info["since"] if overdue_info else None,
             }
         )
     return rows
+
+
+def overdue_status_by_patient(ids) -> dict:
+    """
+    Which of these patients has an unpaid bill or installment past its due
+    date, on a still-active enrollment/plan -- and how much, and since when.
+
+    Two bulk queries rather than a per-patient loop, same discipline as the
+    rest of this module. `overdueAmount` sums every overdue item (docs/05
+    says a manager needs to see the total, not just a yes/no flag);
+    `overdueSince` is the oldest overdue due date, so the UI can show how
+    long, not just how much.
+    """
+    today = date.today()
+    overdue: dict[int, dict] = defaultdict(lambda: {"amount": Decimal("0.00"), "since": None})
+
+    def _accumulate(rows):
+        for patient_id, due_date, amount, amount_paid in rows:
+            entry = overdue[patient_id]
+            entry["amount"] += amount - amount_paid
+            if entry["since"] is None or due_date < entry["since"]:
+                entry["since"] = due_date
+
+    bills = (
+        MonthlyBill.objects.filter(
+            enrollment__patient_id__in=ids,
+            enrollment__status=EnrollmentStatus.ACTIVE,
+            due_date__lt=today,
+        )
+        .exclude(status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF])
+        .filter(amount_paid__lt=F("amount"))
+        .values_list("enrollment__patient_id", "due_date", "amount", "amount_paid")
+    )
+    _accumulate(bills)
+
+    installments = (
+        Installment.objects.filter(
+            plan__patient_id__in=ids,
+            plan__status=EnrollmentStatus.ACTIVE,
+            due_date__lt=today,
+        )
+        .exclude(status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF])
+        .filter(amount_paid__lt=F("amount"))
+        .values_list("plan__patient_id", "due_date", "amount", "amount_paid")
+    )
+    _accumulate(installments)
+
+    return dict(overdue)
 
 
 def _active_monthly_by_patient(ids) -> dict:
