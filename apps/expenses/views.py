@@ -31,6 +31,13 @@ class ExpenseViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
 
     queryset = Expense.objects.select_related("branch", "submitted_by", "reviewed_by").all()
     serializer_class = ExpenseSerializer
+
+    # Same rule as Payment: money records are never edited or deleted in
+    # place. A mistaken expense is corrected by rejecting it (which removes it
+    # from totals and leaves a reason on the record), not by erasing it — a
+    # manager who could delete their own submission could spend money and
+    # remove the evidence.
+    http_method_names = ["get", "post", "head", "options"]
     filterset_fields = ["status", "category"]
     search_fields = ["expense_code", "description", "paid_to"]
     ordering_fields = ["created_at", "amount"]
@@ -74,11 +81,6 @@ class ExpenseViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
             actor=request.user, branch=branch, data=dict(serializer.validated_data)
         )
         return Response(ExpenseSerializer(expense).data, status=status.HTTP_201_CREATED)
-
-    def destroy(self, request, *args, **kwargs):
-        expense = self.get_object()
-        expense.delete()  # soft
-        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=["post"])
     def review(self, request, pk=None):
