@@ -177,6 +177,53 @@ class TestBranchUpdate:
         manager.refresh_from_db()
         assert manager.check_password("rotated-pass-789")
 
+    def test_rotated_password_invalidates_the_old_one(
+        self, admin_client, api_client, branch, manager
+    ):
+        """Rotation only counts if the previous password stops working."""
+        payload = branch_payload(
+            name=branch.name,
+            code=branch.code,
+            manager_email=manager.email,
+            manager_name=manager.name,
+            manager_password="rotated-pass-789",
+        )
+        admin_client.put(reverse("branches:branch-detail", args=[branch.id]), payload)
+
+        old = api_client.post(
+            reverse("accounts:login"),
+            {"email": manager.email, "password": "manager-pass-123"},
+        )
+        new = api_client.post(
+            reverse("accounts:login"),
+            {"email": manager.email, "password": "rotated-pass-789"},
+        )
+
+        assert old.status_code == 401
+        assert new.status_code == 200
+
+    def test_changing_manager_email_changes_the_login(
+        self, admin_client, api_client, branch, manager
+    ):
+        payload = branch_payload(
+            name=branch.name,
+            code=branch.code,
+            manager_email="renamed.manager@speechlab.test",
+            manager_name=manager.name,
+        )
+        del payload["manager_password"]
+
+        admin_client.put(reverse("branches:branch-detail", args=[branch.id]), payload)
+
+        manager.refresh_from_db()
+        assert manager.email == "renamed.manager@speechlab.test"
+
+        response = api_client.post(
+            reverse("accounts:login"),
+            {"email": "renamed.manager@speechlab.test", "password": "manager-pass-123"},
+        )
+        assert response.status_code == 200
+
     def test_email_taken_by_another_account_rejected(
         self, admin_client, branch, other_manager
     ):
@@ -270,14 +317,40 @@ class TestBranchOverview:
         assert len(response.json()) == 2
         assert "patientCount" in response.json()[0]
 
-    @pytest.mark.isolation
-    def test_manager_overview_covers_only_their_branch(
-        self, manager_client, branch, other_branch
-    ):
-        response = manager_client.get(reverse("branches:branch-overview"))
+    def test_admin_gets_overview_for_a_single_branch(self, admin_client, branch):
+        response = admin_client.get(
+            reverse("branches:branch-overview-detail", args=[branch.id])
+        )
 
-        assert len(response.json()) == 1
-        assert response.json()[0]["branch"]["id"] == str(branch.id)
+        assert response.status_code == 200
+        assert response.json()["branch"]["id"] == str(branch.id)
+
+    @pytest.mark.isolation
+    def test_manager_denied_overview(self, manager_client):
+        """
+        Admin-only: the overview exposes cross-branch revenue, which is not a
+        manager's to see even for their own branch.
+        """
+        response = manager_client.get(reverse("branches:branch-overview"))
+        assert response.status_code == 403
+
+    @pytest.mark.isolation
+    def test_manager_denied_single_branch_overview(self, manager_client, branch):
+        response = manager_client.get(
+            reverse("branches:branch-overview-detail", args=[branch.id])
+        )
+        assert response.status_code == 403
+
+    def test_empty_branch_returns_zeros_not_an_error(self, admin_client, other_branch):
+        response = admin_client.get(
+            reverse("branches:branch-overview-detail", args=[other_branch.id])
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["patientCount"] == 0
+        assert body["totalCollected"] == "0.00"
+        assert body["monthlyRevenue"] == "0.00"
 
 
 class TestBranchModel:

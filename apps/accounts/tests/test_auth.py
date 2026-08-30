@@ -61,7 +61,8 @@ class TestLogin:
             reverse("accounts:login"),
             {"email": manager.email, "password": "wrong-password"},
         )
-        assert response.status_code == 400
+        assert response.status_code == 401
+        assert "accessToken" not in response.json()
 
     def test_unknown_and_wrong_password_give_identical_errors(self, api_client, manager):
         """
@@ -77,7 +78,7 @@ class TestLogin:
             {"email": manager.email, "password": "definitely-wrong"},
         )
 
-        assert unknown.status_code == wrong_password.status_code
+        assert unknown.status_code == wrong_password.status_code == 401
         assert unknown.json() == wrong_password.json()
 
     def test_deactivated_account_refused(self, api_client, manager):
@@ -88,7 +89,7 @@ class TestLogin:
             reverse("accounts:login"),
             {"email": manager.email, "password": "manager-pass-123"},
         )
-        assert response.status_code == 400
+        assert response.status_code == 401
 
     def test_soft_deleted_account_refused(self, api_client, manager):
         manager.delete()  # soft delete
@@ -97,7 +98,7 @@ class TestLogin:
             reverse("accounts:login"),
             {"email": manager.email, "password": "manager-pass-123"},
         )
-        assert response.status_code == 400
+        assert response.status_code == 401
 
     def test_manager_without_branch_refused_with_clear_message(self, api_client, db):
         """
@@ -117,8 +118,19 @@ class TestLogin:
             {"email": orphan.email, "password": "orphan-pass-123"},
         )
 
-        assert response.status_code == 400
+        assert response.status_code == 401
         assert "branch" in response.content.decode().lower()
+
+    def test_error_body_uses_detail_key(self, api_client, manager):
+        """
+        The frontend renders `error.response.data.detail` under the password
+        field. A different key would silently show nothing.
+        """
+        response = api_client.post(
+            reverse("accounts:login"),
+            {"email": manager.email, "password": "wrong"},
+        )
+        assert "detail" in response.json()
 
     def test_missing_fields_rejected(self, api_client):
         assert api_client.post(reverse("accounts:login"), {}).status_code == 400
@@ -133,6 +145,59 @@ class TestLogin:
         assert entry is not None
         assert entry.actor_id == manager.id
         assert entry.actor_email == manager.email
+
+
+class TestLoginThrottling:
+    """
+    Brute-force protection.
+
+    Throttling is disabled in the test settings so unrelated tests aren't
+    flaky, so it's re-enabled here explicitly — otherwise the protection could
+    be removed from production settings and no test would notice.
+    """
+
+    @pytest.fixture(autouse=True)
+    def enable_throttle(self, settings):
+        settings.REST_FRAMEWORK = {
+            **settings.REST_FRAMEWORK,
+            "DEFAULT_THROTTLE_RATES": {"login": "5/min"},
+        }
+        # Rates are read at class construction; clear any cached throttle
+        # history so counts start from zero for this test.
+        from django.core.cache import cache
+
+        cache.clear()
+        yield
+        cache.clear()
+
+    def test_repeated_failures_are_eventually_throttled(self, api_client, manager):
+        statuses = []
+        for _ in range(8):
+            response = api_client.post(
+                reverse("accounts:login"),
+                {"email": manager.email, "password": "wrong-password"},
+            )
+            statuses.append(response.status_code)
+
+        assert 429 in statuses, f"login was never throttled: {statuses}"
+
+    def test_throttle_applies_before_credentials_are_checked(self, api_client, manager):
+        """
+        Once throttled, even correct credentials are refused — otherwise an
+        attacker could keep guessing and the limit would only slow down the
+        failures, not the attack.
+        """
+        for _ in range(8):
+            api_client.post(
+                reverse("accounts:login"),
+                {"email": manager.email, "password": "wrong-password"},
+            )
+
+        response = api_client.post(
+            reverse("accounts:login"),
+            {"email": manager.email, "password": "manager-pass-123"},
+        )
+        assert response.status_code == 429
 
 
 class TestCurrentUser:

@@ -38,8 +38,11 @@ class BranchViewSet(viewsets.ModelViewSet):
     ordering_fields = ["name", "opened_at", "created_at"]
 
     def get_permissions(self):
-        # Reads are open to any authenticated user; writes are Admin-only.
-        if self.action in {"list", "retrieve", "overview", "overview_detail"}:
+        # Managers may read branches (they need their own branch's name for the
+        # sidebar and receipts), but the overview endpoints are Admin-only:
+        # they exist for the Admin branches grid and expose cross-branch
+        # revenue figures a manager has no business seeing.
+        if self.action in {"list", "retrieve"}:
             return [IsAuthenticated()]
         return [IsAdmin()]
 
@@ -87,6 +90,7 @@ class BranchViewSet(viewsets.ModelViewSet):
     def overview(self, request):
         """
         GET /api/branches/overview/ — every branch with its headline figures.
+        Admin only.
 
         Aggregates are placeholders until the payments and patients modules
         exist (Phases 2-3); the shape is settled now so the frontend's

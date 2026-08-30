@@ -7,6 +7,7 @@ Response shapes mirror what the frontend already consumes (`AuthUser` in
 
 from django.contrib.auth import authenticate
 from rest_framework import serializers
+from rest_framework.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.accounts.models import User
@@ -35,24 +36,22 @@ class LoginSerializer(serializers.Serializer):
             password=attrs["password"],
         )
 
-        # One message for both "no such user" and "wrong password" — telling
-        # them apart lets an attacker enumerate valid accounts.
+        # 401 rather than 400: these are authentication failures, not malformed
+        # input, and the frontend renders `detail` under the password field.
+        #
+        # One identical message for both "no such user" and "wrong password" —
+        # distinguishing them lets an attacker enumerate valid accounts.
         if user is None:
-            raise serializers.ValidationError(
-                {"detail": "Invalid email or password."}, code="authorization"
-            )
+            raise AuthenticationFailed("Invalid email or password.")
 
         if not user.is_active or user.is_deleted:
-            raise serializers.ValidationError(
-                {"detail": "This account has been deactivated."}, code="authorization"
-            )
+            raise AuthenticationFailed("This account has been deactivated.")
 
         # A manager with no branch would be scoped to nothing and see empty
         # screens everywhere; fail clearly at login instead.
         if user.is_manager and user.branch_id is None:
-            raise serializers.ValidationError(
-                {"detail": "This manager account is not assigned to a branch. Contact your administrator."},
-                code="authorization",
+            raise AuthenticationFailed(
+                "This manager account is not assigned to a branch. Contact your administrator."
             )
 
         attrs["user"] = user
