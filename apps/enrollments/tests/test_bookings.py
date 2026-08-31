@@ -392,3 +392,61 @@ class TestBookingPermissions:
         assert manager_client.get(
             reverse("enrollments:booking-detail", args=[booking_id])
         ).status_code == 200
+
+
+class TestBookingCalendarView:
+    """dateFrom/dateTo range filtering and the branch fields the calendar UI needs."""
+
+    def test_list_includes_branch_fields(self, manager_client, branch, patient, online_service):
+        manager_client.post(LIST_URL, payload(patient, online_service), format="json")
+
+        row = manager_client.get(LIST_URL).json()["results"][0]
+
+        assert row["branchId"] == str(branch.id)
+        assert row["branchName"] == branch.name
+
+    def test_date_range_filter_excludes_bookings_outside_the_window(
+        self, manager_client, patient, online_service
+    ):
+        in_range = timezone.localdate() + timedelta(days=3)
+        out_of_range = timezone.localdate() + timedelta(days=30)
+        manager_client.post(
+            LIST_URL, payload(patient, online_service, date=in_range.isoformat()), format="json"
+        )
+        manager_client.post(
+            LIST_URL,
+            payload(patient, online_service, date=out_of_range.isoformat()),
+            format="json",
+        )
+
+        response = manager_client.get(
+            LIST_URL,
+            {"dateFrom": in_range.isoformat(), "dateTo": in_range.isoformat()},
+        )
+
+        results = response.json()["results"]
+        assert len(results) == 1
+        assert results[0]["date"] == in_range.isoformat()
+
+    def test_more_than_ten_bookings_in_range_are_not_truncated(
+        self, manager_client, patient_factory, online_service
+    ):
+        """
+        The site-wide default page size is 10 -- a calendar month view needs
+        everything in the range at once, not paginated one page at a time.
+        """
+        target_date = timezone.localdate() + timedelta(days=3)
+        for _ in range(12):
+            manager_client.post(
+                LIST_URL,
+                payload(patient_factory(), online_service, date=target_date.isoformat()),
+                format="json",
+            )
+
+        response = manager_client.get(
+            LIST_URL,
+            {"dateFrom": target_date.isoformat(), "dateTo": target_date.isoformat()},
+        )
+
+        assert response.json()["count"] == 12
+        assert len(response.json()["results"]) == 12

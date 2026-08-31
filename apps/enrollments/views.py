@@ -8,6 +8,7 @@ Admin can see everything but shouldn't transact on a branch's behalf.
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
@@ -34,6 +35,10 @@ from apps.enrollments.serializers import (
 from apps.patients.models import Patient
 from apps.payments.serializers import PaymentSerializer
 from apps.services.models import Service
+
+
+class _CalendarPagination(PageNumberPagination):
+    page_size = 200
 
 
 def _error(exc: services.EnrollmentError, http_status=status.HTTP_400_BAD_REQUEST):
@@ -246,6 +251,36 @@ class BookingViewSet(_EnrollmentBase):
     queryset = Booking.objects.select_related("patient", "service", "branch")
     serializer_class = BookingSerializer
     filterset_fields = ["status", "date"]
+    # A calendar view wants every booking in the requested date range at
+    # once, not the site-wide default of 10 per page -- the range itself
+    # already bounds the result to a sane size (a branch's bookings for a
+    # month, not the whole table). Keeps the standard paginated envelope
+    # (count/results) rather than disabling pagination outright.
+    pagination_class = _CalendarPagination
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                "dateFrom", str, description="Inclusive. Calendar month/week views."
+            ),
+            OpenApiParameter("dateTo", str, description="Inclusive."),
+        ],
+    )
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    def get_queryset(self):
+        # A separate pair of query params rather than `filterset_fields`'s
+        # exact-match `date` -- a calendar view needs "everything in this
+        # month", not one day at a time.
+        queryset = super().get_queryset()
+        date_from = self.request.query_params.get("dateFrom")
+        date_to = self.request.query_params.get("dateTo")
+        if date_from:
+            queryset = queryset.filter(date__gte=date_from)
+        if date_to:
+            queryset = queryset.filter(date__lte=date_to)
+        return queryset
 
     def create(self, request, *args, **kwargs):
         serializer = BookingCreateSerializer(data=request.data)

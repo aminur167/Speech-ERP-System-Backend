@@ -122,6 +122,8 @@ class BookingSerializer(serializers.ModelSerializer):
     patientName = serializers.CharField(source="patient.name", read_only=True)
     serviceId = serializers.CharField(source="service_id", read_only=True)
     serviceName = serializers.CharField(source="service.name", read_only=True)
+    branchId = serializers.CharField(source="branch_id", read_only=True)
+    branchName = serializers.CharField(source="branch.name", read_only=True)
     advanceAmount = serializers.DecimalField(
         source="advance_amount", max_digits=12, decimal_places=2, read_only=True
     )
@@ -130,7 +132,7 @@ class BookingSerializer(serializers.ModelSerializer):
         model = Booking
         fields = [
             "id", "bookingCode", "patientId", "patientName", "serviceId", "serviceName",
-            "date", "time", "advanceAmount", "status",
+            "branchId", "branchName", "date", "time", "advanceAmount", "status",
         ]
         read_only_fields = fields
 
