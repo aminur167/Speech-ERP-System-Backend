@@ -39,12 +39,17 @@ class ExpenseWriteSerializer(serializers.ModelSerializer):
     amount = serializers.DecimalField(
         max_digits=12, decimal_places=2, min_value=MIN_AMOUNT
     )
+    # Offline-queue replay support (docs/00) -- see the matching fields on
+    # PatientWriteSerializer for why these aren't in Meta.fields.
+    idempotency_key = serializers.CharField(required=False, allow_blank=True, max_length=64)
+    client_created_at = serializers.DateTimeField(required=False, allow_null=True)
 
     class Meta:
         model = Expense
         fields = [
             "category", "amount", "description", "paid_to",
             "payment_method", "remarks", "is_recurring",
+            "idempotency_key", "client_created_at",
         ]
         extra_kwargs = {
             "remarks": {"required": False, "allow_blank": True},

@@ -133,6 +133,8 @@ class MaterialViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
                 movement_type=data["type"],
                 quantity=data["quantity"],
                 note=data.get("note", ""),
+                idempotency_key=data.get("idempotencyKey"),
+                client_created_at=data.get("clientCreatedAt"),
             )
         except services.MaterialError as exc:
             return _error(exc)

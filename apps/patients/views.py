@@ -173,12 +173,16 @@ class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         serializer = PatientWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        idempotency_key = data.pop("idempotency_key", None)
+        client_created_at = data.pop("client_created_at", None)
 
         # Always the manager's own branch, whatever the body claims.
         branch = Branch.objects.get(pk=request.user.branch_id)
 
         patient = services.create_patient(
-            actor=request.user, branch=branch, data=dict(serializer.validated_data)
+            actor=request.user, branch=branch, data=data,
+            idempotency_key=idempotency_key, client_created_at=client_created_at,
         )
         return Response(PatientSerializer(patient).data, status=status.HTTP_201_CREATED)
 
@@ -188,10 +192,14 @@ class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
             instance=patient, data=request.data, partial=kwargs.pop("partial", False)
         )
         serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        # idempotency_key/client_created_at describe the CREATE that's being
+        # replayed, not an editable field of the patient -- an edit is never
+        # itself offline-queued in a way that needs replay protection today.
+        data.pop("idempotency_key", None)
+        data.pop("client_created_at", None)
 
-        patient = services.update_patient(
-            actor=request.user, patient=patient, data=dict(serializer.validated_data)
-        )
+        patient = services.update_patient(actor=request.user, patient=patient, data=data)
         return Response(PatientSerializer(patient).data)
 
     def partial_update(self, request, *args, **kwargs):

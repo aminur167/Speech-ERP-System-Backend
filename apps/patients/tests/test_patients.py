@@ -113,6 +113,23 @@ class TestPatientCreation:
         ).json()["patientCode"]
         assert dhaka_second.endswith("00002")
 
+    def test_replayed_idempotency_key_returns_the_same_patient(self, manager_client):
+        """
+        Part of the offline-first prerequisites (docs/00): a queued
+        registration that gets replayed (network retry, an offline device
+        flushing its outbox) must return the original patient, not register
+        the same person a second time with a second patient_code.
+        """
+        payload = patient_payload(idempotency_key="reg-key-1")
+
+        first = manager_client.post(reverse("patients:patient-list"), payload)
+        second = manager_client.post(reverse("patients:patient-list"), payload)
+
+        assert first.status_code == 201
+        assert second.status_code == 201
+        assert first.json()["id"] == second.json()["id"]
+        assert Patient.objects.filter(phone="01711000003").count() == 1
+
     def test_admin_cannot_register_a_patient(self, admin_client):
         """Registration is a branch desk action; the UI hides it from Admin."""
         response = admin_client.post(reverse("patients:patient-list"), patient_payload())

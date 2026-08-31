@@ -20,7 +20,10 @@ class ExpenseError(Exception):
 
 
 @transaction.atomic
-def create_expense(*, actor, branch, data: dict) -> Expense:
+def create_expense(
+    *, actor, branch, data: dict,
+    idempotency_key: str | None = None, client_created_at=None,
+) -> Expense:
     """
     Record an expense.
 
@@ -31,8 +34,15 @@ def create_expense(*, actor, branch, data: dict) -> Expense:
 
     `expense_code` stays org-wide (not per-branch like receipts): expenses
     aren't taken at the counter under time pressure, so offline issuance
-    isn't a concern here.
+    isn't a concern here. A replayed *submission* still is, though (a
+    network retry after the first request actually landed) -- checked before
+    a code is drawn, same as patient registration.
     """
+    if idempotency_key:
+        existing = Expense.all_objects.filter(idempotency_key=idempotency_key).first()
+        if existing is not None:
+            return existing
+
     year = timezone.localdate().year
     value = next_value("expense", year)
 
@@ -48,6 +58,8 @@ def create_expense(*, actor, branch, data: dict) -> Expense:
         status=Expense.Status.APPROVED if auto_approved else Expense.Status.PENDING,
         reviewed_at=timezone.now() if auto_approved else None,
         review_note="Auto-approved (below approval threshold)" if auto_approved else "",
+        idempotency_key=idempotency_key or None,
+        client_created_at=client_created_at,
         **data,
     )
 

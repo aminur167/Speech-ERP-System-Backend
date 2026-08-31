@@ -469,6 +469,16 @@ def create_booking(
     client-supplied amount could otherwise undercharge, or overcharge, a
     patient at the moment of booking.
     """
+    # A replay must return the ORIGINAL booking, not a second one. The old
+    # code created the Booking unconditionally before ever consulting the
+    # idempotency key -- only the Payment underneath it was replay-safe, so a
+    # retried request minted a second booking_code and a second calendar
+    # slot for the same appointment even though it charged only once.
+    if idempotency_key:
+        existing_payment = Payment.all_objects.filter(idempotency_key=idempotency_key).first()
+        if existing_payment is not None:
+            return existing_payment.bookings.first(), existing_payment
+
     _validate_booking_slot(booking_date, booking_time)
 
     year = timezone.localdate().year

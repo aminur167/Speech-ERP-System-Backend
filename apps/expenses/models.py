@@ -16,10 +16,10 @@ from decimal import Decimal
 from django.core.validators import MinValueValidator
 from django.db import models
 
-from apps.common.models import SoftDeleteModel, TimeStampedModel
+from apps.common.models import IdempotentModel, SoftDeleteModel, TimeStampedModel
 
 
-class Expense(TimeStampedModel, SoftDeleteModel):
+class Expense(TimeStampedModel, SoftDeleteModel, IdempotentModel):
     class Category(models.TextChoices):
         RENT = "rent", "Rent"
         UTILITIES = "utilities", "Utilities"

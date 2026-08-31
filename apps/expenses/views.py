@@ -75,10 +75,14 @@ class ExpenseViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         serializer = ExpenseWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        idempotency_key = data.pop("idempotency_key", None)
+        client_created_at = data.pop("client_created_at", None)
 
         branch = Branch.objects.get(pk=request.user.branch_id)
         expense = services.create_expense(
-            actor=request.user, branch=branch, data=dict(serializer.validated_data)
+            actor=request.user, branch=branch, data=data,
+            idempotency_key=idempotency_key, client_created_at=client_created_at,
         )
         return Response(ExpenseSerializer(expense).data, status=status.HTTP_201_CREATED)
 

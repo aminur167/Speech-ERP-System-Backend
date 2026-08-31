@@ -117,6 +117,7 @@ class PatientWriteSerializer(serializers.ModelSerializer):
             "phone", "email", "address",
             "guardian_name", "guardian_relation", "guardian_phone", "emergency_contact",
             "referred_by", "chief_complaint", "national_id", "notes", "status",
+            "idempotency_key", "client_created_at",
         ]
         extra_kwargs = {
             # All optional at field level; create-time requiredness is applied
@@ -124,7 +125,7 @@ class PatientWriteSerializer(serializers.ModelSerializer):
             # rather than one per round-trip.
             field: {"required": False, "allow_blank": True}
             for field in fields
-            if field not in {"date_of_birth"}
+            if field not in {"date_of_birth", "idempotency_key", "client_created_at"}
         }
 
     date_of_birth = serializers.DateField(required=False, allow_null=True)
@@ -135,6 +136,12 @@ class PatientWriteSerializer(serializers.ModelSerializer):
     emergency_contact = serializers.CharField(
         required=False, allow_blank=True, validators=[validate_bd_phone]
     )
+    # Offline-queue replay support (docs/00) -- generated client-side once,
+    # when the manager acts, not regenerated on retry. Not part of the
+    # patient's own data, so the view pulls these out before handing the
+    # rest of validated_data to create_patient() as the row's fields.
+    idempotency_key = serializers.CharField(required=False, allow_blank=True, max_length=64)
+    client_created_at = serializers.DateTimeField(required=False, allow_null=True)
 
     def validate_date_of_birth(self, value):
         if value and value > date.today():

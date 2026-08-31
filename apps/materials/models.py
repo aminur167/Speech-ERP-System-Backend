@@ -15,7 +15,7 @@ from decimal import Decimal
 from django.core.validators import MinValueValidator
 from django.db import models
 
-from apps.common.models import SoftDeleteModel, TimeStampedModel
+from apps.common.models import IdempotentModel, SoftDeleteModel, TimeStampedModel
 
 
 class Material(TimeStampedModel, SoftDeleteModel):
@@ -73,7 +73,7 @@ class Material(TimeStampedModel, SoftDeleteModel):
         return self.unit_cost * self.quantity
 
 
-class MaterialMovement(TimeStampedModel):
+class MaterialMovement(TimeStampedModel, IdempotentModel):
     """
     Append-only stock ledger.
 

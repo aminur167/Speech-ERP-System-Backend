@@ -22,6 +22,34 @@ class TimeStampedModel(models.Model):
         abstract = True
 
 
+class IdempotentModel(models.Model):
+    """
+    Fields needed to safely replay a queued offline mutation (docs/00's
+    Full Offline-First section).
+
+    `idempotency_key` is generated client-side once, when the user acts —
+    not regenerated on retry. The service layer that creates a row of this
+    type must look the key up *before* creating anything and return the
+    existing row unchanged if found, the same pattern already used by
+    Payment. Unique + nullable: most rows won't have one (created by a
+    script, a migration, or an endpoint that hasn't adopted this yet), but
+    any two rows that DO have one must never collide.
+
+    `client_created_at` is what the offline device's clock claimed when the
+    action happened; `created_at` (from TimeStampedModel) is when the server
+    actually received it. The device's clock is untrusted — reports and
+    ordering use `created_at` unless there's a specific reason not to.
+    """
+
+    idempotency_key = models.CharField(
+        max_length=64, unique=True, null=True, blank=True, db_index=True
+    )
+    client_created_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        abstract = True
+
+
 class SoftDeleteQuerySet(models.QuerySet):
     def alive(self):
         return self.filter(is_deleted=False)

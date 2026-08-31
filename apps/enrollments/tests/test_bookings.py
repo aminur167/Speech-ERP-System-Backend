@@ -86,6 +86,27 @@ class TestBookingCreation:
         booking = Booking.objects.get(pk=response.json()["booking"]["id"])
         assert booking.payment_id == response.json()["payment"]["id"]
 
+    def test_replayed_idempotency_key_returns_the_same_booking(
+        self, manager_client, patient, online_service
+    ):
+        """
+        Regression test: create_booking() used to create the Booking row
+        unconditionally before ever consulting the idempotency key, so a
+        replay (network retry, an offline-queue flush) minted a second
+        booking_code and a second calendar slot for the same appointment
+        even though the underlying Payment correctly charged only once.
+        """
+        data = payload(patient, online_service, idempotencyKey="booking-key-1")
+
+        first = manager_client.post(LIST_URL, data, format="json")
+        second = manager_client.post(LIST_URL, data, format="json")
+
+        assert first.status_code == 201
+        assert second.status_code == 201
+        assert first.json()["booking"]["id"] == second.json()["booking"]["id"]
+        assert first.json()["payment"]["id"] == second.json()["payment"]["id"]
+        assert Booking.objects.filter(patient=patient, service=online_service).count() == 1
+
 
 @pytest.mark.money
 class TestAdvanceRecomputedServerSide:

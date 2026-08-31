@@ -16,7 +16,7 @@ from datetime import date
 
 from django.db import models
 
-from apps.common.models import SoftDeleteModel, TimeStampedModel
+from apps.common.models import IdempotentModel, SoftDeleteModel, TimeStampedModel
 from apps.common.validators import normalize_phone, validate_bd_phone
 
 
@@ -37,7 +37,7 @@ def calculate_age(date_of_birth: date | None, *, on: date | None = None) -> int 
     return age if had_birthday else age - 1
 
 
-class Patient(TimeStampedModel, SoftDeleteModel):
+class Patient(TimeStampedModel, SoftDeleteModel, IdempotentModel):
     class Gender(models.TextChoices):
         MALE = "male", "Male"
         FEMALE = "female", "Female"

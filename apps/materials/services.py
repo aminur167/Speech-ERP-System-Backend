@@ -49,13 +49,25 @@ def create_material(*, actor, branch, data: dict) -> Material:
 
 
 @transaction.atomic
-def adjust_stock(*, actor, material: Material, movement_type: str, quantity: int, note: str = ""):
+def adjust_stock(
+    *, actor, material: Material, movement_type: str, quantity: int, note: str = "",
+    idempotency_key: str | None = None, client_created_at=None,
+):
     """
     Move stock in or out, recording why.
 
     The row is locked for the update so two simultaneous adjustments can't both
     read the same starting quantity and lose one of the changes.
+
+    A replayed idempotency key must not move stock a second time -- checked
+    before the lock is even taken, same as every other offline-replayable
+    action (docs/00).
     """
+    if idempotency_key:
+        existing = MaterialMovement.objects.filter(idempotency_key=idempotency_key).first()
+        if existing is not None:
+            return existing.material
+
     if quantity <= 0:
         raise MaterialError("Quantity must be at least 1.", code="invalid_quantity")
 
@@ -81,6 +93,8 @@ def adjust_stock(*, actor, material: Material, movement_type: str, quantity: int
         note=note,
         branch=material.branch,
         created_by=actor,
+        idempotency_key=idempotency_key or None,
+        client_created_at=client_created_at,
     )
 
     audit.record(

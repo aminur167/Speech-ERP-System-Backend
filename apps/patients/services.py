@@ -16,14 +16,27 @@ def build_patient_code(branch: Branch, year: int, value: int) -> str:
 
 
 @transaction.atomic
-def create_patient(*, actor, branch: Branch, data: dict) -> Patient:
+def create_patient(
+    *, actor, branch: Branch, data: dict,
+    idempotency_key: str | None = None, client_created_at=None,
+) -> Patient:
     """
     Register a patient with a race-safe, branch-scoped code.
 
     The code is reserved inside this transaction so the number and the row it
     labels commit together — reserving outside would burn codes on any
     subsequent failure and leave gaps in a sequence people read.
+
+    A replayed idempotency key (a network retry, an offline-queue flush)
+    must return the SAME patient rather than register them twice — checked
+    before the code is even drawn, or a retry would burn a second
+    patient_code for no reason.
     """
+    if idempotency_key:
+        existing = Patient.all_objects.filter(idempotency_key=idempotency_key).first()
+        if existing is not None:
+            return existing
+
     year = timezone.localdate().year
     scope = f"patient:{branch.code}"
     value = next_value(scope, year)
@@ -32,6 +45,8 @@ def create_patient(*, actor, branch: Branch, data: dict) -> Patient:
         patient_code=build_patient_code(branch, year, value),
         branch=branch,
         created_by=actor if actor and actor.is_authenticated else None,
+        idempotency_key=idempotency_key or None,
+        client_created_at=client_created_at,
         **data,
     )
 

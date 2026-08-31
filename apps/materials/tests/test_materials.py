@@ -266,6 +266,23 @@ class TestStockAdjustment:
         flashcards.refresh_from_db()
         assert flashcards.quantity == 20
 
+    def test_replayed_idempotency_key_does_not_move_stock_twice(self, manager, flashcards):
+        """Offline-first prerequisite (docs/00): a replayed adjustment must be a no-op the second time."""
+        services.adjust_stock(
+            actor=manager, material=flashcards,
+            movement_type=MaterialMovement.Type.IN, quantity=10, note="Restock",
+            idempotency_key="stock-key-1",
+        )
+        services.adjust_stock(
+            actor=manager, material=flashcards,
+            movement_type=MaterialMovement.Type.IN, quantity=10, note="Restock",
+            idempotency_key="stock-key-1",
+        )
+
+        flashcards.refresh_from_db()
+        assert flashcards.quantity == 30  # +10 once, not twice
+        assert MaterialMovement.objects.filter(idempotency_key="stock-key-1").count() == 1
+
 
 class TestMaterialCreationValidation:
     def test_negative_opening_quantity_is_rejected(self, manager_client):

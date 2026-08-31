@@ -95,6 +95,8 @@ class AdjustStockSerializer(serializers.Serializer):
     type = serializers.ChoiceField(choices=MaterialMovement.Type.choices)
     quantity = serializers.IntegerField(min_value=1)
     note = serializers.CharField(required=False, allow_blank=True)
+    idempotencyKey = serializers.CharField(required=False, allow_blank=True, max_length=64)
+    clientCreatedAt = serializers.DateTimeField(required=False, allow_null=True)
 
 
 class SaleItemSerializer(serializers.Serializer):

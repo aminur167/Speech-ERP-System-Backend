@@ -597,6 +597,21 @@ class TestValidationAndCodes:
         assert manager_client.post(LIST_URL, data, format="json").status_code == 201
 
 
+class TestIdempotency:
+    """Offline-first prerequisite (docs/00): a replayed submission must not double-record spend."""
+
+    def test_replayed_idempotency_key_returns_the_same_expense(self, manager_client):
+        data = payload(idempotency_key="exp-key-1")
+
+        first = manager_client.post(LIST_URL, data, format="json")
+        second = manager_client.post(LIST_URL, data, format="json")
+
+        assert first.status_code == 201
+        assert second.status_code == 201
+        assert first.json()["id"] == second.json()["id"]
+        assert Expense.objects.filter(description="Therapy room stationery").count() == 1
+
+
 @pytest.mark.isolation
 class TestExpenseBranchIsolation:
     def test_manager_list_excludes_other_branches(
