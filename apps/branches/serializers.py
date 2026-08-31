@@ -93,6 +93,22 @@ class BranchWriteSerializer(serializers.Serializer):
             raise serializers.ValidationError("This email is already used by another account.")
         return value
 
+    def validate_manager_password(self, value):
+        """
+        Same strength bar as a self-service change, not just a length check.
+
+        An Admin sets this password for someone else, who then uses it to
+        log in and handle real payments -- there's no reason that credential
+        should be held to a lower standard than a manager changing their own.
+        Blank stays blank here (optional-on-update, "keep current" signal);
+        `validate()` below is what enforces non-blank on create.
+        """
+        if value:
+            from django.contrib.auth.password_validation import validate_password
+
+            validate_password(value)
+        return value
+
     def validate(self, attrs):
         creating = self.instance is None
         if creating and not attrs.get("manager_password"):

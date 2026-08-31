@@ -117,6 +117,25 @@ class TestBranchCreation:
         )
         assert response.status_code == 400
 
+    def test_common_password_rejected(self, admin_client):
+        """
+        Regression test: manager_password only checked min_length, not
+        Django's full validator stack -- an Admin could hand a new manager a
+        password like "password123" that a self-service change would refuse.
+        """
+        response = admin_client.post(
+            reverse("branches:branch-list"), branch_payload(manager_password="password123")
+        )
+        assert response.status_code == 400
+        assert "manager_password" in response.json()
+
+    def test_numeric_only_password_rejected(self, admin_client):
+        response = admin_client.post(
+            reverse("branches:branch-list"), branch_payload(manager_password="19283746")
+        )
+        assert response.status_code == 400
+        assert "manager_password" in response.json()
+
     def test_creation_is_audited(self, admin_client, admin_user):
         admin_client.post(reverse("branches:branch-list"), branch_payload())
 
