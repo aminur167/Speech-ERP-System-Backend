@@ -25,3 +25,7 @@ REST_FRAMEWORK = {  # noqa: F405
 
 # Keep test output readable — only warnings and above.
 LOGGING["root"]["level"] = "WARNING"  # noqa: F405
+
+# Captures sent emails in django.core.mail.outbox for assertions, and never
+# touches a real SMTP server.
+EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"

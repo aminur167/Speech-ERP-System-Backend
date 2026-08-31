@@ -234,7 +234,27 @@ its contents.
 
 ---
 
-## 10. Staging
+## 10. Scheduled jobs (reminders)
+
+Status: built, pending final confirmation with the client on whether it
+ships (`apps/notifications`). Both commands no-op safely (log instead of
+send) until Twilio/SMTP credentials are set in `backend.env` — see
+`.env.example`'s Reminders section.
+
+```bash
+sudo crontab -u speecherp -e
+# add:
+0 9 * * *  SPEECH_ERP_ENV_FILE=/etc/speech-erp/backend.env DJANGO_SETTINGS_MODULE=config.settings.production /opt/speech-erp/backend/.venv/bin/python /opt/speech-erp/backend/manage.py send_due_payment_reminders >> /var/log/speech-erp/reminders.log 2>&1
+0 18 * * * SPEECH_ERP_ENV_FILE=/etc/speech-erp/backend.env DJANGO_SETTINGS_MODULE=config.settings.production /opt/speech-erp/backend/.venv/bin/python /opt/speech-erp/backend/manage.py send_appointment_reminders >> /var/log/speech-erp/reminders.log 2>&1
+```
+
+If the client confirms this isn't wanted, remove these two cron lines and
+the `apps.notifications` app can stay dormant (it does nothing without
+being invoked) or be deleted outright.
+
+---
+
+## 11. Staging
 
 Staging is **the same `config.settings.production` module**, not a forked
 settings file — the whole point of a staging environment is to run what
@@ -248,7 +268,7 @@ staging first, verify, then repeat the same steps against production.
 
 ---
 
-## 11. Release checklist
+## 12. Release checklist
 
 For every deploy after the first:
 

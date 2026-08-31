@@ -63,6 +63,7 @@ LOCAL_APPS = [
     "apps.expenses",
     "apps.dailyclosing",
     "apps.reporting",
+    "apps.notifications",
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -264,6 +265,22 @@ CLOUDINARY_API_SECRET = env("CLOUDINARY_API_SECRET", default="")
 CLOUDINARY_UPLOAD_FOLDER = env("CLOUDINARY_UPLOAD_FOLDER", default="speech-erp/materials")
 CLOUDINARY_MAX_IMAGE_BYTES = env.int("CLOUDINARY_MAX_IMAGE_BYTES", default=5 * 1024 * 1024)
 CLOUDINARY_ALLOWED_FORMATS = ["jpg", "jpeg", "png", "webp"]
+
+# --------------------------------------------------------------------------
+# Reminders (SMS/WhatsApp via Twilio, email) — apps/notifications
+# --------------------------------------------------------------------------
+# Same shape as the Cloudinary/Sentry settings above: blank by default, and
+# every sender in apps/notifications/services.py no-ops to a log line rather
+# than failing when these aren't set — a clinic's first deploy shouldn't be
+# blocked on having a Twilio account, and this feature is still pending
+# final confirmation with the client at all.
+
+TWILIO_ACCOUNT_SID = env("TWILIO_ACCOUNT_SID", default="")
+TWILIO_AUTH_TOKEN = env("TWILIO_AUTH_TOKEN", default="")
+TWILIO_SMS_FROM = env("TWILIO_SMS_FROM", default="")
+TWILIO_WHATSAPP_FROM = env("TWILIO_WHATSAPP_FROM", default="")
+
+DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", default="no-reply@speechlab.test")
 
 # --------------------------------------------------------------------------
 # Logging

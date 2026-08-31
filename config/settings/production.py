@@ -65,3 +65,15 @@ if SENTRY_DSN:
     )
 
 LOGGING["root"]["level"] = "WARNING"  # noqa: F405
+
+# Same "warn, don't crash" shape as Sentry above: defaults to logging instead
+# of sending, so reminders (still pending final confirmation with the
+# client) never block a deploy on SMTP credentials being ready.
+EMAIL_BACKEND = env(  # noqa: F405
+    "EMAIL_BACKEND", default="django.core.mail.backends.console.EmailBackend"
+)
+EMAIL_HOST = env("EMAIL_HOST", default="")  # noqa: F405
+EMAIL_PORT = env.int("EMAIL_PORT", default=587)  # noqa: F405
+EMAIL_HOST_USER = env("EMAIL_HOST_USER", default="")  # noqa: F405
+EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", default="")  # noqa: F405
+EMAIL_USE_TLS = env.bool("EMAIL_USE_TLS", default=True)  # noqa: F405

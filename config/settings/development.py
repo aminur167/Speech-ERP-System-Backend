@@ -6,6 +6,11 @@ DEBUG = True
 
 ALLOWED_HOSTS = ["localhost", "127.0.0.1", "0.0.0.0"]
 
+# Reminder emails print to the console instead of actually sending — see
+# apps/notifications/services.py's DEFAULT_FROM_EMAIL comment for the same
+# reasoning applied to SMS/WhatsApp.
+EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+
 # The Next.js dev server.
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
