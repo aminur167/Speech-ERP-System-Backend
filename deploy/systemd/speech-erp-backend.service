@@ -1,0 +1,40 @@
+[Unit]
+Description=Speech ERP backend (Django via gunicorn)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=speecherp
+Group=speecherp
+WorkingDirectory=/opt/speech-erp/backend
+EnvironmentFile=/etc/speech-erp/backend.env
+Environment=DJANGO_SETTINGS_MODULE=config.settings.production
+
+# /run/speech-erp/ is created fresh (mode 0755, owned by this service's
+# user) on every start -- gunicorn's socket lives there, and nginx's
+# upstream in api.speech-erp.conf points at that same path.
+RuntimeDirectory=speech-erp
+RuntimeDirectoryMode=0755
+
+ExecStart=/opt/speech-erp/backend/.venv/bin/gunicorn \
+    config.wsgi:application \
+    --bind unix:/run/speech-erp/gunicorn.sock \
+    --workers 3 \
+    --timeout 30 \
+    --access-logfile /var/log/speech-erp/gunicorn-access.log \
+    --error-logfile /var/log/speech-erp/gunicorn-error.log
+
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Defense in depth -- this process only needs its own working directory,
+# the socket directory, and the log directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/speech-erp/backend/staticfiles /var/log/speech-erp
+
+[Install]
+WantedBy=multi-user.target

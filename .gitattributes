@@ -1,0 +1,5 @@
+# Shell scripts run on a Linux server (deploy/scripts/) -- force LF
+# regardless of a contributor's local core.autocrlf, so a Windows checkout
+# never silently ships a CRLF line-ending script that fails with
+# "bad interpreter" or a stray $'\r' on the actual target server.
+*.sh text eol=lf

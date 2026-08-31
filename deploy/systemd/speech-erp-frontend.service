@@ -1,0 +1,27 @@
+[Unit]
+Description=Speech ERP frontend (Next.js)
+After=network.target
+
+[Service]
+Type=simple
+User=speecherp
+Group=speecherp
+WorkingDirectory=/opt/speech-erp/frontend
+EnvironmentFile=/etc/speech-erp/frontend.env
+Environment=NODE_ENV=production
+Environment=PORT=3000
+
+# `next build` must have already been run as part of the deploy (see
+# docs/DEPLOYMENT.md) -- this only starts the already-built server.
+ExecStart=/usr/bin/npm run start
+
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/speech-erp/frontend/.next/cache
+
+[Install]
+WantedBy=multi-user.target

@@ -99,12 +99,28 @@ The frontend is a demo, so these are expected. Each is recorded in context in it
   `/api/docs/` (drf-spectacular). A dedicated test
   (`apps/common/tests/test_openapi_schema.py`) asserts the schema generates
   with zero errors, so a view that silently drops out of the docs fails CI.
-- ✅ Sentry wired up in `config/settings/production.py` — enabled the moment
-  `SENTRY_DSN` is set, PII scrubbed by default, a modest trace sample rate.
-- Automated off-server backups **plus a tested restore**
-- Uptime monitoring
-- SSL with auto-renewal
-- Seeded performance benchmark on production-like hardware
+- ✅ Sentry wired up on both apps — backend in
+  `config/settings/production.py`, frontend via `instrumentation.ts` /
+  `instrumentation-client.ts` / `sentry.server.config.ts` — enabled the
+  moment a DSN is set, PII scrubbed by default (`send_default_pii` /
+  `sendDefaultPii: false` on both), a modest trace sample rate.
+- ✅ Automated off-server backups **plus a tested restore** —
+  `deploy/scripts/backup_db.sh` (nightly, off-server via S3 or rsync,
+  retention-pruned) and `deploy/scripts/verify_backup_restore.sh` (weekly
+  cron: restores the latest dump into a throwaway database and sanity-checks
+  row counts, so "the backup works" is proven on a schedule, not assumed).
+  See `docs/DEPLOYMENT.md` §9.
+- ✅ Uptime monitoring — `/api/health/` is built and documented as the
+  external check target (`docs/DEPLOYMENT.md` §8); wiring an actual
+  UptimeRobot account is a one-time manual step at real-domain deploy time.
+- ✅ SSL with auto-renewal — `deploy/nginx/*.conf` + Certbot
+  (`docs/DEPLOYMENT.md` §6); Certbot's own systemd timer handles renewal,
+  nothing custom to maintain.
+- ✅ Staging environment — documented as the same `production` settings
+  module distinguished by env vars, not a forked settings file
+  (`docs/DEPLOYMENT.md` §10).
+- Seeded performance benchmark on production-like hardware — needs a real
+  server to be meaningful; deferred until one exists.
 - Client handover: documentation and training
 
 ---
