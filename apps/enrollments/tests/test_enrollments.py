@@ -192,20 +192,34 @@ class TestCollectionIsAtomic:
             services.collect_bill_payment(actor=manager, branch=branch, bill=bill, method="cash")
         assert exc.value.code == "already_paid"
 
-    def test_replayed_idempotency_key_does_not_settle_twice(
+    def test_replayed_idempotency_key_returns_the_original_payment(
         self, manager, branch, enrollment
     ):
+        """
+        Regression test: the already-settled guard used to run before the
+        idempotency-key lookup, so a genuine replay (network retry, an
+        offline-queue flushing) was rejected with "already_paid" instead of
+        getting back the payment its first attempt actually produced.
+        """
         bill = enrollment.oldest_unpaid_bill()
 
-        services.collect_bill_payment(
+        first_payment, _ = services.collect_bill_payment(
             actor=manager, branch=branch, bill=bill, method="cash", idempotency_key="k1"
         )
         payment_count = Payment.objects.count()
 
-        # A second call with the same key returns the original payment; the
-        # bill must not be settled again or the next bill double-promoted.
+        # The bill is now settled -- a naive replay would trip the
+        # already-settled guard if idempotency weren't checked first.
+        second_payment, _ = services.collect_bill_payment(
+            actor=manager, branch=branch, bill=bill, method="cash", idempotency_key="k1"
+        )
+
+        assert second_payment.pk == first_payment.pk
+        assert Payment.objects.count() == payment_count  # no double charge
+
         bill.refresh_from_db()
-        assert Payment.objects.count() == payment_count
+        assert bill.status == BillStatus.PAID
+        assert bill.amount_paid == bill.amount
 
     def test_cannot_collect_on_a_terminated_enrollment(self, manager, branch, enrollment):
         bill = enrollment.oldest_unpaid_bill()
@@ -215,6 +229,28 @@ class TestCollectionIsAtomic:
         with pytest.raises(services.EnrollmentError) as exc:
             services.collect_bill_payment(actor=manager, branch=branch, bill=bill, method="cash")
         assert exc.value.code == "terminated"
+
+    def test_replayed_idempotency_key_on_an_installment_returns_the_original_payment(
+        self, manager, branch, patient, installment_service
+    ):
+        """Same regression as the monthly-bill version above, for collect_installment_payment."""
+        plan = services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient,
+            service=installment_service, number_of_installments=3,
+        )
+        installment = plan.oldest_unpaid_installment()
+
+        first_payment, _ = services.collect_installment_payment(
+            actor=manager, branch=branch, installment=installment, method="cash", idempotency_key="k1"
+        )
+        payment_count = Payment.objects.count()
+
+        second_payment, _ = services.collect_installment_payment(
+            actor=manager, branch=branch, installment=installment, method="cash", idempotency_key="k1"
+        )
+
+        assert second_payment.pk == first_payment.pk
+        assert Payment.objects.count() == payment_count
 
 
 class TestOldestFirst:

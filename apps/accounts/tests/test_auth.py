@@ -246,6 +246,52 @@ class TestTokenRefresh:
     def test_refresh_requires_a_token(self, api_client):
         assert api_client.post(reverse("accounts:refresh"), {}).status_code == 400
 
+    def test_rotated_refresh_token_cannot_be_replayed(self, api_client, manager):
+        """
+        Regression test: rest_framework_simplejwt.token_blacklist was missing
+        from INSTALLED_APPS, so BLACKLIST_AFTER_ROTATION silently did nothing
+        and a rotated-away token kept working for its full lifetime.
+        """
+        login = api_client.post(
+            reverse("accounts:login"),
+            {"email": manager.email, "password": "manager-pass-123"},
+        ).json()
+        original_refresh = login["refreshToken"]
+
+        rotated = api_client.post(
+            reverse("accounts:refresh"), {"refreshToken": original_refresh}
+        )
+        assert rotated.status_code == 200
+
+        replay = api_client.post(
+            reverse("accounts:refresh"), {"refreshToken": original_refresh}
+        )
+        assert replay.status_code == 401
+
+
+class TestLogout:
+    def test_logout_blacklists_the_refresh_token(self, api_client, manager):
+        """Regression test for the same missing-app bug as rotation replay above."""
+        login = api_client.post(
+            reverse("accounts:login"),
+            {"email": manager.email, "password": "manager-pass-123"},
+        ).json()
+
+        logout_response = api_client.post(
+            reverse("accounts:logout"),
+            {"refreshToken": login["refreshToken"]},
+            HTTP_AUTHORIZATION=f"Bearer {login['accessToken']}",
+        )
+        assert logout_response.status_code == 204
+
+        replay = api_client.post(
+            reverse("accounts:refresh"), {"refreshToken": login["refreshToken"]}
+        )
+        assert replay.status_code == 401
+
+    def test_logout_without_a_token_still_succeeds(self, manager_client):
+        assert manager_client.post(reverse("accounts:logout"), {}).status_code == 204
+
 
 class TestProfile:
     def test_user_can_change_own_name(self, manager_client, manager):
@@ -308,6 +354,30 @@ class TestChangePassword:
         assert response.status_code == 400
         manager.refresh_from_db()
         assert manager.check_password("manager-pass-123")  # unchanged
+
+    def test_changing_password_blacklists_existing_refresh_tokens(self, api_client, manager):
+        """
+        A password change should end every other session, not just stop
+        accepting the old password on a fresh login -- otherwise a refresh
+        token issued before a compromised password was changed keeps working
+        for its full remaining lifetime.
+        """
+        login = api_client.post(
+            reverse("accounts:login"),
+            {"email": manager.email, "password": "manager-pass-123"},
+        ).json()
+
+        change_response = api_client.post(
+            reverse("accounts:change-password"),
+            {"current_password": "manager-pass-123", "new_password": "brand-new-pass-456"},
+            HTTP_AUTHORIZATION=f"Bearer {login['accessToken']}",
+        )
+        assert change_response.status_code == 204
+
+        replay = api_client.post(
+            reverse("accounts:refresh"), {"refreshToken": login["refreshToken"]}
+        )
+        assert replay.status_code == 401
 
     def test_weak_new_password_rejected(self, manager_client):
         response = manager_client.post(

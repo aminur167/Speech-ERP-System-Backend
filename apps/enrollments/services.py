@@ -34,7 +34,7 @@ from apps.enrollments.models import (
     due_date_for_month,
 )
 from apps.payments import services as payment_services
-from apps.payments.models import PaymentCategory
+from apps.payments.models import Payment, PaymentCategory
 
 ORDINALS = ["1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th", "11th", "12th"]
 
@@ -210,6 +210,18 @@ def collect_bill_payment(
     nothing to reconcile it against. One transaction makes that impossible.
     """
     enrollment = bill.enrollment
+
+    # An idempotency-key replay must return the ORIGINAL result even though
+    # the bill is already settled by now -- checked before every other guard,
+    # or a legitimate retry (a network timeout, an offline-queue replaying a
+    # queued mutation) gets told "already paid" instead of getting back the
+    # receipt its first attempt actually produced.
+    if idempotency_key:
+        existing = Payment.all_objects.filter(idempotency_key=idempotency_key).first()
+        if existing is not None:
+            bill.refresh_from_db()
+            return existing, bill
+
     if not enrollment.is_active:
         raise EnrollmentError("This enrollment has been terminated.", code="terminated")
 
@@ -262,6 +274,14 @@ def collect_installment_payment(
 ):
     """Same contract as `collect_bill_payment`, for installment plans."""
     plan = installment.plan
+
+    # See the matching guard in collect_bill_payment for why this runs first.
+    if idempotency_key:
+        existing = Payment.all_objects.filter(idempotency_key=idempotency_key).first()
+        if existing is not None:
+            installment.refresh_from_db()
+            return existing, installment
+
     if not plan.is_active:
         raise EnrollmentError("This plan has been terminated.", code="terminated")
 

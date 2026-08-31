@@ -107,6 +107,19 @@ class ChangePasswordSerializer(serializers.Serializer):
         user = self.context["request"].user
         user.set_password(self.validated_data["new_password"])
         user.save(update_fields=["password"])
+
+        # A password change should end every other session, not just stop
+        # accepting the old password on a fresh login -- otherwise a refresh
+        # token issued before a compromised password was changed keeps
+        # working for its full remaining lifetime regardless.
+        from rest_framework_simplejwt.token_blacklist.models import (
+            BlacklistedToken,
+            OutstandingToken,
+        )
+
+        for outstanding in OutstandingToken.objects.filter(user=user):
+            BlacklistedToken.objects.get_or_create(token=outstanding)
+
         return user
 
 

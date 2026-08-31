@@ -267,6 +267,35 @@ class TestStockAdjustment:
         assert flashcards.quantity == 20
 
 
+class TestMaterialCreationValidation:
+    def test_negative_opening_quantity_is_rejected(self, manager_client):
+        """
+        Regression test: quantity had no lower-bound validation (unlike
+        unit_cost/selling_price, which both reject below their minimum), so a
+        material could be created already sitting at negative stock.
+        """
+        response = manager_client.post(
+            reverse("materials:material-list"),
+            {
+                "name": "Bad Opening Stock", "unit": "piece", "quantity": -5,
+                "unit_cost": "10.00", "selling_price": "20.00", "reorder_level": 0,
+            },
+        )
+        assert response.status_code == 400
+        assert "quantity" in response.json()
+
+    def test_zero_opening_quantity_is_accepted(self, manager_client):
+        response = manager_client.post(
+            reverse("materials:material-list"),
+            {
+                "name": "Zero Opening Stock", "unit": "piece", "quantity": 0,
+                "unit_cost": "10.00", "selling_price": "20.00", "reorder_level": 0,
+            },
+        )
+        assert response.status_code == 201
+        assert response.json()["quantity"] == 0
+
+
 class TestMaterialImages:
     def test_material_without_an_image_is_fine(self, manager_client):
         response = manager_client.post(

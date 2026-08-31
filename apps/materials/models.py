@@ -37,7 +37,9 @@ class Material(TimeStampedModel, SoftDeleteModel):
     image_public_id = models.CharField(max_length=255, blank=True)
 
     unit = models.CharField(max_length=16, choices=Unit.choices, default=Unit.PIECE)
-    quantity = models.IntegerField(default=0)
+    # Never negative -- a physical stock count can't go below zero. Matches
+    # reorder_level's own PositiveIntegerField for the same reason.
+    quantity = models.PositiveIntegerField(default=0)
 
     unit_cost = models.DecimalField(
         max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal("0.00"))]
