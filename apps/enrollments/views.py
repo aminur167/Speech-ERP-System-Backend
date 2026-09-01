@@ -26,6 +26,7 @@ from apps.enrollments.models import (
 from apps.enrollments.serializers import (
     BookingCreateSerializer,
     BookingSerializer,
+    CancelBookingSerializer,
     CollectPaymentSerializer,
     InstallmentPlanCreateSerializer,
     InstallmentPlanSerializer,
@@ -318,3 +319,18 @@ class BookingViewSet(_EnrollmentBase):
             },
             status=status.HTTP_201_CREATED,
         )
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        booking = self.get_object()
+        serializer = CancelBookingSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            booking = services.cancel_booking(
+                actor=request.user, booking=booking, reason=serializer.validated_data["reason"]
+            )
+        except services.EnrollmentError as exc:
+            return _error(exc)
+
+        return Response(BookingSerializer(booking).data)

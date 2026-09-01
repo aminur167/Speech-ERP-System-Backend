@@ -521,3 +521,28 @@ def create_booking(
         changes={"booking_code": code, "advance": str(advance_amount)},
     )
     return booking, payment
+
+
+def cancel_booking(*, actor, booking: Booking, reason: str = "") -> Booking:
+    """
+    Marks a booking cancelled. Does not touch its payment -- the advance
+    already collected is real money that moved, and refunding it (or not) is
+    a separate decision that goes through the existing Refund Request flow
+    (Manager requests, Admin approves), the same as any other collected
+    payment. Reinventing that here would create a second, untested path to
+    the same outcome.
+    """
+    if booking.status == Booking.Status.CANCELLED:
+        raise EnrollmentError("This booking is already cancelled.", code="already_cancelled")
+
+    booking.status = Booking.Status.CANCELLED
+    booking.save(update_fields=["status"])
+
+    audit.record(
+        actor=actor,
+        action=AuditLog.Action.TERMINATE,
+        target=booking,
+        branch=booking.branch,
+        reason=reason,
+    )
+    return booking

@@ -450,3 +450,82 @@ class TestBookingCalendarView:
 
         assert response.json()["count"] == 12
         assert len(response.json()["results"]) == 12
+
+
+class TestBookingCancellation:
+    def test_manager_can_cancel_their_branch_booking(
+        self, manager_client, patient, online_service
+    ):
+        create_response = manager_client.post(
+            LIST_URL, payload(patient, online_service), format="json"
+        )
+        booking_id = create_response.json()["booking"]["id"]
+
+        response = manager_client.post(
+            reverse("enrollments:booking-cancel", args=[booking_id]),
+            {"reason": "Patient rescheduled."},
+            format="json",
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "cancelled"
+
+    def test_cancelling_an_already_cancelled_booking_is_rejected(
+        self, manager_client, patient, online_service
+    ):
+        create_response = manager_client.post(
+            LIST_URL, payload(patient, online_service), format="json"
+        )
+        booking_id = create_response.json()["booking"]["id"]
+        cancel_url = reverse("enrollments:booking-cancel", args=[booking_id])
+        manager_client.post(cancel_url, {}, format="json")
+
+        response = manager_client.post(cancel_url, {}, format="json")
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "already_cancelled"
+
+    def test_admin_cannot_cancel_a_booking(self, admin_client, manager_client, patient, online_service):
+        create_response = manager_client.post(
+            LIST_URL, payload(patient, online_service), format="json"
+        )
+        booking_id = create_response.json()["booking"]["id"]
+
+        response = admin_client.post(
+            reverse("enrollments:booking-cancel", args=[booking_id]), {}, format="json"
+        )
+
+        assert response.status_code == 403
+
+    def test_manager_cannot_cancel_another_branchs_booking(
+        self, manager_client, other_manager, other_branch, online_service, patient_factory
+    ):
+        foreign_patient = patient_factory(branch=other_branch)
+        from apps.enrollments import services as enrollment_services
+
+        booking, _ = enrollment_services.create_booking(
+            actor=other_manager, branch=other_branch, patient=foreign_patient,
+            service=online_service, booking_date=timezone.localdate() + timedelta(days=3),
+            booking_time="14:00", method="cash",
+        )
+
+        response = manager_client.post(
+            reverse("enrollments:booking-cancel", args=[booking.id]), {}, format="json"
+        )
+
+        assert response.status_code == 404
+
+    def test_cancelling_does_not_touch_the_payment(self, manager_client, patient, online_service):
+        from apps.payments.models import Payment
+
+        create_response = manager_client.post(
+            LIST_URL, payload(patient, online_service), format="json"
+        )
+        booking_id = create_response.json()["booking"]["id"]
+        payment_id = create_response.json()["payment"]["id"]
+
+        manager_client.post(
+            reverse("enrollments:booking-cancel", args=[booking_id]), {}, format="json"
+        )
+
+        assert Payment.objects.get(pk=payment_id).status == "paid"

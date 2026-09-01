@@ -150,3 +150,7 @@ class BookingCreateSerializer(serializers.Serializer):
     time = serializers.CharField(max_length=16)
     method = serializers.ChoiceField(choices=PaymentMethod.choices)
     idempotencyKey = serializers.CharField(required=False, allow_blank=True, max_length=64)
+
+
+class CancelBookingSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=False, allow_blank=True, default="")
