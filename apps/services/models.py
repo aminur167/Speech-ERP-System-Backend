@@ -30,6 +30,11 @@ class Service(TimeStampedModel, SoftDeleteModel):
         INSTALLMENT = "installment", "Installment"
         ONLINE = "online", "Online"
 
+    class ReviewStatus(models.TextChoices):
+        APPROVED = "approved", "Approved"
+        PENDING = "pending", "Pending"
+        REJECTED = "rejected", "Rejected"
+
     name = models.CharField(max_length=150)
     code = models.CharField(max_length=32, unique=True, db_index=True)
     category = models.CharField(max_length=16, choices=Category.choices, db_index=True)
@@ -62,9 +67,31 @@ class Service(TimeStampedModel, SoftDeleteModel):
 
     is_active = models.BooleanField(default=True, db_index=True)
 
+    # A Manager may propose a new package (docs/03's Admin-only catalog CRUD
+    # still governs edit/delete/activate/deactivate -- only creation opens up,
+    # and only as a proposal). Defaults to APPROVED so an Admin's own creates
+    # -- and every service that existed before this field did -- behave
+    # exactly as before, with no separate self-approval step.
+    review_status = models.CharField(
+        max_length=16, choices=ReviewStatus.choices, default=ReviewStatus.APPROVED, db_index=True
+    )
+    proposed_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="proposed_services",
+    )
+    review_note = models.TextField(blank=True)
+    reviewed_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="reviewed_services",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+
     class Meta:
         ordering = ["category", "name"]
-        indexes = [models.Index(fields=["category", "is_active"])]
+        indexes = [
+            models.Index(fields=["category", "is_active"]),
+            models.Index(fields=["review_status"]),
+        ]
 
     def __str__(self):
         return f"{self.name} ({self.code})"

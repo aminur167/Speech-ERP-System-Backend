@@ -111,9 +111,11 @@ class TestServicePermissions:
         """Read access is intentional — the enrollment wizards need the catalog."""
         assert manager_client.get(reverse("services:service-list")).status_code == 200
 
-    def test_manager_cannot_create(self, manager_client):
+    def test_manager_can_propose_a_package_but_it_lands_pending(self, manager_client):
+        """A Manager may create a package, but it's a proposal, not a live entry — see TestServiceReview."""
         response = manager_client.post(reverse("services:service-list"), service_payload())
-        assert response.status_code == 403
+        assert response.status_code == 201
+        assert response.json()["reviewStatus"] == "pending"
 
     def test_manager_cannot_update(self, manager_client, service):
         response = manager_client.patch(
@@ -474,3 +476,117 @@ class TestCatalogIsNotBranchScoped:
             reverse("services:service-detail", args=[service.id])
         )
         assert response.status_code == 200
+
+
+class TestServiceReview:
+    """A Manager's proposed package stays invisible to enrollment until Admin reviews it."""
+
+    def _propose(self, manager_client, **overrides):
+        response = manager_client.post(
+            reverse("services:service-list"), service_payload(**overrides)
+        )
+        assert response.status_code == 201
+        return response.json()["id"]
+
+    def test_pending_package_is_excluded_from_the_default_list(self, manager_client):
+        """The default list (no ?includePending) is what enrollment wizards call — never show an unapproved package there."""
+        self._propose(manager_client)
+
+        response = manager_client.get(reverse("services:service-list"))
+
+        assert response.json()["count"] == 0
+
+    def test_manager_sees_their_own_pending_proposal_with_includepending(self, manager_client):
+        self._propose(manager_client)
+
+        response = manager_client.get(
+            reverse("services:service-list"), {"includePending": "true"}
+        )
+
+        assert response.json()["count"] == 1
+        assert response.json()["results"][0]["reviewStatus"] == "pending"
+
+    def test_manager_does_not_see_another_managers_pending_proposal(
+        self, manager_client, other_manager_client
+    ):
+        self._propose(other_manager_client, code="PKG-OTHER-01")
+
+        response = manager_client.get(
+            reverse("services:service-list"), {"includePending": "true"}
+        )
+
+        assert response.json()["count"] == 0
+
+    def test_admin_sees_every_pending_proposal_with_includepending(
+        self, admin_client, manager_client, other_manager_client
+    ):
+        self._propose(manager_client, code="PKG-MINE-01")
+        self._propose(other_manager_client, code="PKG-THEIRS-01")
+
+        response = admin_client.get(
+            reverse("services:service-list"), {"includePending": "true"}
+        )
+
+        assert response.json()["count"] == 2
+
+    def test_manager_cannot_review(self, manager_client):
+        service_id = self._propose(manager_client)
+
+        response = manager_client.post(
+            reverse("services:service-review", args=[service_id]), {"approve": True}
+        )
+
+        assert response.status_code == 403
+
+    def test_admin_approving_makes_the_package_immediately_enrollable(
+        self, admin_client, manager_client
+    ):
+        service_id = self._propose(manager_client)
+
+        response = admin_client.post(
+            reverse("services:service-review", args=[service_id]), {"approve": True}
+        )
+        assert response.status_code == 200
+        assert response.json()["reviewStatus"] == "approved"
+
+        listed = manager_client.get(reverse("services:service-list")).json()
+        assert listed["count"] == 1
+
+    def test_admin_rejecting_requires_a_reason(self, admin_client, manager_client):
+        service_id = self._propose(manager_client)
+
+        response = admin_client.post(
+            reverse("services:service-review", args=[service_id]), {"approve": False}
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "note_required"
+
+    def test_admin_rejecting_with_a_reason_succeeds(self, admin_client, manager_client):
+        service_id = self._propose(manager_client)
+
+        response = admin_client.post(
+            reverse("services:service-review", args=[service_id]),
+            {"approve": False, "reviewNote": "Duplicate of an existing package."},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["reviewStatus"] == "rejected"
+        assert response.json()["reviewNote"] == "Duplicate of an existing package."
+
+    def test_cannot_review_an_already_decided_package(self, admin_client, manager_client):
+        service_id = self._propose(manager_client)
+        admin_client.post(reverse("services:service-review", args=[service_id]), {"approve": True})
+
+        response = admin_client.post(
+            reverse("services:service-review", args=[service_id]), {"approve": True}
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "not_pending"
+
+    def test_admin_created_service_is_approved_immediately(self, admin_client):
+        response = admin_client.post(reverse("services:service-list"), service_payload())
+
+        assert response.status_code == 201
+        assert response.json()["reviewStatus"] == "approved"

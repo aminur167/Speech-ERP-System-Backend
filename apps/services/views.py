@@ -15,8 +15,13 @@ from rest_framework.response import Response
 from apps.common import audit
 from apps.common.models import AuditLog
 from apps.common.permissions import IsAdmin
+from apps.services import services
 from apps.services.models import Service
-from apps.services.serializers import ServiceSerializer, ServiceWriteSerializer
+from apps.services.serializers import (
+    ServiceReviewSerializer,
+    ServiceSerializer,
+    ServiceWriteSerializer,
+)
 
 
 class ServiceViewSet(viewsets.ModelViewSet):
@@ -30,6 +35,12 @@ class ServiceViewSet(viewsets.ModelViewSet):
 
     def get_permissions(self):
         if self.action in {"list", "retrieve", "enrollment_counts"}:
+            return [IsAuthenticated()]
+        # Anyone authenticated may propose a new package (create()) -- a
+        # Manager's proposal lands as `pending`, never live, until Admin
+        # reviews it via `review`. Every other write (edit, delete,
+        # (de)activate) stays Admin-only, unchanged.
+        if self.action == "create":
             return [IsAuthenticated()]
         return [IsAdmin()]
 
@@ -68,17 +79,48 @@ class ServiceViewSet(viewsets.ModelViewSet):
         if not include_inactive:
             queryset = queryset.filter(is_active=True)
 
+        # A pending or rejected proposal must never appear as a selectable
+        # option in an enrollment wizard -- those call this same endpoint
+        # without ?includePending, so they get approved-only by default
+        # (true for both roles: even the Manager who proposed a package can't
+        # enroll a patient in it before Admin approves it). The catalog pages
+        # (Admin's and the Manager's) pass includePending=true to also show
+        # what's awaiting a decision: Admin sees every pending/rejected
+        # proposal (their queue to review); a Manager sees only their own,
+        # so they can track it without seeing other branches' proposals.
+        include_pending = (
+            self.request.query_params.get("includePending", "").lower() == "true"
+        )
+        if not include_pending:
+            queryset = queryset.filter(review_status=Service.ReviewStatus.APPROVED)
+        elif not self.request.user.is_admin:
+            queryset = queryset.filter(
+                Q(review_status=Service.ReviewStatus.APPROVED)
+                | Q(proposed_by=self.request.user)
+            )
+
         return queryset
 
     def create(self, request, *args, **kwargs):
         serializer = ServiceWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        service = serializer.save()
+
+        # A Manager's package is a proposal, not a live catalog entry -- it
+        # never reaches enrollment pickers (get_queryset above) until Admin
+        # reviews it. Admin's own creates keep today's behaviour: live
+        # immediately, no self-approval step.
+        if request.user.is_admin:
+            service = serializer.save()
+        else:
+            service = serializer.save(
+                review_status=Service.ReviewStatus.PENDING, proposed_by=request.user
+            )
 
         audit.record(
             actor=request.user,
             action=AuditLog.Action.CREATE,
             target=service,
+            reason="Proposed for admin review" if not request.user.is_admin else "",
             changes={"code": service.code, "name": service.name, "fee": str(service.fee)},
         )
         return Response(ServiceSerializer(service).data, status=status.HTTP_201_CREATED)
@@ -139,6 +181,27 @@ class ServiceViewSet(viewsets.ModelViewSet):
             changes={"code": service.code},
         )
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["post"])
+    def review(self, request, pk=None):
+        """Admin approves or rejects a Manager's proposed package."""
+        service = self.get_object()
+        serializer = ServiceReviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            service = services.review_service(
+                actor=request.user,
+                service=service,
+                approve=serializer.validated_data["approve"],
+                review_note=serializer.validated_data.get("reviewNote", ""),
+            )
+        except services.ServiceError as exc:
+            return Response(
+                {"detail": exc.message, "code": exc.code}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        return Response(ServiceSerializer(service).data)
 
     @action(detail=True, methods=["post"])
     def deactivate(self, request, pk=None):

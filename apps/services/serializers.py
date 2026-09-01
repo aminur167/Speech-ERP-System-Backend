@@ -22,12 +22,18 @@ class ServiceSerializer(serializers.ModelSerializer):
     sessionsLabel = serializers.CharField(source="sessions_label", read_only=True)
     expiryLabel = serializers.CharField(source="expiry_label", read_only=True)
     isActive = serializers.BooleanField(source="is_active", read_only=True)
+    reviewStatus = serializers.CharField(source="review_status", read_only=True)
+    proposedBy = serializers.CharField(source="proposed_by.name", read_only=True, default="")
+    reviewNote = serializers.CharField(source="review_note", read_only=True)
+    reviewedBy = serializers.CharField(source="reviewed_by.name", read_only=True, default="")
+    reviewedAt = serializers.DateTimeField(source="reviewed_at", read_only=True)
 
     class Meta:
         model = Service
         fields = [
             "id", "name", "code", "category", "fee", "isOnline", "description",
             "originalFee", "durationLabel", "sessionsLabel", "expiryLabel", "isActive",
+            "reviewStatus", "proposedBy", "reviewNote", "reviewedBy", "reviewedAt",
         ]
         read_only_fields = fields
 
@@ -74,3 +80,10 @@ class ServiceWriteSerializer(serializers.ModelSerializer):
         if value is not None and value <= Decimal("0"):
             raise serializers.ValidationError("Original fee must be greater than zero.")
         return value
+
+
+class ServiceReviewSerializer(serializers.Serializer):
+    """Admin approves or rejects a Manager's proposed package."""
+
+    approve = serializers.BooleanField()
+    reviewNote = serializers.CharField(required=False, allow_blank=True)
