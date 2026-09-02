@@ -1,19 +1,23 @@
 """
 Service catalog endpoints.
 
-Read access is intentionally open to both roles — the enrollment wizards need
-the catalog. Writes are Admin-only, enforced here and not by the frontend's
-`canManage` flag alone.
+Branch-scoped (apps/services/models.py). A Manager only ever sees and
+creates for their own branch. Admin sees every branch and may narrow with
+`?branch=<id>`; edit/delete/(de)activate/review stay Admin-only, enforced
+here and not by the frontend's `canManage` flag alone.
 """
 
 from django.db.models import Count, Q
+from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from apps.accounts.models import User
+from apps.branches.models import Branch
 from apps.common import audit
+from apps.common.mixins import BranchScopedQuerySetMixin
 from apps.common.models import AuditLog
 from apps.common.permissions import IsAdmin
 from apps.notifications.inapp import notify_many
@@ -26,10 +30,17 @@ from apps.services.serializers import (
 )
 
 
-class ServiceViewSet(viewsets.ModelViewSet):
-    """/api/services/ — organisation-wide, not branch-scoped."""
+class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
+    """
+    /api/services/ — branch-scoped, like Materials.
 
-    queryset = Service.objects.all()
+    A Manager only ever sees and creates for their own branch. Admin sees
+    every branch by default and may narrow with `?branch=<id>`; creating as
+    Admin requires `branch` in the payload -- there's no "current branch" to
+    fall back to (BranchScopedQuerySetMixin.get_effective_branch_id).
+    """
+
+    queryset = Service.objects.select_related("branch").all()
     serializer_class = ServiceSerializer
     filterset_fields = ["category", "is_online"]
     search_fields = ["name", "code"]
@@ -69,6 +80,9 @@ class ServiceViewSet(viewsets.ModelViewSet):
         again. docs/03 is explicit that a deactivated service "is still
         visible in the Admin catalog... so it can be reactivated."
         """
+        # BranchScopedQuerySetMixin.get_queryset() first: a Manager only ever
+        # sees their own branch; Admin sees every branch, optionally narrowed
+        # with ?branch=<id>. Everything below layers on top of that.
         queryset = super().get_queryset()
 
         if self.action != "list":
@@ -104,20 +118,29 @@ class ServiceViewSet(viewsets.ModelViewSet):
         return queryset
 
     def create(self, request, *args, **kwargs):
-        serializer = ServiceWriteSerializer(data=request.data)
+        # Resolved before validation, not after, so validate_code can check
+        # the (branch, code) uniqueness constraint against the right branch.
+        if request.user.is_admin:
+            branch_id = self.get_effective_branch_id()
+            branch = get_object_or_404(Branch, pk=branch_id)
+        else:
+            branch = request.user.branch
+
+        serializer = ServiceWriteSerializer(data=request.data, context={"branch": branch})
         serializer.is_valid(raise_exception=True)
 
-        # A Manager's package is a proposal, not a live catalog entry -- it
-        # never reaches enrollment pickers (get_queryset above) until Admin
-        # reviews it. Admin's own creates keep today's behaviour: live
-        # immediately, no self-approval step.
+        # A Manager's package is filed under their own branch and lands as a
+        # proposal, not a live catalog entry -- it never reaches enrollment
+        # pickers (get_queryset above) until Admin reviews it. Admin creates
+        # directly for a branch they name explicitly (there's no "their own
+        # branch" to default to) and it's live immediately, no self-approval.
         if request.user.is_admin:
-            service = serializer.save()
+            service = serializer.save(branch=branch)
         else:
             service = serializer.save(
-                review_status=Service.ReviewStatus.PENDING, proposed_by=request.user
+                branch=branch, review_status=Service.ReviewStatus.PENDING, proposed_by=request.user
             )
-            branch_name = request.user.branch.name if request.user.branch_id else "A branch"
+            branch_name = branch.name if branch else "A branch"
             notify_many(
                 recipients=User.objects.filter(role=User.Role.ADMIN),
                 title="New package proposal",
@@ -139,7 +162,10 @@ class ServiceViewSet(viewsets.ModelViewSet):
         before = {"name": service.name, "fee": str(service.fee), "code": service.code}
 
         serializer = ServiceWriteSerializer(
-            instance=service, data=request.data, partial=kwargs.pop("partial", False)
+            instance=service,
+            data=request.data,
+            partial=kwargs.pop("partial", False),
+            context={"branch": service.branch},
         )
         serializer.is_valid(raise_exception=True)
         service = serializer.save()

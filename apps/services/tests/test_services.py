@@ -1,11 +1,10 @@
 """
 Service catalog tests — follows the required-test list in docs/03.
 
-The highest-value groups here are the delete-vs-deactivate distinction and the
-deliberate absence of branch scoping. Both are places where a well-meaning
-change could quietly break something important: deleting a package patients
-are paying for, or "adding branch scoping everywhere" and splitting the shared
-catalog.
+The highest-value groups here are the delete-vs-deactivate distinction and
+branch isolation (TestCatalogIsBranchScoped) -- a well-meaning change could
+quietly break either: deleting a package patients are paying for, or letting
+a package leak across branches the way Materials and Patients never do.
 """
 
 from decimal import Decimal
@@ -35,8 +34,9 @@ def service_payload(**overrides):
 
 
 @pytest.fixture
-def service(db):
+def service(db, branch):
     return Service.objects.create(
+        branch=branch,
         name="Individual Therapy",
         code="MON-INDIV",
         category=Service.Category.MONTHLY,
@@ -45,54 +45,76 @@ def service(db):
 
 
 class TestServiceCrud:
-    def test_admin_creates_a_service(self, admin_client):
-        response = admin_client.post(reverse("services:service-list"), service_payload())
+    def test_admin_creates_a_service(self, admin_client, branch):
+        response = admin_client.post(
+            reverse("services:service-list"), service_payload(branch=branch.id)
+        )
 
         assert response.status_code == 201
         assert response.json()["code"] == "PKG-M1-01"
+        assert response.json()["branchId"] == str(branch.id)
 
-    def test_optional_fields_may_be_omitted(self, admin_client):
+    def test_admin_create_requires_a_branch(self, admin_client):
+        """Unlike a Manager, Admin has no "own branch" to fall back to."""
+        response = admin_client.post(reverse("services:service-list"), service_payload())
+        assert response.status_code == 400
+
+    def test_optional_fields_may_be_omitted(self, admin_client, branch):
         response = admin_client.post(
             reverse("services:service-list"),
-            {"name": "Bare", "code": "BARE-01", "category": "daily", "fee": "500.00"},
+            {
+                "name": "Bare", "code": "BARE-01", "category": "daily", "fee": "500.00",
+                "branch": branch.id,
+            },
         )
 
         assert response.status_code == 201
         assert response.json()["originalFee"] is None
 
-    def test_duplicate_code_rejected(self, admin_client, service):
+    def test_duplicate_code_rejected_in_the_same_branch(self, admin_client, service):
         response = admin_client.post(
-            reverse("services:service-list"), service_payload(code=service.code)
+            reverse("services:service-list"),
+            service_payload(code=service.code, branch=service.branch_id),
         )
         assert response.status_code == 400
         assert "code" in response.json()
 
-    def test_code_is_uppercased(self, admin_client):
+    def test_same_code_allowed_in_a_different_branch(self, admin_client, service, other_branch):
+        """`code` is unique per branch, not globally -- two branches may each run their own."""
         response = admin_client.post(
-            reverse("services:service-list"), service_payload(code="pkg-lower-01")
+            reverse("services:service-list"),
+            service_payload(code=service.code, branch=other_branch.id),
+        )
+        assert response.status_code == 201
+
+    def test_code_is_uppercased(self, admin_client, branch):
+        response = admin_client.post(
+            reverse("services:service-list"),
+            service_payload(code="pkg-lower-01", branch=branch.id),
         )
         assert response.json()["code"] == "PKG-LOWER-01"
 
     @pytest.mark.money
-    def test_fee_round_trips_exactly(self, admin_client):
+    def test_fee_round_trips_exactly(self, admin_client, branch):
         """The float-vs-Decimal regression: 12600.50 must not become 12600.49."""
         response = admin_client.post(
-            reverse("services:service-list"), service_payload(fee="12600.50")
+            reverse("services:service-list"), service_payload(fee="12600.50", branch=branch.id)
         )
 
         assert response.json()["fee"] == "12600.50"
         assert Service.objects.get(code="PKG-M1-01").fee == Decimal("12600.50")
 
     @pytest.mark.parametrize("bad_fee", ["0", "0.00", "-100.00"])
-    def test_non_positive_fee_rejected(self, admin_client, bad_fee):
+    def test_non_positive_fee_rejected(self, admin_client, bad_fee, branch):
         response = admin_client.post(
-            reverse("services:service-list"), service_payload(fee=bad_fee)
+            reverse("services:service-list"), service_payload(fee=bad_fee, branch=branch.id)
         )
         assert response.status_code == 400
 
-    def test_invalid_category_rejected(self, admin_client):
+    def test_invalid_category_rejected(self, admin_client, branch):
         response = admin_client.post(
-            reverse("services:service-list"), service_payload(category="weekly")
+            reverse("services:service-list"),
+            service_payload(category="weekly", branch=branch.id),
         )
         assert response.status_code == 400
 
@@ -143,13 +165,13 @@ class TestServicePermissions:
 
 class TestCategoryFiltering:
     @pytest.fixture(autouse=True)
-    def catalog(self, db):
+    def catalog(self, db, branch):
         for code, category in [
             ("DLY-1", "daily"), ("MON-1", "monthly"),
             ("INS-1", "installment"), ("ONL-1", "online"),
         ]:
             Service.objects.create(
-                name=code, code=code, category=category, fee=Decimal("1000.00")
+                branch=branch, name=code, code=code, category=category, fee=Decimal("1000.00")
             )
 
     @pytest.mark.parametrize("category", ["daily", "monthly", "installment", "online"])
@@ -166,18 +188,20 @@ class TestCategoryFiltering:
 
 class TestDiscountPricing:
     @pytest.mark.money
-    def test_original_fee_above_fee_round_trips(self, admin_client):
+    def test_original_fee_above_fee_round_trips(self, admin_client, branch):
         response = admin_client.post(
             reverse("services:service-list"),
-            service_payload(fee="12600.00", original_fee="14000.00"),
+            service_payload(fee="12600.00", original_fee="14000.00", branch=branch.id),
         )
 
         body = response.json()
         assert body["fee"] == "12600.00"
         assert body["originalFee"] == "14000.00"
 
-    def test_omitted_original_fee_is_null(self, admin_client):
-        response = admin_client.post(reverse("services:service-list"), service_payload())
+    def test_omitted_original_fee_is_null(self, admin_client, branch):
+        response = admin_client.post(
+            reverse("services:service-list"), service_payload(branch=branch.id)
+        )
         assert response.json()["originalFee"] is None
 
 
@@ -192,10 +216,12 @@ class TestNoRegistrationFee:
         assert "registrationFee" not in response.json()
         assert "registration_fee" not in response.json()
 
-    def test_posting_a_registration_fee_is_ignored(self, admin_client):
+    def test_posting_a_registration_fee_is_ignored(self, admin_client, branch):
         response = admin_client.post(
             reverse("services:service-list"),
-            service_payload(registration_fee="1000.00", registrationFee="1000.00"),
+            service_payload(
+                registration_fee="1000.00", registrationFee="1000.00", branch=branch.id
+            ),
         )
 
         assert response.status_code == 201
@@ -230,7 +256,7 @@ class TestDeleteBlockedWhileInUse:
         from apps.enrollments.services import create_installment_plan
 
         service = Service.objects.create(
-            name="Assessment", code="PKG-ASM-01",
+            branch=branch, name="Assessment", code="PKG-ASM-01",
             category=Service.Category.INSTALLMENT, fee=Decimal("18500.00"),
         )
         create_installment_plan(
@@ -441,7 +467,7 @@ class TestEnrollmentCounts:
 
         for index in range(5):
             svc = Service.objects.create(
-                name=f"S{index}", code=f"S-{index}",
+                branch=branch, name=f"S{index}", code=f"S-{index}",
                 category=Service.Category.MONTHLY, fee=Decimal("1000.00"),
             )
             create_monthly_enrollment(
@@ -453,29 +479,58 @@ class TestEnrollmentCounts:
 
 
 @pytest.mark.isolation
-class TestCatalogIsNotBranchScoped:
+class TestCatalogIsBranchScoped:
     """
-    The deliberate exception to branch isolation. Asserted explicitly so a
-    future "add branch scoping everywhere" change can't silently split the
-    shared catalog into per-branch ones.
+    Packages are branch-owned like Materials, not shared org-wide. Asserted
+    explicitly so a future change can't silently merge the catalogs back
+    together (BranchScopedQuerySetMixin, apps/common/mixins.py).
     """
 
-    def test_managers_of_different_branches_see_the_same_catalog(
-        self, manager_client, other_manager_client, service
+    def test_managers_of_different_branches_see_different_catalogs(
+        self, manager_client, other_manager_client, service, other_branch
     ):
+        Service.objects.create(
+            branch=other_branch, name="Their Package", code="THEIRS-01",
+            category=Service.Category.MONTHLY, fee=Decimal("3000.00"),
+        )
+
         mine = manager_client.get(reverse("services:service-list")).json()
         theirs = other_manager_client.get(reverse("services:service-list")).json()
 
-        assert mine["count"] == theirs["count"] == 1
-        assert mine["results"][0]["id"] == theirs["results"][0]["id"]
+        assert mine["count"] == 1
+        assert mine["results"][0]["id"] == service.id
+        assert theirs["count"] == 1
+        assert theirs["results"][0]["id"] != service.id
 
-    def test_a_manager_can_read_a_service_by_id_regardless_of_branch(
+    def test_a_manager_cannot_read_a_service_from_another_branch(
         self, other_manager_client, service
     ):
+        """Out-of-scope 404s rather than leaking via a guessed id."""
         response = other_manager_client.get(
             reverse("services:service-detail", args=[service.id])
         )
-        assert response.status_code == 200
+        assert response.status_code == 404
+
+    def test_admin_sees_every_branch_by_default(self, admin_client, service, other_branch):
+        Service.objects.create(
+            branch=other_branch, name="Their Package", code="THEIRS-02",
+            category=Service.Category.MONTHLY, fee=Decimal("3000.00"),
+        )
+
+        response = admin_client.get(reverse("services:service-list")).json()
+        assert response["count"] == 2
+
+    def test_admin_can_narrow_to_one_branch(self, admin_client, service, other_branch):
+        Service.objects.create(
+            branch=other_branch, name="Their Package", code="THEIRS-03",
+            category=Service.Category.MONTHLY, fee=Decimal("3000.00"),
+        )
+
+        response = admin_client.get(
+            reverse("services:service-list"), {"branch": service.branch_id}
+        ).json()
+        assert response["count"] == 1
+        assert response["results"][0]["id"] == service.id
 
 
 class TestServiceReview:
@@ -585,8 +640,10 @@ class TestServiceReview:
         assert response.status_code == 400
         assert response.json()["code"] == "not_pending"
 
-    def test_admin_created_service_is_approved_immediately(self, admin_client):
-        response = admin_client.post(reverse("services:service-list"), service_payload())
+    def test_admin_created_service_is_approved_immediately(self, admin_client, branch):
+        response = admin_client.post(
+            reverse("services:service-list"), service_payload(branch=branch.id)
+        )
 
         assert response.status_code == 201
         assert response.json()["reviewStatus"] == "approved"

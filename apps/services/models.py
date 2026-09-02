@@ -1,10 +1,11 @@
 """
 Service catalog.
 
-**Deliberately not branch-scoped** — the one real exception to the isolation
-rule. The catalog is organisation-wide so every branch offers the same
-packages at the same prices. Contrast with Materials (docs/06), which *are*
-per-branch because physical stock doesn't move between locations.
+Branch-scoped, like Materials (docs/06): each branch owns its own packages.
+A Manager's proposal is filed under their own branch; Admin creates directly
+for a specific branch (the branch drill-down page), never organisation-wide.
+`code` is therefore unique per branch, not globally -- two branches may each
+run their own "MON-INDIV".
 
 Two distinct retirement concepts, easily confused:
 
@@ -35,8 +36,11 @@ class Service(TimeStampedModel, SoftDeleteModel):
         PENDING = "pending", "Pending"
         REJECTED = "rejected", "Rejected"
 
+    branch = models.ForeignKey(
+        "branches.Branch", on_delete=models.PROTECT, related_name="services"
+    )
     name = models.CharField(max_length=150)
-    code = models.CharField(max_length=32, unique=True, db_index=True)
+    code = models.CharField(max_length=32, db_index=True)
     category = models.CharField(max_length=16, choices=Category.choices, db_index=True)
 
     # Decimal, never float — see the money rules in docs/00-OVERVIEW.md.
@@ -88,8 +92,11 @@ class Service(TimeStampedModel, SoftDeleteModel):
 
     class Meta:
         ordering = ["category", "name"]
+        constraints = [
+            models.UniqueConstraint(fields=["branch", "code"], name="unique_service_code_per_branch"),
+        ]
         indexes = [
-            models.Index(fields=["category", "is_active"]),
+            models.Index(fields=["branch", "category", "is_active"]),
             models.Index(fields=["review_status"]),
         ]
 

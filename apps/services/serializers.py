@@ -14,6 +14,8 @@ from apps.services.models import Service
 
 
 class ServiceSerializer(serializers.ModelSerializer):
+    branchId = serializers.CharField(source="branch_id", read_only=True)
+    branchName = serializers.CharField(source="branch.name", read_only=True)
     isOnline = serializers.BooleanField(source="is_online", read_only=True)
     originalFee = serializers.DecimalField(
         source="original_fee", max_digits=12, decimal_places=2, read_only=True
@@ -31,9 +33,9 @@ class ServiceSerializer(serializers.ModelSerializer):
     class Meta:
         model = Service
         fields = [
-            "id", "name", "code", "category", "fee", "isOnline", "description",
-            "originalFee", "durationLabel", "sessionsLabel", "expiryLabel", "isActive",
-            "reviewStatus", "proposedBy", "reviewNote", "reviewedBy", "reviewedAt",
+            "id", "branchId", "branchName", "name", "code", "category", "fee", "isOnline",
+            "description", "originalFee", "durationLabel", "sessionsLabel", "expiryLabel",
+            "isActive", "reviewStatus", "proposedBy", "reviewNote", "reviewedBy", "reviewedAt",
         ]
         read_only_fields = fields
 
@@ -64,11 +66,14 @@ class ServiceWriteSerializer(serializers.ModelSerializer):
 
     def validate_code(self, value):
         value = value.strip().upper()
-        existing = Service.all_objects.filter(code=value)
+        branch = self.context.get("branch") or (self.instance.branch if self.instance else None)
+        existing = Service.all_objects.filter(code=value, branch=branch)
         if self.instance is not None:
             existing = existing.exclude(pk=self.instance.pk)
         if existing.exists():
-            raise serializers.ValidationError("A service with this code already exists.")
+            raise serializers.ValidationError(
+                "This branch already has a package with this code."
+            )
         return value
 
     def validate_fee(self, value):

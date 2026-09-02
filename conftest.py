@@ -130,8 +130,8 @@ def patient_factory(db, branch):
 
 
 @pytest.fixture
-def service_factory(db):
-    """Catalog entries. Not branch-scoped — the catalog is organisation-wide."""
+def service_factory(db, branch):
+    """Catalog entries. Branch-scoped, like Materials -- defaults to `branch`."""
     from decimal import Decimal
 
     from apps.services.models import Service
@@ -142,6 +142,7 @@ def service_factory(db):
         counter["n"] += 1
         n = counter["n"]
         defaults = {
+            "branch": branch,
             "name": f"Service {n}",
             "code": f"SVC-{n:03d}",
             "category": Service.Category.MONTHLY,
