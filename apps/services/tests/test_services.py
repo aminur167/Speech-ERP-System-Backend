@@ -590,3 +590,41 @@ class TestServiceReview:
 
         assert response.status_code == 201
         assert response.json()["reviewStatus"] == "approved"
+
+
+class TestPendingCount:
+    """Powers the sidebar's Services badge — Admin-only, org-wide, live regardless of what page is open."""
+
+    def _propose(self, manager_client, **overrides):
+        response = manager_client.post(
+            reverse("services:service-list"), service_payload(**overrides)
+        )
+        assert response.status_code == 201
+
+    def test_admin_sees_the_total_pending_count_across_every_branch(
+        self, admin_client, manager_client, other_manager_client
+    ):
+        self._propose(manager_client, code="PKG-BADGE-01")
+        self._propose(other_manager_client, code="PKG-BADGE-02")
+
+        response = admin_client.get(reverse("services:service-pending-count"))
+
+        assert response.status_code == 200
+        assert response.json()["count"] == 2
+
+    def test_manager_cannot_read_the_pending_count(self, manager_client):
+        response = manager_client.get(reverse("services:service-pending-count"))
+        assert response.status_code == 403
+
+    def test_reviewing_decreases_the_count(self, admin_client, manager_client):
+        self._propose(manager_client, code="PKG-BADGE-03")
+        service_id = manager_client.get(
+            reverse("services:service-list"), {"includePending": "true"}
+        ).json()["results"][0]["id"]
+
+        admin_client.post(
+            reverse("services:service-review", args=[service_id]), {"approve": True}
+        )
+
+        response = admin_client.get(reverse("services:service-pending-count"))
+        assert response.json()["count"] == 0

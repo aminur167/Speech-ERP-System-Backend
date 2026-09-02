@@ -12,9 +12,11 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from apps.accounts.models import User
 from apps.common import audit
 from apps.common.models import AuditLog
 from apps.common.permissions import IsAdmin
+from apps.notifications.inapp import notify_many
 from apps.services import services
 from apps.services.models import Service
 from apps.services.serializers import (
@@ -115,6 +117,13 @@ class ServiceViewSet(viewsets.ModelViewSet):
             service = serializer.save(
                 review_status=Service.ReviewStatus.PENDING, proposed_by=request.user
             )
+            branch_name = request.user.branch.name if request.user.branch_id else "A branch"
+            notify_many(
+                recipients=User.objects.filter(role=User.Role.ADMIN),
+                title="New package proposal",
+                message=f'{branch_name} proposed "{service.name}" ({service.code}) for review.',
+                link="/admin/services",
+            )
 
         audit.record(
             actor=request.user,
@@ -202,6 +211,12 @@ class ServiceViewSet(viewsets.ModelViewSet):
             )
 
         return Response(ServiceSerializer(service).data)
+
+    @action(detail=False, methods=["get"], url_path="pending-count")
+    def pending_count(self, request):
+        """Admin-only — powers the sidebar's Services badge, independent of whatever page is open."""
+        count = Service.objects.filter(review_status=Service.ReviewStatus.PENDING).count()
+        return Response({"count": count})
 
     @action(detail=True, methods=["post"])
     def deactivate(self, request, pk=None):

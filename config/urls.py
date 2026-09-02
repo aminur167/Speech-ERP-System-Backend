@@ -42,4 +42,5 @@ urlpatterns = [
     path("api/daily-closing/", include("apps.dailyclosing.urls")),
     path("api/transactions/", include("apps.reporting.urls")),
     path("api/", include("apps.common.urls")),
+    path("api/", include("apps.notifications.urls")),
 ]
