@@ -1,0 +1,63 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+#
+# Deploy: Render dashboard -> New -> Blueprint -> pick this repo. Render reads
+# this file and creates the service below. Every envVar marked `sync: false`
+# is a secret Render will prompt for during that setup instead of reading a
+# value from here -- nothing sensitive is committed.
+#
+# migrate runs on every start, not just the first deploy: Django migrations
+# are idempotent (a no-op once already applied), so this is the simplest way
+# to guarantee a new release's migrations always run before gunicorn starts
+# serving it, with no separate "run this once" step to remember.
+
+services:
+  - type: web
+    name: speech-erp-backend
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: "pip install -r requirements/prod.txt && python manage.py collectstatic --noinput"
+    startCommand: "python manage.py migrate --noinput && gunicorn config.wsgi:application"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: DJANGO_SETTINGS_MODULE
+        value: config.settings.production
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      # Render's own default domain (<service-name>.onrender.com) once
+      # assigned, plus your custom domain if you add one later.
+      - key: DJANGO_ALLOWED_HOSTS
+        sync: false
+      # Your Vercel frontend's URL, e.g. https://your-app.vercel.app
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: POSTGRES_DB
+        sync: false
+      - key: POSTGRES_USER
+        sync: false
+      - key: POSTGRES_PASSWORD
+        sync: false
+      - key: POSTGRES_HOST
+        sync: false
+      - key: POSTGRES_PORT
+        value: "5432"
+      - key: POSTGRES_SSLMODE
+        value: require
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      # Optional -- leave unset in the dashboard to skip these features.
+      - key: SENTRY_DSN
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_SMS_FROM
+        sync: false
+      - key: TWILIO_WHATSAPP_FROM
+        sync: false

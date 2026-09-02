@@ -17,6 +17,19 @@ DEBUG = False
 SECRET_KEY = env("DJANGO_SECRET_KEY")  # noqa: F405 — no default, must be set
 ALLOWED_HOSTS = env("DJANGO_ALLOWED_HOSTS")  # noqa: F405
 
+# Serves STATIC_ROOT (Django Admin, /api/docs/) directly from the app
+# process -- no separate static host needed on a platform like Render.
+# Inserted right after SecurityMiddleware per whitenoise's own docs; only
+# installed via requirements/prod.txt, so this stays out of base.py, which
+# every environment (including dev, without whitenoise installed) imports.
+MIDDLEWARE.insert(1, "whitenoise.middleware.WhiteNoiseMiddleware")  # noqa: F405
+STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"
+    },
+}
+
 # --------------------------------------------------------------------------
 # HTTPS / transport security
 # --------------------------------------------------------------------------

@@ -114,6 +114,11 @@ DATABASES = {
         "HOST": env("POSTGRES_HOST", default="localhost"),
         "PORT": env("POSTGRES_PORT", default="5432"),
         "ATOMIC_REQUESTS": False,  # transactions are declared explicitly where needed
+        # "prefer" works against both a local Postgres with no SSL configured
+        # and a hosted one (e.g. Supabase) that requires it -- set
+        # POSTGRES_SSLMODE=require in production so a misconfigured proxy
+        # can't silently downgrade a connection carrying patient data.
+        "OPTIONS": {"sslmode": env("POSTGRES_SSLMODE", default="prefer")},
     }
 }
 

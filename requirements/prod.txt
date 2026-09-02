@@ -4,5 +4,9 @@
 # WSGI server.
 gunicorn==23.0.0
 
+# Serves static files (Django Admin, /api/docs/) directly from the app
+# process -- no separate static-file host needed on a platform like Render.
+whitenoise==6.12.0
+
 # Error tracking — configured via SENTRY_DSN (docs/00-OVERVIEW.md).
 sentry-sdk==2.68.1
