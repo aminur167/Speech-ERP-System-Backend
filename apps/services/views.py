@@ -14,13 +14,12 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from apps.accounts.models import User
 from apps.branches.models import Branch
 from apps.common import audit
 from apps.common.mixins import BranchScopedQuerySetMixin
 from apps.common.models import AuditLog
 from apps.common.permissions import IsAdmin
-from apps.notifications.inapp import notify_many
+from apps.notifications.inapp import notify_admins, notify_many
 from apps.services import services
 from apps.services.models import Service
 from apps.services.serializers import (
@@ -141,11 +140,11 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
                 branch=branch, review_status=Service.ReviewStatus.PENDING, proposed_by=request.user
             )
             branch_name = branch.name if branch else "A branch"
-            notify_many(
-                recipients=User.objects.filter(role=User.Role.ADMIN),
-                title="New package proposal",
+            notify_admins(
+                title="Package needs approval",
                 message=f'{branch_name} proposed "{service.name}" ({service.code}) for review.',
                 link="/admin/services",
+                exclude=request.user,
             )
 
         audit.record(

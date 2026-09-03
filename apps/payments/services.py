@@ -16,6 +16,7 @@ from apps.branches.models import Branch
 from apps.common import audit
 from apps.common.models import AuditLog
 from apps.common.sequences import next_value
+from apps.notifications.inapp import notify_admins, notify_requester
 from apps.payments.models import (
     Payment,
     PaymentCategory,
@@ -252,6 +253,16 @@ def request_refund(
         reason=reason,
         changes={"payment": payment.receipt_number, "amount": str(resolved_amount)},
     )
+
+    notify_admins(
+        title="Refund needs approval",
+        message=(
+            f"{payment.branch.name} requested a {resolved_amount} refund on "
+            f"{payment.receipt_number} — {reason}"
+        ),
+        link="/admin/refund-approvals",
+        exclude=actor,
+    )
     return request
 
 
@@ -377,6 +388,17 @@ def approve_refund(
             "bill_action": bill_action,
         },
     )
+
+    notify_requester(
+        actor=actor,
+        recipient=request.requested_by,
+        title="Refund approved",
+        message=(
+            f"The {request.amount} refund on {payment.receipt_number} was approved."
+            + (f" — {review_note}" if review_note.strip() else "")
+        ),
+        link="/manager/transactions",
+    )
     return request
 
 
@@ -496,5 +518,16 @@ def reject_refund(*, actor, request: RefundRequest, review_note: str) -> RefundR
         target=request,
         branch=request.branch,
         reason=review_note,
+    )
+
+    notify_requester(
+        actor=actor,
+        recipient=request.requested_by,
+        title="Refund rejected",
+        message=(
+            f"The {request.amount} refund on {request.payment.receipt_number} "
+            f"was rejected — {review_note}"
+        ),
+        link="/manager/transactions",
     )
     return request

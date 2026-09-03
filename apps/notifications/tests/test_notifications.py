@@ -1,4 +1,13 @@
-"""In-app notification API, and the triggers that create them from the package-review workflow."""
+"""
+In-app notification API, and the triggers that create them.
+
+One rule across every request flow (apps/notifications/inapp.py): whatever a
+manager sends up for a decision reaches every admin, and whatever the admin
+decides reaches the manager who asked. Asserted per flow below, because each
+one is wired separately and a new flow is easy to add without the routing.
+"""
+
+from decimal import Decimal
 
 import pytest
 from django.urls import reverse
@@ -162,3 +171,130 @@ class TestPackageEditNotifications:
         )
 
         assert not Notification.objects.filter(recipient=manager).exists()
+
+
+class TestExpenseApprovalNotifications:
+    """An expense at or above the threshold is a request; below it, nothing waits on anyone."""
+
+    def _submit(self, manager_client, amount: str):
+        return manager_client.post(
+            reverse("expenses:expense-list"),
+            {
+                "category": "supplies",
+                "amount": amount,
+                "description": "Therapy cards",
+                "paid_to": "Local supplier",
+                "payment_method": "cash",
+            },
+        )
+
+    def test_an_expense_needing_approval_notifies_every_admin(
+        self, manager_client, admin_user
+    ):
+        response = self._submit(manager_client, "9000.00")
+        assert response.status_code == 201
+
+        note = Notification.objects.filter(
+            recipient=admin_user, title="Expense needs approval"
+        ).first()
+        assert note is not None
+        assert "9000.00" in note.message
+
+    def test_an_auto_approved_expense_notifies_nobody(self, manager_client, admin_user):
+        """Below the threshold there is no decision to make — the bell stays quiet."""
+        response = self._submit(manager_client, "100.00")
+        assert response.status_code == 201
+
+        assert not Notification.objects.filter(recipient=admin_user).exists()
+
+    def test_approving_notifies_the_manager_who_submitted(
+        self, admin_client, manager_client, manager
+    ):
+        expense_id = self._submit(manager_client, "9000.00").json()["id"]
+
+        response = admin_client.post(
+            reverse("expenses:expense-review", args=[expense_id]), {"approve": True}
+        )
+        assert response.status_code == 200
+
+        assert Notification.objects.filter(
+            recipient=manager, title="Expense approved"
+        ).exists()
+
+    def test_rejecting_notifies_the_manager_with_the_reason(
+        self, admin_client, manager_client, manager
+    ):
+        expense_id = self._submit(manager_client, "9000.00").json()["id"]
+
+        admin_client.post(
+            reverse("expenses:expense-review", args=[expense_id]),
+            {"approve": False, "reviewNote": "Buy from the approved vendor."},
+        )
+
+        note = Notification.objects.filter(
+            recipient=manager, title="Expense rejected"
+        ).first()
+        assert note is not None
+        assert "approved vendor" in note.message
+
+
+class TestRefundApprovalNotifications:
+    def test_requesting_a_refund_notifies_every_admin(
+        self, manager, admin_user, branch, patient_factory, service_factory
+    ):
+        from apps.payments.services import create_payment, request_refund
+
+        payment, _ = create_payment(
+            actor=manager, branch=branch, patient=patient_factory(),
+            amount=Decimal("5000.00"), method="cash", description="Session fee",
+        )
+        request_refund(
+            actor=manager, payment=payment, amount=Decimal("5000.00"),
+            reason="Patient cancelled before the session.",
+        )
+
+        note = Notification.objects.filter(
+            recipient=admin_user, title="Refund needs approval"
+        ).first()
+        assert note is not None
+        assert payment.receipt_number in note.message
+
+    def test_approving_a_refund_notifies_the_requesting_manager(
+        self, manager, admin_user, branch, patient_factory
+    ):
+        from apps.payments.services import approve_refund, create_payment, request_refund
+
+        payment, _ = create_payment(
+            actor=manager, branch=branch, patient=patient_factory(),
+            amount=Decimal("5000.00"), method="cash", description="Session fee",
+        )
+        refund = request_refund(
+            actor=manager, payment=payment, amount=Decimal("5000.00"), reason="Cancelled.",
+        )
+
+        approve_refund(actor=admin_user, request=refund, bill_action="reopen")
+
+        assert Notification.objects.filter(
+            recipient=manager, title="Refund approved"
+        ).exists()
+
+    def test_rejecting_a_refund_notifies_the_requesting_manager(
+        self, manager, admin_user, branch, patient_factory
+    ):
+        from apps.payments.services import create_payment, reject_refund, request_refund
+
+        payment, _ = create_payment(
+            actor=manager, branch=branch, patient=patient_factory(),
+            amount=Decimal("5000.00"), method="cash", description="Session fee",
+        )
+        refund = request_refund(
+            actor=manager, payment=payment, amount=Decimal("5000.00"), reason="Cancelled.",
+        )
+
+        reject_refund(actor=admin_user, request=refund, review_note="Session was delivered.")
+
+        note = Notification.objects.filter(
+            recipient=manager, title="Refund rejected"
+        ).first()
+        assert note is not None
+        assert "Session was delivered." in note.message

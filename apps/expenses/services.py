@@ -10,6 +10,7 @@ from apps.common import audit
 from apps.common.models import AuditLog
 from apps.common.sequences import next_value
 from apps.expenses.models import Expense
+from apps.notifications.inapp import notify_admins, notify_requester
 
 
 class ExpenseError(Exception):
@@ -74,6 +75,21 @@ def create_expense(
             "status": expense.status,
         },
     )
+
+    # Only the ones actually waiting on someone: an auto-approved expense
+    # needs no decision, so notifying about it would just be noise that
+    # trains people to ignore the bell.
+    if not auto_approved:
+        notify_admins(
+            title="Expense needs approval",
+            message=(
+                f"{branch.name} submitted {expense.expense_code} for "
+                f"{expense.amount} — {expense.description}."
+            ),
+            link="/admin/expenses",
+            exclude=actor,
+        )
+
     return expense
 
 
@@ -124,5 +140,17 @@ def review_expense(*, actor, expense: Expense, approve: bool, review_note: str =
         branch=expense.branch,
         reason=review_note,
         changes={"status": {"from": previous, "to": new_status}},
+    )
+
+    decision = "approved" if approve else "rejected"
+    notify_requester(
+        actor=actor,
+        recipient=expense.submitted_by,
+        title=f"Expense {decision}",
+        message=(
+            f"{expense.expense_code} ({expense.amount}) was {decision}."
+            + (f" — {review_note}" if review_note.strip() else "")
+        ),
+        link="/manager/expenses",
     )
     return expense

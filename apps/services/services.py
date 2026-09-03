@@ -4,7 +4,7 @@ from django.utils import timezone
 
 from apps.common import audit
 from apps.common.models import AuditLog
-from apps.notifications.inapp import notify
+from apps.notifications.inapp import notify_requester
 from apps.services.models import Service
 
 
@@ -52,13 +52,18 @@ def review_service(*, actor, service: Service, approve: bool, review_note: str =
         changes={"review_status": {"from": "pending", "to": service.review_status}},
     )
 
-    if service.proposed_by_id:
-        if approve:
-            title = "Package approved"
-            message = f'"{service.name}" ({service.code}) is now live and enrollable.'
-        else:
-            title = "Package rejected"
-            message = f'"{service.name}" ({service.code}) was rejected: {review_note}'
-        notify(recipient=service.proposed_by, title=title, message=message, link="/manager/packages")
+    if approve:
+        title = "Package approved"
+        message = f'"{service.name}" ({service.code}) is now live and enrollable.'
+    else:
+        title = "Package rejected"
+        message = f'"{service.name}" ({service.code}) was rejected: {review_note}'
 
+    notify_requester(
+        actor=actor,
+        recipient=service.proposed_by,
+        title=title,
+        message=message,
+        link="/manager/packages",
+    )
     return service
