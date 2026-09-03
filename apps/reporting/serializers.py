@@ -62,3 +62,28 @@ class NetRevenueSerializer(serializers.Serializer):
     refunded = serializers.DecimalField(max_digits=14, decimal_places=2)
     expenses = serializers.DecimalField(max_digits=14, decimal_places=2)
     netRevenue = serializers.DecimalField(max_digits=14, decimal_places=2)
+
+
+class BranchSummarySerializer(serializers.Serializer):
+    """Everything one branch did between two dates — the Summary page."""
+
+    dateFrom = serializers.DateField()
+    dateTo = serializers.DateField()
+
+    grossCollected = serializers.DecimalField(max_digits=14, decimal_places=2)
+    refunded = serializers.DecimalField(max_digits=14, decimal_places=2)
+    expenses = serializers.DecimalField(max_digits=14, decimal_places=2)
+    netRevenue = serializers.DecimalField(max_digits=14, decimal_places=2)
+    outstandingDue = serializers.DecimalField(max_digits=14, decimal_places=2)
+
+    paymentCount = serializers.IntegerField()
+    patientsSeen = serializers.IntegerField()
+    newPatients = serializers.IntegerField()
+    totalPatients = serializers.IntegerField()
+    expenseCount = serializers.IntegerField()
+    refundCount = serializers.IntegerField()
+    closingsSubmitted = serializers.IntegerField()
+    closingsMismatched = serializers.IntegerField()
+
+    byMethod = ByMethodRowSerializer(many=True)
+    byCategory = RevenueByCategoryRowSerializer(many=True)

@@ -30,6 +30,8 @@ from decimal import Decimal
 from django.db.models import Count, Q, Sum
 from django.utils import timezone
 
+from apps.dailyclosing.models import DailyClosing
+from apps.duepayments.services import due_summary
 from apps.expenses.models import Expense
 from apps.patients.models import Patient
 from apps.payments.models import Payment, PaymentStatus, RefundRequest
@@ -266,4 +268,82 @@ def patient_directory_summary(*, branch_id=None, as_of: date | None = None) -> d
         "intake": patients.filter(
             created_at__year=reference.year, created_at__month=reference.month
         ).count(),
+    }
+
+
+def branch_summary(*, branch_id=None, date_from: date, date_to: date) -> dict:
+    """
+    Everything one branch did between two dates.
+
+    The date-range equivalent of the month-scoped figures above, for the
+    branch Summary page. Same accounting rules throughout (see this module's
+    header): revenue is dated by when the payment was taken, a refund by when
+    it was approved, a void never happened at all, and an expense counts while
+    approved or pending.
+
+    `outstandingDue` is deliberately not range-scoped -- money still owed is a
+    position as of now, not something that happened during a window, and
+    showing it as though it belonged to the range would misread it.
+    """
+    # Inclusive of both endpoints: a user picking 1st-31st means the whole
+    # month, so `created_at__date` (not a datetime __range that would cut the
+    # last day off at midnight).
+    in_range = {"created_at__date__gte": date_from, "created_at__date__lte": date_to}
+
+    revenue = _revenue_queryset(branch_id).filter(**in_range)
+    gross = _sum(revenue)
+
+    refunds = _refund_queryset(branch_id).filter(
+        reviewed_at__date__gte=date_from, reviewed_at__date__lte=date_to
+    )
+    refunded = _sum(refunds)
+
+    expenses = Expense.objects.filter(status__in=COUNTED_EXPENSE_STATUSES)
+    if branch_id:
+        expenses = expenses.filter(branch_id=branch_id)
+    expenses = expenses.filter(**in_range)
+    expense_total = _sum(expenses)
+
+    patients = Patient.objects.all()
+    if branch_id:
+        patients = patients.filter(branch_id=branch_id)
+
+    by_method = [
+        {"method": row["method"], "amount": row["amount"]}
+        for row in revenue.values("method").annotate(amount=Sum("amount")).order_by("-amount")
+    ]
+    by_category = [
+        {"category": row["category"], "amount": row["amount"]}
+        for row in revenue.exclude(category="")
+        .exclude(category="material_sale")
+        .values("category")
+        .annotate(amount=Sum("amount"))
+        .order_by("-amount")
+    ]
+
+    closings = DailyClosing.objects.filter(date__gte=date_from, date__lte=date_to)
+    if branch_id:
+        closings = closings.filter(branch_id=branch_id)
+
+    return {
+        "dateFrom": date_from,
+        "dateTo": date_to,
+        "grossCollected": gross,
+        "refunded": refunded,
+        "expenses": expense_total,
+        "netRevenue": gross - refunded - expense_total,
+        "paymentCount": revenue.count(),
+        "patientsSeen": revenue.values("patient_id").distinct().count(),
+        "newPatients": patients.filter(**in_range).count(),
+        "totalPatients": patients.count(),
+        "expenseCount": expenses.count(),
+        "refundCount": refunds.count(),
+        # Reuses the due-payments module rather than re-deriving it: that one
+        # already handles partially-paid bills (outstanding is amount − paid,
+        # not amount), and two implementations of "what is owed" would drift.
+        "outstandingDue": due_summary(branch_id=branch_id)["totalDue"],
+        "byMethod": by_method,
+        "byCategory": by_category,
+        "closingsSubmitted": closings.count(),
+        "closingsMismatched": closings.exclude(status=DailyClosing.Status.MATCHED).count(),
     }

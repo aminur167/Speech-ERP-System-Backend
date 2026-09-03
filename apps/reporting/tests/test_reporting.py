@@ -780,3 +780,178 @@ class TestQueryBudgets:
 
         with django_assert_max_num_queries(10):
             manager_client.get(url)
+
+
+BRANCH_SUMMARY_URL = reverse("reporting:branch-summary")
+
+
+@pytest.mark.money
+class TestBranchSummary:
+    """
+    The Summary page's single call. Same accounting rules as everything else
+    here — the point of the tests below is that a *date range* doesn't quietly
+    reintroduce the period-attribution bug the rest of this module avoids.
+    """
+
+    def test_the_range_is_inclusive_of_both_end_dates(self, manager_client, pay):
+        first = date(2026, 5, 1)
+        last = date(2026, 5, 31)
+        pay("1000.00", when=local_midnight(first))
+        pay("2000.00", when=local_midnight(last))
+        # Just outside, on both sides.
+        pay("500.00", when=local_midnight(date(2026, 4, 30)))
+        pay("700.00", when=local_midnight(date(2026, 6, 1)))
+
+        body = manager_client.get(
+            BRANCH_SUMMARY_URL, {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"}
+        ).json()
+
+        assert Decimal(body["grossCollected"]) == Decimal("3000.00")
+        assert body["paymentCount"] == 2
+
+    def test_a_payment_late_on_the_last_day_is_still_inside_the_range(
+        self, manager_client, pay
+    ):
+        """The off-by-one a datetime range would introduce: 23:30 is still that day."""
+        late = timezone.make_aware(datetime.combine(date(2026, 5, 31), time(23, 30)))
+        pay("1500.00", when=late)
+
+        body = manager_client.get(
+            BRANCH_SUMMARY_URL, {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"}
+        ).json()
+
+        assert Decimal(body["grossCollected"]) == Decimal("1500.00")
+
+    def test_a_refund_lands_in_the_range_it_was_approved_in(
+        self, manager_client, manager, admin_user, pay
+    ):
+        """Revenue keeps its own period; the refund is dated to its approval."""
+        payment = pay("5000.00", when=local_midnight(date(2026, 5, 10)))
+        refund_fully(
+            payment,
+            requester=manager,
+            approver=admin_user,
+            approved_at=local_midnight(date(2026, 6, 10)),
+        )
+
+        may = manager_client.get(
+            BRANCH_SUMMARY_URL, {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"}
+        ).json()
+        june = manager_client.get(
+            BRANCH_SUMMARY_URL, {"dateFrom": "2026-06-01", "dateTo": "2026-06-30"}
+        ).json()
+
+        # May keeps the revenue it already reported.
+        assert Decimal(may["grossCollected"]) == Decimal("5000.00")
+        assert Decimal(may["refunded"]) == Decimal("0.00")
+        # June absorbs the refund.
+        assert Decimal(june["refunded"]) == Decimal("5000.00")
+
+    def test_net_revenue_is_gross_minus_refunds_minus_expenses(
+        self, manager_client, manager, branch, pay
+    ):
+        pay("10000.00")
+        expense_services.create_expense(
+            actor=manager,
+            branch=branch,
+            data={
+                "category": "supplies",
+                "amount": Decimal("2500.00"),
+                "description": "Cards",
+                "paid_to": "Vendor",
+                "payment_method": "cash",
+            },
+        )
+
+        today = timezone.localdate().isoformat()
+        body = manager_client.get(
+            BRANCH_SUMMARY_URL, {"dateFrom": today, "dateTo": today}
+        ).json()
+
+        assert Decimal(body["grossCollected"]) == Decimal("10000.00")
+        assert Decimal(body["expenses"]) == Decimal("2500.00")
+        assert Decimal(body["netRevenue"]) == Decimal("7500.00")
+
+    def test_a_void_leaves_the_range_entirely(self, manager_client, manager, pay):
+        payment = pay("4000.00")
+        payment_services.void_payment(actor=manager, payment=payment, reason="Wrong patient")
+
+        today = timezone.localdate().isoformat()
+        body = manager_client.get(
+            BRANCH_SUMMARY_URL, {"dateFrom": today, "dateTo": today}
+        ).json()
+
+        assert Decimal(body["grossCollected"]) == Decimal("0.00")
+        assert body["paymentCount"] == 0
+
+    @pytest.mark.isolation
+    def test_a_manager_only_ever_sees_their_own_branch(
+        self, manager_client, pay, other_branch, other_manager, patient_factory
+    ):
+        pay("1000.00")
+        pay("9999.00", actor=other_manager, target_branch=other_branch)
+
+        today = timezone.localdate().isoformat()
+        body = manager_client.get(
+            BRANCH_SUMMARY_URL, {"dateFrom": today, "dateTo": today}
+        ).json()
+
+        assert Decimal(body["grossCollected"]) == Decimal("1000.00")
+
+    @pytest.mark.isolation
+    def test_a_manager_cannot_read_another_branch_by_passing_its_id(
+        self, manager_client, pay, other_branch, other_manager
+    ):
+        pay("9999.00", actor=other_manager, target_branch=other_branch)
+
+        today = timezone.localdate().isoformat()
+        body = manager_client.get(
+            BRANCH_SUMMARY_URL,
+            {"dateFrom": today, "dateTo": today, "branch": other_branch.id},
+        ).json()
+
+        assert Decimal(body["grossCollected"]) == Decimal("0.00")
+
+    def test_admin_can_narrow_to_one_branch(
+        self, admin_client, pay, other_branch, other_manager
+    ):
+        pay("1000.00")
+        pay("2000.00", actor=other_manager, target_branch=other_branch)
+
+        today = timezone.localdate().isoformat()
+        body = admin_client.get(
+            BRANCH_SUMMARY_URL,
+            {"dateFrom": today, "dateTo": today, "branch": other_branch.id},
+        ).json()
+
+        assert Decimal(body["grossCollected"]) == Decimal("2000.00")
+
+    def test_a_reversed_range_is_rejected_rather_than_returning_zeros(
+        self, manager_client
+    ):
+        """Zeros would read as "no activity" instead of as the mistake it is."""
+        response = manager_client.get(
+            BRANCH_SUMMARY_URL, {"dateFrom": "2026-06-30", "dateTo": "2026-06-01"}
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "invalid_range"
+
+    def test_it_defaults_to_the_current_month_to_date(self, manager_client, pay):
+        pay("1200.00")
+
+        body = manager_client.get(BRANCH_SUMMARY_URL).json()
+
+        today = timezone.localdate()
+        assert body["dateFrom"] == today.replace(day=1).isoformat()
+        assert body["dateTo"] == today.isoformat()
+        assert Decimal(body["grossCollected"]) == Decimal("1200.00")
+
+    def test_an_empty_range_returns_zeros_not_errors(self, manager_client):
+        body = manager_client.get(
+            BRANCH_SUMMARY_URL, {"dateFrom": "2020-01-01", "dateTo": "2020-01-31"}
+        ).json()
+
+        assert Decimal(body["grossCollected"]) == Decimal("0.00")
+        assert body["paymentCount"] == 0
+        assert body["byMethod"] == []

@@ -8,7 +8,9 @@ usual rule — manager sees their own, admin sees all or narrows with ?branch=.
 from datetime import datetime
 
 from django.db.models import Q
+from django.utils import timezone
 from drf_spectacular.utils import OpenApiParameter, extend_schema
+from rest_framework import status
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -18,6 +20,7 @@ from apps.payments.models import Payment, PaymentStatus
 from apps.payments.serializers import PaymentSerializer
 from apps.reporting import services
 from apps.reporting.serializers import (
+    BranchSummarySerializer,
     CollectionForDateSerializer,
     DashboardMetricsSerializer,
     NetRevenueSerializer,
@@ -247,5 +250,45 @@ class NetRevenueView(_ReportView):
             services.net_revenue(
                 branch_id=_branch_id_for(request),
                 as_of=_parse_date(request.query_params.get("date")),
+            )
+        )
+
+
+class BranchSummaryView(_ReportView):
+    """
+    GET /api/transactions/branch-summary/
+
+    The branch Summary page: one call for everything that branch did between
+    two dates. Manager is scoped to their own branch; Admin passes `?branch=`
+    to look at any one (both via `_branch_id_for`, same as every view here).
+    """
+
+    @extend_schema(
+        tags=["reporting"],
+        parameters=[
+            _BRANCH_PARAM,
+            OpenApiParameter("dateFrom", str, description="ISO date. Defaults to the 1st of the current month."),
+            OpenApiParameter("dateTo", str, description="ISO date. Defaults to today."),
+        ],
+        responses=BranchSummarySerializer,
+    )
+    def get(self, request):
+        today = timezone.localdate()
+        date_to = _parse_date(request.query_params.get("dateTo")) or today
+        date_from = _parse_date(request.query_params.get("dateFrom")) or date_to.replace(day=1)
+
+        # A reversed range would silently return zeros and read as "no
+        # activity" rather than as the mistake it is.
+        if date_from > date_to:
+            return Response(
+                {"detail": "dateFrom cannot be after dateTo.", "code": "invalid_range"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(
+            services.branch_summary(
+                branch_id=_branch_id_for(request),
+                date_from=date_from,
+                date_to=date_to,
             )
         )
