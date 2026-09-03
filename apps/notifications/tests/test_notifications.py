@@ -118,3 +118,47 @@ class TestPackageReviewNotifications:
         notes = Notification.objects.filter(recipient=manager, title="Package rejected")
         assert notes.count() == 1
         assert "Not needed." in notes.first().message
+
+
+class TestPackageEditNotifications:
+    """A branch's manager finds out when Admin edits that branch's package."""
+
+    def test_editing_notifies_the_branch_manager_with_what_changed(
+        self, admin_client, manager, service_factory
+    ):
+        service = service_factory()
+
+        response = admin_client.patch(
+            reverse("services:service-detail", args=[service.id]), {"fee": "7500.00"}
+        )
+        assert response.status_code == 200
+
+        note = Notification.objects.filter(
+            recipient=manager, title="Package updated by Admin"
+        ).first()
+        assert note is not None
+        assert service.name in note.message
+        assert "7500.00" in note.message
+
+    def test_another_branchs_manager_is_not_notified(
+        self, admin_client, other_manager, service_factory
+    ):
+        service = service_factory()
+
+        admin_client.patch(
+            reverse("services:service-detail", args=[service.id]), {"fee": "7500.00"}
+        )
+
+        assert not Notification.objects.filter(recipient=other_manager).exists()
+
+    def test_an_edit_that_changes_nothing_notifies_nobody(
+        self, admin_client, manager, service_factory
+    ):
+        """Saving the form untouched must not ping the branch for no reason."""
+        service = service_factory()
+
+        admin_client.patch(
+            reverse("services:service-detail", args=[service.id]), {"name": service.name}
+        )
+
+        assert not Notification.objects.filter(recipient=manager).exists()

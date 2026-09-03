@@ -179,7 +179,38 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
                 target=service,
                 changes=changes,
             )
+            self._notify_branch_of_edit(actor=request.user, service=service, changes=changes)
         return Response(ServiceSerializer(service).data)
+
+    @staticmethod
+    def _notify_branch_of_edit(*, actor, service, changes: dict) -> None:
+        """
+        Tell the branch its package was edited.
+
+        Only Admin can reach update(), so this is always "someone above you
+        changed your branch's package" -- the manager otherwise finds out by
+        noticing a different price on the enrollment screen. Skips the actor
+        so nobody is notified about their own edit, and says what moved
+        rather than just that something did.
+        """
+        recipients = [
+            manager
+            for manager in service.branch.managers.filter(is_active=True)
+            if manager.pk != actor.pk
+        ]
+        if not recipients:
+            return
+
+        summary = ", ".join(
+            f"{field.replace('_', ' ')} {value['from']} → {value['to']}"
+            for field, value in changes.items()
+        )
+        notify_many(
+            recipients=recipients,
+            title="Package updated by Admin",
+            message=f'"{service.name}" was changed — {summary}.',
+            link="/manager/packages",
+        )
 
     def partial_update(self, request, *args, **kwargs):
         return self.update(request, *args, partial=True, **kwargs)
