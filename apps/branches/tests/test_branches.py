@@ -436,3 +436,20 @@ class TestBranchModel:
             address="a", phone="p", opened_at="2024-01-01",
         )
         assert odd.short_code == "SINGLE"
+
+    def test_short_code_is_capped_for_an_unusually_long_code(self, db):
+        """
+        Regression: a branch code with no dash falls back to the whole
+        code, unbounded -- PT-<short_code>-<year>-<seq> then overflows
+        patient_code's 32-char column with a 500 at registration instead of
+        a caught error. Nothing enforces a "BR-XXX-001" format at branch
+        creation, so short_code itself has to stay safe against any input.
+        """
+        odd = Branch.objects.create(
+            # Branch.code itself caps at 32 -- long enough on its own to
+            # overflow patient_code (18-char budget for short_code) without
+            # coming close to that separate limit.
+            name="Odd", code="A" * 25, status=Branch.Status.ACTIVE,
+            address="a", phone="p", opened_at="2024-01-01",
+        )
+        assert len(odd.short_code) <= 10

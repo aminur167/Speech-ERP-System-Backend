@@ -67,6 +67,15 @@ class Branch(TimeStampedModel, SoftDeleteModel):
         Used to build per-branch receipt/patient codes (RCPT-DHK-2026-00001),
         which is what lets a branch issue codes offline without colliding with
         another branch (docs/04-payments-core.md).
+
+        Truncated to a safe length regardless of what `code` actually looks
+        like: a branch's code has no format enforced at creation, so this
+        must never assume it matches "BR-XXX-001". Without the cap, an
+        unusual code (or the whole code, on the no-dash fallback) flows
+        straight into patient_code -- the tightest of the fields built from
+        this (32 chars, PT-<short_code>-<year>-<seq>) -- and overflows it
+        with a 500 at registration instead of a caught validation error.
         """
         parts = self.code.split("-")
-        return parts[1] if len(parts) >= 2 else self.code
+        raw = parts[1] if len(parts) >= 2 else self.code
+        return raw[:10]
