@@ -750,3 +750,241 @@ class TestPayAndTerminateEndpoints:
         )
 
         assert response.status_code == 404
+
+
+@pytest.mark.money
+class TestInstallmentDateRange:
+    """The manager agrees a window; the plan has to be cleared inside it."""
+
+    def test_due_dates_span_the_range_inclusive(
+        self, manager, branch, patient, installment_service
+    ):
+        starts = date(2026, 3, 1)
+        ends = date(2026, 9, 1)
+
+        plan = services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient,
+            service=installment_service, number_of_installments=3,
+            starts_on=starts, ends_on=ends,
+        )
+
+        dues = list(plan.installments.order_by("index").values_list("due_date", flat=True))
+        assert dues[0] == starts
+        assert dues[-1] == ends
+        # Evenly spaced, so nothing bunches at one end.
+        assert dues[1] == date(2026, 6, 1)
+
+    def test_the_range_is_stored_on_the_plan(
+        self, manager, branch, patient, installment_service
+    ):
+        plan = services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient,
+            service=installment_service, number_of_installments=2,
+            starts_on=date(2026, 3, 1), ends_on=date(2026, 4, 1),
+        )
+
+        assert plan.starts_on == date(2026, 3, 1)
+        assert plan.ends_on == date(2026, 4, 1)
+
+    def test_an_end_before_the_start_is_rejected(
+        self, manager, branch, patient, installment_service
+    ):
+        with pytest.raises(services.EnrollmentError):
+            services.create_installment_plan(
+                actor=manager, branch=branch, patient=patient,
+                service=installment_service, number_of_installments=3,
+                starts_on=date(2026, 9, 1), ends_on=date(2026, 3, 1),
+            )
+
+    def test_a_range_too_short_for_the_parts_is_rejected(
+        self, manager, branch, patient, installment_service
+    ):
+        """Three installments need three distinct days to fall on."""
+        with pytest.raises(services.EnrollmentError):
+            services.create_installment_plan(
+                actor=manager, branch=branch, patient=patient,
+                service=installment_service, number_of_installments=3,
+                starts_on=date(2026, 3, 1), ends_on=date(2026, 3, 2),
+            )
+
+    def test_omitting_the_range_keeps_the_monthly_schedule(
+        self, manager, branch, patient, installment_service
+    ):
+        plan = services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient,
+            service=installment_service, number_of_installments=3,
+        )
+
+        assert plan.starts_on is None
+        assert plan.installments.count() == 3
+
+
+@pytest.mark.money
+class TestPartialInstallmentCollection:
+    """
+    The manager takes whatever the patient can pay today; the rest is carried
+    into the later installments so the plan total never changes.
+    """
+
+    def _plan(self, manager, branch, patient, installment_service, parts=3):
+        return services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient,
+            service=installment_service, number_of_installments=parts,
+        )
+
+    def test_paying_less_carries_the_shortfall_into_later_installments(
+        self, manager, branch, patient, installment_service
+    ):
+        plan = self._plan(manager, branch, patient, installment_service)
+        first = plan.installments.order_by("index").first()
+
+        services.collect_installment_payment(
+            actor=manager, branch=branch, installment=first,
+            method="cash", amount=Decimal("1000.00"),
+        )
+
+        rows = list(plan.installments.order_by("index"))
+        assert rows[0].amount == Decimal("1000.00")
+        assert rows[0].status == BillStatus.PAID
+        # 18,500 − 1,000 = 17,500 across the two that remain.
+        assert sum(r.amount for r in rows[1:]) == Decimal("17500.00")
+        assert rows[1].amount == Decimal("8750.00")
+
+    def test_the_plan_total_survives_a_partial_payment(
+        self, manager, branch, patient, installment_service
+    ):
+        plan = self._plan(manager, branch, patient, installment_service)
+        first = plan.installments.order_by("index").first()
+
+        services.collect_installment_payment(
+            actor=manager, branch=branch, installment=first,
+            method="cash", amount=Decimal("333.33"),
+        )
+
+        assert sum(i.amount for i in plan.installments.all()) == plan.total_amount
+
+    def test_paying_more_than_scheduled_reduces_the_later_ones(
+        self, manager, branch, patient, installment_service
+    ):
+        plan = self._plan(manager, branch, patient, installment_service)
+        first = plan.installments.order_by("index").first()
+
+        services.collect_installment_payment(
+            actor=manager, branch=branch, installment=first,
+            method="cash", amount=Decimal("10000.00"),
+        )
+
+        rows = list(plan.installments.order_by("index"))
+        assert rows[0].amount == Decimal("10000.00")
+        assert sum(r.amount for r in rows[1:]) == Decimal("8500.00")
+
+    def test_the_outstanding_balance_reflects_what_is_still_owed(
+        self, manager, branch, patient, installment_service
+    ):
+        plan = self._plan(manager, branch, patient, installment_service)
+        first = plan.installments.order_by("index").first()
+
+        services.collect_installment_payment(
+            actor=manager, branch=branch, installment=first,
+            method="cash", amount=Decimal("1000.00"),
+        )
+
+        assert plan.outstanding_total() == Decimal("17500.00")
+
+    def test_zero_or_negative_is_rejected(
+        self, manager, branch, patient, installment_service
+    ):
+        plan = self._plan(manager, branch, patient, installment_service)
+        first = plan.installments.order_by("index").first()
+
+        with pytest.raises(services.EnrollmentError):
+            services.collect_installment_payment(
+                actor=manager, branch=branch, installment=first,
+                method="cash", amount=Decimal("0.00"),
+            )
+
+    def test_more_than_the_whole_plan_is_rejected(
+        self, manager, branch, patient, installment_service
+    ):
+        plan = self._plan(manager, branch, patient, installment_service)
+        first = plan.installments.order_by("index").first()
+
+        with pytest.raises(services.EnrollmentError):
+            services.collect_installment_payment(
+                actor=manager, branch=branch, installment=first,
+                method="cash", amount=Decimal("20000.00"),
+            )
+
+    def test_omitting_the_amount_collects_the_scheduled_figure(
+        self, manager, branch, patient, installment_service
+    ):
+        plan = self._plan(manager, branch, patient, installment_service)
+        first = plan.installments.order_by("index").first()
+        scheduled = first.amount
+
+        payment, _ = services.collect_installment_payment(
+            actor=manager, branch=branch, installment=first, method="cash",
+        )
+
+        assert payment.amount == scheduled
+
+
+@pytest.mark.money
+class TestInstallmentEndpointCarriesTheNewFields:
+    """
+    Regression: the service accepted `starts_on`/`ends_on` and `amount`, and
+    the serializer accepted them off the wire, but the *view* dropped both on
+    the floor — so a manager's date range and partial collection silently
+    became the defaults. Service-level tests can't see that; these post real
+    requests.
+    """
+
+    def test_creating_a_plan_over_http_honours_the_date_range(
+        self, manager_client, patient, installment_service
+    ):
+        response = manager_client.post(
+            reverse("enrollments:installment-plan-list"),
+            {
+                "patient": str(patient.id),
+                "service": str(installment_service.id),
+                "numberOfInstallments": 3,
+                "startsOn": "2026-10-01",
+                "endsOn": "2027-04-01",
+            },
+            format="json",
+        )
+
+        assert response.status_code == 201
+        body = response.json()
+        assert body["startsOn"] == "2026-10-01"
+        assert body["endsOn"] == "2027-04-01"
+        dues = [i["dueDate"] for i in body["installments"]]
+        assert dues[0] == "2026-10-01"
+        assert dues[-1] == "2027-04-01"
+
+    def test_paying_a_partial_amount_over_http_redistributes_the_rest(
+        self, manager_client, manager, branch, patient, installment_service
+    ):
+        plan = services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient,
+            service=installment_service, number_of_installments=3,
+        )
+        first = plan.installments.order_by("index").first()
+
+        response = manager_client.post(
+            reverse(
+                "enrollments:installment-plan-pay-installment", args=[plan.id, first.id]
+            ),
+            {"method": "cash", "amount": "1000.00"},
+            format="json",
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert Decimal(body["payment"]["amount"]) == Decimal("1000.00")
+
+        rows = sorted(body["plan"]["installments"], key=lambda i: i["index"])
+        assert Decimal(rows[0]["amount"]) == Decimal("1000.00")
+        # 18,500 − 1,000 shared across the two that remain.
+        assert Decimal(rows[1]["amount"]) == Decimal("8750.00")
+        assert sum(Decimal(r["amount"]) for r in rows) == installment_service.fee

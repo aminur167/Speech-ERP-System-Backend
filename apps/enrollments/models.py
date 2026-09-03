@@ -203,6 +203,13 @@ class InstallmentPlan(TimeStampedModel):
     )
     terminated_at = models.DateTimeField(null=True, blank=True)
 
+    # The window the manager agreed with the patient: the first installment
+    # falls due on `starts_on`, the last on `ends_on`, and the plan has to be
+    # cleared inside it. Null on plans created before this existed -- those
+    # keep the monthly-on-the-5th schedule they were built with.
+    starts_on = models.DateField(null=True, blank=True)
+    ends_on = models.DateField(null=True, blank=True)
+
     class Meta:
         ordering = ["-created_at"]
         indexes = [

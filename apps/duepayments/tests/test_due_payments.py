@@ -137,8 +137,10 @@ class TestOutstandingTotals:
 
         body = manager_client.get(reverse("duepayments:due-summary")).json()
         assert Decimal(body["monthlyDue"]) == Decimal("5000.00")
-        assert Decimal(body["installmentDue"]) == Decimal("2000.00")
-        assert Decimal(body["totalDue"]) == Decimal("7000.00")
+        # The whole plan, not just the installment that's payable today: a
+        # signed-up patient owes all 6,000 of it.
+        assert Decimal(body["installmentDue"]) == Decimal("6000.00")
+        assert Decimal(body["totalDue"]) == Decimal("11000.00")
 
     def test_empty_branch_returns_zero_not_an_error(self, other_manager_client):
         body = other_manager_client.get(reverse("duepayments:due-summary")).json()

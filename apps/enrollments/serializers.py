@@ -1,5 +1,7 @@
 """Enrollment, plan, bill and booking serializers."""
 
+from decimal import Decimal
+
 from rest_framework import serializers
 
 from apps.enrollments.models import (
@@ -88,14 +90,22 @@ class InstallmentPlanSerializer(serializers.ModelSerializer):
         source="total_amount", max_digits=12, decimal_places=2, read_only=True
     )
     createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+    startsOn = serializers.DateField(source="starts_on", read_only=True)
+    endsOn = serializers.DateField(source="ends_on", read_only=True)
+    outstanding = serializers.SerializerMethodField()
 
     class Meta:
         model = InstallmentPlan
         fields = [
             "id", "patientId", "patientName", "serviceId", "serviceName",
             "branchId", "status", "totalAmount", "installments", "createdAt",
+            "startsOn", "endsOn", "outstanding",
         ]
         read_only_fields = fields
+
+    def get_outstanding(self, plan) -> str:
+        """What's still owed on the plan, so the UI needn't re-sum installments."""
+        return str(plan.outstanding_total())
 
 
 class MonthlyEnrollmentCreateSerializer(serializers.Serializer):
@@ -107,6 +117,11 @@ class InstallmentPlanCreateSerializer(serializers.Serializer):
     patient = serializers.IntegerField()
     service = serializers.IntegerField()
     numberOfInstallments = serializers.IntegerField(min_value=2, max_value=12)
+    # The window the plan must be cleared in. Optional together — omitting
+    # both keeps the older monthly schedule (see create_installment_plan);
+    # the service layer rejects one without the other.
+    startsOn = serializers.DateField(required=False)
+    endsOn = serializers.DateField(required=False)
 
 
 class CollectPaymentSerializer(serializers.Serializer):
@@ -114,6 +129,12 @@ class CollectPaymentSerializer(serializers.Serializer):
 
     method = serializers.ChoiceField(choices=PaymentMethod.choices)
     idempotencyKey = serializers.CharField(required=False, allow_blank=True, max_length=64)
+    # Installments only: how much the patient can actually pay today.
+    # Omitted means the scheduled amount, which is what monthly bills always
+    # use (they're full-payment-by-the-5th by rule).
+    amount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, min_value=Decimal("0.01")
+    )
 
 
 class BookingSerializer(serializers.ModelSerializer):

@@ -159,6 +159,25 @@ def collect_due_items(*, branch_id=None, as_of: date | None = None) -> list[dict
     return items
 
 
+def _installment_balance(*, branch_id=None) -> Decimal:
+    """
+    Everything still owed on active installment plans, right now.
+
+    Written-off installments are excluded — that's the sanctioned way to close
+    an uncollectable plan, so counting them would make the figure impossible
+    to ever clear.
+    """
+    installments = Installment.objects.filter(
+        plan__status=EnrollmentStatus.ACTIVE
+    ).exclude(status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF])
+    if branch_id:
+        installments = installments.filter(plan__branch_id=branch_id)
+
+    return sum(
+        (i.outstanding for i in installments if i.outstanding > 0), Decimal("0.00")
+    )
+
+
 def due_summary(*, branch_id=None, as_of: date | None = None) -> dict:
     """
     Outstanding totals, optionally reconstructed for a past date.
@@ -172,9 +191,13 @@ def due_summary(*, branch_id=None, as_of: date | None = None) -> dict:
         monthly = sum(
             (i["amount"] for i in items if i["type"] == "monthly"), Decimal("0.00")
         )
-        installment = sum(
-            (i["amount"] for i in items if i["type"] == "installment"), Decimal("0.00")
-        )
+        # Deliberately NOT summed from `items`: that list is what a manager can
+        # collect right now, so it holds one installment per plan. What's owed
+        # is the whole remaining balance of every active plan — a patient who
+        # has paid the 1st of 3 still owes the other two, and the dashboard has
+        # to say so. Monthly stays list-derived: those renew indefinitely, so
+        # "everything ahead" isn't a finite number there.
+        installment = _installment_balance(branch_id=branch_id)
         return {
             "totalDue": monthly + installment,
             "monthlyDue": monthly,
@@ -219,15 +242,16 @@ def due_summary(*, branch_id=None, as_of: date | None = None) -> dict:
     if branch_id:
         installments = installments.filter(plan__branch_id=branch_id)
 
-    seen_plans = set()
+    # Every unpaid installment, not just the currently-payable one: an
+    # installment plan is a single agreed debt, so once a patient is on one
+    # the whole remaining balance is money the clinic is owed. Monthly
+    # enrollments above stay one-bill-at-a-time on purpose -- they renew
+    # indefinitely, so "everything ahead" isn't a finite figure there.
     for installment in installments:
-        if installment.plan_id in seen_plans:
-            continue
         if installment.plan.created_at > cutoff:
             continue
         if not _was_outstanding_at(installment, cutoff):
             continue
-        seen_plans.add(installment.plan_id)
         installment_total += _outstanding_at(installment, cutoff)
 
     return {

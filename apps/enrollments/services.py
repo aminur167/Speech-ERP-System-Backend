@@ -13,11 +13,12 @@ The rules that matter most here, all confirmed in docs/05:
   * Termination is **blocked** while anything is outstanding.
 """
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import ROUND_DOWN, Decimal
 
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Sum
 from django.utils import timezone
 
 from apps.common import audit
@@ -110,51 +111,121 @@ def create_monthly_enrollment(*, actor, branch, patient, service, months_ahead: 
     return enrollment
 
 
-@transaction.atomic
-def create_installment_plan(*, actor, branch, patient, service, number_of_installments: int):
+def split_equally(total: Decimal, parts: int) -> list[Decimal]:
     """
-    Split a service fee into equal installments.
+    `total` in `parts` equal amounts, remainder on the last.
 
-    Any rounding remainder lands on the **final** installment, so the parts
-    always sum to exactly the total — splitting 18,500 three ways must not
-    quietly lose or invent a taka.
+    ROUND_DOWN, not default rounding: the remainder must be non-negative so
+    it lands on the *final* part. With banker's rounding the base can round
+    up (18,500/3 → 6,166.67 each = 18,500.01), making the remainder negative
+    and the last part smaller than the rest — the opposite of the documented
+    behaviour, and it charges the patient more up front.
+    """
+    base = (total / parts).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    remainder = total - (base * parts)
+    return [base + remainder if i == parts - 1 else base for i in range(parts)]
+
+
+def spread_due_dates(*, starts_on: date, ends_on: date, count: int) -> list[date]:
+    """
+    `count` due dates from `starts_on` to `ends_on` inclusive, evenly spaced.
+
+    The first falls on `starts_on` and the last on `ends_on`, so the plan is
+    cleared inside the window the manager agreed with the patient rather than
+    running past it. Integer division means intermediate gaps can differ by a
+    day; the two endpoints are what matter and they stay exact.
+    """
+    if count == 1:
+        return [ends_on]
+    span = (ends_on - starts_on).days
+    return [starts_on + timedelta(days=(span * i) // (count - 1)) for i in range(count)]
+
+
+@transaction.atomic
+def create_installment_plan(
+    *,
+    actor,
+    branch,
+    patient,
+    service,
+    number_of_installments: int,
+    starts_on: date | None = None,
+    ends_on: date | None = None,
+):
+    """
+    Split a service fee into equal installments across an agreed window.
+
+    Given `starts_on`/`ends_on`, due dates spread evenly across that range —
+    first on the start, last on the end — so the plan clears inside it.
+    Without them the original behaviour stands (monthly, on the configured due
+    day), which is what plans created before the range existed were built on.
+
+    Amounts are equal by default; `collect_installment_payment` re-divides
+    what's left whenever a collection differs from the scheduled amount.
     """
     if number_of_installments < 2:
         raise EnrollmentError(
             "An installment plan needs at least 2 installments.", code="too_few_installments"
         )
 
-    total = Decimal(service.fee)
+    if (starts_on is None) != (ends_on is None):
+        raise EnrollmentError(
+            "Give both a start and an end date, or neither.", code="incomplete_range"
+        )
 
-    # ROUND_DOWN, not default rounding: the remainder must be non-negative so
-    # it lands on the *final* installment. With banker's rounding the base can
-    # round up (18,500/3 → 6,166.67 each = 18,500.01), making the remainder
-    # negative and the last installment smaller than the rest — the opposite
-    # of the documented behaviour, and it charges the patient more up front.
-    base = (total / number_of_installments).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-    remainder = total - (base * number_of_installments)
+    if starts_on is not None and ends_on is not None:
+        if ends_on < starts_on:
+            raise EnrollmentError(
+                "The end date cannot be before the start date.", code="invalid_range"
+            )
+        # One date per installment at minimum: two installments falling due on
+        # the same day isn't a schedule, and it makes the even spread
+        # meaningless.
+        if (ends_on - starts_on).days + 1 < number_of_installments:
+            raise EnrollmentError(
+                f"A {number_of_installments}-installment plan needs a range of at least "
+                f"{number_of_installments} days.",
+                code="range_too_short",
+            )
+
+    total = Decimal(service.fee)
+    amounts = split_equally(total, number_of_installments)
 
     plan = InstallmentPlan.objects.create(
-        patient=patient, service=service, branch=branch, total_amount=total
+        patient=patient,
+        service=service,
+        branch=branch,
+        total_amount=total,
+        starts_on=starts_on,
+        ends_on=ends_on,
     )
 
-    today = timezone.localdate()
-    first_of_month = today.replace(day=1)
-
-    rows = []
-    for index in range(1, number_of_installments + 1):
-        amount = base + remainder if index == number_of_installments else base
-        month_date = add_months(first_of_month, index - 1)
-        rows.append(
-            Installment(
-                plan=plan,
-                index=index,
-                label=f"{ORDINALS[index - 1] if index <= len(ORDINALS) else f'{index}th'} Installment",
-                amount=amount,
-                due_date=due_date_for_month(month_key(month_date)),
-                status=BillStatus.DUE if index == 1 else BillStatus.UPCOMING,
-            )
+    if starts_on is not None and ends_on is not None:
+        due_dates = spread_due_dates(
+            starts_on=starts_on, ends_on=ends_on, count=number_of_installments
         )
+    else:
+        first_of_month = timezone.localdate().replace(day=1)
+        due_dates = [
+            due_date_for_month(month_key(add_months(first_of_month, index)))
+            for index in range(number_of_installments)
+        ]
+
+    rows = [
+        Installment(
+            plan=plan,
+            index=index + 1,
+            label=(
+                f"{ORDINALS[index]} Installment"
+                if index < len(ORDINALS)
+                else f"{index + 1}th Installment"
+            ),
+            amount=amounts[index],
+            due_date=due_dates[index],
+            status=BillStatus.DUE if index == 0 else BillStatus.UPCOMING,
+        )
+        for index in range(number_of_installments)
+    ]
     Installment.objects.bulk_create(rows)
 
     audit.record(
@@ -162,7 +233,12 @@ def create_installment_plan(*, actor, branch, patient, service, number_of_instal
         action=AuditLog.Action.CREATE,
         target=plan,
         branch=branch,
-        changes={"service": service.name, "total": str(total), "parts": number_of_installments},
+        changes={
+            "service": service.name,
+            "total": str(total),
+            "parts": number_of_installments,
+            "window": f"{starts_on} → {ends_on}" if starts_on else "monthly",
+        },
     )
     return plan
 
@@ -269,10 +345,63 @@ def _promote_next_bill(enrollment: MonthlyEnrollment) -> None:
 
 
 @transaction.atomic
+def _redistribute_remaining(plan, *, after_index: int) -> None:
+    """
+    Re-divide what's still owed across the installments after `after_index`.
+
+    The plan's total is fixed; only how it's split moves. So when a
+    collection differs from the scheduled amount, the difference is carried
+    forward into the later installments equally rather than left stranded on
+    a closed one — paying 3,000 against a 5,000 installment on a 15,000 plan
+    leaves 12,000 over the remaining two, i.e. 6,000 each.
+
+    Nothing left to owe means the later installments aren't needed at all;
+    they're removed so the schedule matches reality (the plan was cleared in
+    fewer payments than planned) rather than sitting there at zero.
+    """
+    later = list(
+        plan.installments.filter(index__gt=after_index)
+        .exclude(status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF])
+        .order_by("index")
+    )
+    if not later:
+        return
+
+    collected = plan.installments.aggregate(s=Sum("amount_paid"))["s"] or Decimal("0.00")
+    remaining = plan.total_amount - collected
+
+    if remaining <= 0:
+        plan.installments.filter(pk__in=[row.pk for row in later]).delete()
+        return
+
+    amounts = split_equally(remaining, len(later))
+    for row, amount in zip(later, amounts):
+        row.amount = amount
+    Installment.objects.bulk_update(later, ["amount"])
+
+
+@transaction.atomic
 def collect_installment_payment(
-    *, actor, branch, installment, method: str, idempotency_key: str | None = None
+    *,
+    actor,
+    branch,
+    installment,
+    method: str,
+    amount: Decimal | None = None,
+    idempotency_key: str | None = None,
 ):
-    """Same contract as `collect_bill_payment`, for installment plans."""
+    """
+    Collect against an installment, for any amount the patient can pay today.
+
+    `amount` defaults to the scheduled figure. Anything else closes this
+    installment at what was actually collected and carries the difference
+    into the later ones (`_redistribute_remaining`) — under- and overpayment
+    both, since both change what's left to spread.
+
+    The exception is the final installment: there's nothing after it to carry
+    a shortfall into, so it stays open for the remainder instead of quietly
+    writing the debt off.
+    """
     plan = installment.plan
 
     # See the matching guard in collect_bill_payment for why this runs first.
@@ -292,11 +421,32 @@ def collect_installment_payment(
 
     _assert_is_oldest_unpaid(plan, installment)
 
+    scheduled = installment.outstanding
+    collecting = scheduled if amount is None else Decimal(amount)
+
+    if collecting <= 0:
+        raise EnrollmentError("Enter an amount greater than zero.", code="invalid_amount")
+
+    # Never take more than the plan still owes -- the surplus would have
+    # nowhere to go and would overstate collection.
+    plan_outstanding = plan.total_amount - (
+        plan.installments.aggregate(s=Sum("amount_paid"))["s"] or Decimal("0.00")
+    )
+    if collecting > plan_outstanding:
+        raise EnrollmentError(
+            f"This plan only has {plan_outstanding} outstanding.",
+            code="exceeds_outstanding",
+            extra={"outstanding": str(plan_outstanding)},
+        )
+
+    is_last = not plan.installments.filter(index__gt=installment.index).exists()
+    short = collecting < scheduled
+
     payment, created = payment_services.create_payment(
         actor=actor,
         branch=branch,
         patient=plan.patient,
-        amount=installment.outstanding,
+        amount=collecting,
         method=method,
         category=PaymentCategory.INSTALLMENT,
         description=f"{plan.service.name} — {installment.label}",
@@ -304,17 +454,34 @@ def collect_installment_payment(
     )
 
     if created:
-        installment.amount_paid = installment.amount
-        installment.status = BillStatus.PAID
-        installment.paid_at = timezone.now()
-        installment.payment = payment
-        installment.save(update_fields=["amount_paid", "status", "paid_at", "payment"])
+        installment.amount_paid = installment.amount_paid + collecting
+
+        if short and is_last:
+            # Stays open: the remainder has nowhere later to go.
+            installment.status = (
+                BillStatus.OVERDUE
+                if installment.due_date < timezone.localdate()
+                else BillStatus.DUE
+            )
+            installment.payment = payment
+            installment.save(update_fields=["amount_paid", "status", "payment"])
+        else:
+            # Closes at what was collected; the schedule absorbs the rest.
+            installment.amount = installment.amount_paid
+            installment.status = BillStatus.PAID
+            installment.paid_at = timezone.now()
+            installment.payment = payment
+            installment.save(
+                update_fields=["amount", "amount_paid", "status", "paid_at", "payment"]
+            )
+            _redistribute_remaining(plan, after_index=installment.index)
 
         nxt = plan.installments.filter(status=BillStatus.UPCOMING).order_by("index").first()
         if nxt is not None:
             nxt.status = BillStatus.DUE
             nxt.save(update_fields=["status"])
 
+    installment.refresh_from_db()
     return payment, installment
 
 

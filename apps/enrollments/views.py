@@ -191,6 +191,8 @@ class InstallmentPlanViewSet(_EnrollmentBase):
                 patient=patient,
                 service=service,
                 number_of_installments=data["numberOfInstallments"],
+                starts_on=data.get("startsOn"),
+                ends_on=data.get("endsOn"),
             )
         except services.EnrollmentError as exc:
             return _error(exc)
@@ -221,6 +223,9 @@ class InstallmentPlanViewSet(_EnrollmentBase):
                 installment=installment,
                 method=serializer.validated_data["method"],
                 idempotency_key=serializer.validated_data.get("idempotencyKey") or None,
+                # Omitted collects the scheduled figure; a smaller amount is
+                # carried into the later installments by the service.
+                amount=serializer.validated_data.get("amount"),
             )
         except services.EnrollmentError as exc:
             return _error(exc)
