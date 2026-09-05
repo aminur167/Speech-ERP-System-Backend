@@ -28,6 +28,9 @@ class DuePaymentItemSerializer(serializers.Serializer):
     branchId = serializers.CharField()
     label = serializers.CharField()
     amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    # Everything unpaid on the enrollment/plan, which is what terminating
+    # writes off — `amount` is only the part payable right now.
+    outstandingTotal = serializers.DecimalField(max_digits=12, decimal_places=2)
     dueDate = serializers.DateField()
     status = serializers.CharField()
     installmentIndex = serializers.IntegerField(required=False)

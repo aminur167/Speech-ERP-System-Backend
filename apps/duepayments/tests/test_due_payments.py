@@ -264,3 +264,31 @@ class TestDueBranchIsolation:
             reverse("duepayments:due-summary"), {"branch": str(branch.id)}
         ).json()
         assert Decimal(body["totalDue"]) == Decimal("5000.00")
+
+
+@pytest.mark.money
+class TestOutstandingTotalOnRows:
+    """
+    A row's `amount` is what's payable now; `outstandingTotal` is everything
+    still unpaid. Terminating writes off the latter, so the confirmation
+    dialog needs it — showing `amount` there would understate what the
+    manager is about to forgive.
+    """
+
+    def test_an_installment_row_carries_the_whole_plan_balance(
+        self, manager_client, manager, branch, patient_factory, service_factory
+    ):
+        from apps.services.models import Service
+
+        enrollment_services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient_factory(),
+            service=service_factory(
+                code="INS-T", category=Service.Category.INSTALLMENT, fee=Decimal("9000.00")
+            ),
+            number_of_installments=3,
+        )
+
+        row = manager_client.get(reverse("duepayments:due-list")).json()["results"][0]
+
+        assert Decimal(row["amount"]) == Decimal("3000.00")
+        assert Decimal(row["outstandingTotal"]) == Decimal("9000.00")

@@ -25,6 +25,7 @@ from apps.enrollments.models import (
     MonthlyBill,
     MonthlyEnrollment,
 )
+from apps.common.models import AuditLog
 from apps.payments.models import Payment, PaymentCategory
 
 pytestmark = pytest.mark.django_db
@@ -344,27 +345,65 @@ class TestOldestFirst:
 
 
 class TestTermination:
-    def test_blocked_while_a_bill_is_unpaid(self, manager, enrollment):
-        with pytest.raises(services.EnrollmentError) as exc:
-            services.terminate(actor=manager, container=enrollment)
+    def test_succeeds_while_a_bill_is_unpaid(self, manager, enrollment):
+        """
+        A manager has to be able to close a plan for someone who stopped
+        coming. It used to be refused outright, which left the row in Due
+        Payments with nothing that could clear it.
+        """
+        services.terminate(actor=manager, container=enrollment)
 
-        assert exc.value.code == "outstanding_dues"
         enrollment.refresh_from_db()
-        assert enrollment.status == EnrollmentStatus.ACTIVE
+        assert enrollment.status == EnrollmentStatus.TERMINATED
 
-    def test_the_error_names_the_amount_owed(self, manager, enrollment):
-        with pytest.raises(services.EnrollmentError) as exc:
-            services.terminate(actor=manager, container=enrollment)
+    def test_the_unpaid_balance_is_written_off_not_dropped(self, manager, enrollment):
+        services.terminate(actor=manager, container=enrollment)
 
-        assert exc.value.extra["outstandingAmount"] == "15000.00"  # 3 × 5,000
+        statuses = set(enrollment.bills.values_list("status", flat=True))
+        assert statuses == {BillStatus.WRITTEN_OFF}
 
-    def test_blocked_while_a_bill_is_overdue(self, manager, branch, enrollment):
+    def test_the_write_off_is_audited_with_the_amount(self, manager, enrollment):
+        """Forgiving money silently is the thing the old block existed to prevent."""
+        services.terminate(actor=manager, container=enrollment)
+
+        entry = AuditLog.objects.filter(
+            action=AuditLog.Action.WRITE_OFF, target_type="MonthlyEnrollment"
+        ).first()
+        assert entry is not None
+        assert entry.changes["writtenOff"] == "15000.00"  # 3 × 5,000
+
+    def test_a_terminated_plans_balance_leaves_outstanding_due(
+        self, manager, branch, enrollment
+    ):
+        from apps.duepayments.services import due_summary
+
+        assert Decimal(due_summary(branch_id=branch.id)["totalDue"]) > 0
+
+        services.terminate(actor=manager, container=enrollment)
+
+        assert Decimal(due_summary(branch_id=branch.id)["totalDue"]) == Decimal("0.00")
+
+    def test_an_overdue_bill_does_not_block_it_either(self, manager, branch, enrollment):
         MonthlyBill.objects.filter(enrollment=enrollment).update(
             due_date=timezone.localdate() - timedelta(days=60)
         )
 
-        with pytest.raises(services.EnrollmentError):
-            services.terminate(actor=manager, container=enrollment)
+        services.terminate(actor=manager, container=enrollment)
+
+        enrollment.refresh_from_db()
+        assert enrollment.status == EnrollmentStatus.TERMINATED
+
+    def test_nothing_is_written_off_when_nothing_is_owed(self, manager, branch, enrollment):
+        for _ in range(enrollment.bills.count()):
+            services.collect_bill_payment(
+                actor=manager, branch=branch,
+                bill=enrollment.oldest_unpaid_bill(), method="cash",
+            )
+
+        services.terminate(actor=manager, container=enrollment)
+
+        assert not AuditLog.objects.filter(action=AuditLog.Action.WRITE_OFF).exists()
+        assert set(enrollment.bills.values_list("status", flat=True)) == {BillStatus.PAID}
 
     def test_succeeds_once_everything_is_settled(self, manager, branch, enrollment):
         for _ in range(enrollment.bills.count()):
@@ -611,12 +650,16 @@ class TestPayAndTerminateEndpoints:
 
         assert response.status_code == 400
 
-    def test_terminate_endpoint_blocks_an_unpaid_bill(self, manager_client, enrollment):
+    def test_terminate_endpoint_writes_off_an_unpaid_bill(self, manager_client, enrollment):
+        """Over HTTP too: unpaid no longer refuses, it forgives and records."""
         response = manager_client.post(self.terminate_monthly_url(enrollment), format="json")
 
-        assert response.status_code == 400
+        assert response.status_code == 200
         enrollment.refresh_from_db()
-        assert enrollment.status == EnrollmentStatus.ACTIVE
+        assert enrollment.status == EnrollmentStatus.TERMINATED
+        assert set(enrollment.bills.values_list("status", flat=True)) == {
+            BillStatus.WRITTEN_OFF
+        }
 
     def test_terminate_endpoint_succeeds_once_settled(
         self, manager_client, manager, branch, enrollment
@@ -694,9 +737,10 @@ class TestPayAndTerminateEndpoints:
 
         assert response.status_code == 404
 
-    def test_terminate_installment_endpoint_blocks_unpaid(
+    def test_terminate_installment_endpoint_writes_off_and_stops_the_plan(
         self, manager_client, manager, branch, patient, installment_service
     ):
+        """Over HTTP too: unpaid no longer refuses, it forgives and records."""
         plan = services.create_installment_plan(
             actor=manager, branch=branch, patient=patient,
             service=installment_service, number_of_installments=2,
@@ -706,9 +750,12 @@ class TestPayAndTerminateEndpoints:
             self.terminate_installment_url(plan), format="json"
         )
 
-        assert response.status_code == 400
+        assert response.status_code == 200
         plan.refresh_from_db()
-        assert plan.status == EnrollmentStatus.ACTIVE
+        assert plan.status == EnrollmentStatus.TERMINATED
+        assert set(plan.installments.values_list("status", flat=True)) == {
+            BillStatus.WRITTEN_OFF
+        }
 
     def test_terminate_installment_endpoint_succeeds_once_settled(
         self, manager_client, manager, branch, patient, installment_service

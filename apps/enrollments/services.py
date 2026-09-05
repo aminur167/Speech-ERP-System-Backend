@@ -491,29 +491,44 @@ def collect_installment_payment(
 
 
 @transaction.atomic
-def terminate(*, actor, container) -> None:
+def terminate(*, actor, container, reason: str = "") -> None:
     """
-    Stop a service — but only once the patient has settled what they owe.
+    Stop a service, whatever the patient still owes.
 
-    Without this block, a patient could walk away from an unpaid bill simply
-    by asking to stop, and the debt would vanish from Outstanding Due. The
-    sanctioned escape hatch for genuinely uncollectable money is an
-    admin-approved refund write-off (docs/04), not silent termination.
+    An outstanding balance used to block this outright, on the reasoning that
+    a patient could otherwise walk away from a debt by asking to stop. In
+    practice that left a manager unable to close a plan for someone who had
+    simply stopped coming, and the row sat in Due Payments forever.
+
+    So termination always succeeds now — but the debt is never allowed to
+    quietly evaporate. Anything still unpaid is written off explicitly: the
+    same WRITTEN_OFF status an admin-approved refund write-off produces, which
+    is excluded from Outstanding Due, plus an audit entry naming the exact
+    amount forgiven. The money is accounted for either way; the difference is
+    that closing the plan is now the manager's call rather than a dead end.
     """
     outstanding = container.outstanding_total()
 
     if outstanding > 0:
-        unpaid = (
-            container.oldest_unpaid_bill()
-            if isinstance(container, MonthlyEnrollment)
-            else container.oldest_unpaid_installment()
-        )
-        label = unpaid.label if unpaid else "an outstanding balance"
-        raise EnrollmentError(
-            f"{outstanding} outstanding ({label}) must be paid before this service "
-            f"can be stopped.",
-            code="outstanding_dues",
-            extra={"outstandingAmount": str(outstanding), "oldestLabel": label},
+        unpaid = container.installments if not isinstance(
+            container, MonthlyEnrollment
+        ) else container.bills
+        # `is_settled` rather than status alone: a partially-paid item still
+        # has a balance to forgive, and leaving it DUE would keep the money in
+        # Outstanding Due after the plan is closed.
+        for item in unpaid.exclude(status=BillStatus.WRITTEN_OFF):
+            if item.outstanding <= 0:
+                continue
+            item.status = BillStatus.WRITTEN_OFF
+            item.save(update_fields=["status"])
+
+        audit.record(
+            actor=actor,
+            action=AuditLog.Action.WRITE_OFF,
+            target=container,
+            branch=container.branch,
+            reason=reason or "Written off when the service was stopped",
+            changes={"writtenOff": str(outstanding)},
         )
 
     container.status = EnrollmentStatus.TERMINATED
@@ -525,6 +540,8 @@ def terminate(*, actor, container) -> None:
         action=AuditLog.Action.TERMINATE,
         target=container,
         branch=container.branch,
+        reason=reason,
+        changes={"writtenOff": str(outstanding)} if outstanding > 0 else None,
     )
 
 

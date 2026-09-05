@@ -110,6 +110,10 @@ def collect_due_items(*, branch_id=None, as_of: date | None = None) -> list[dict
                 "branchId": str(enrollment.branch_id),
                 "label": bill.label,
                 "amount": bill.outstanding,
+                # Everything unpaid on the enrollment, not just this bill —
+                # what terminating would write off, which the confirmation
+                # has to state before the manager agrees to it.
+                "outstandingTotal": enrollment.outstanding_total(),
                 "dueDate": bill.due_date,
                 "status": bill.effective_status(),
             }
@@ -148,6 +152,9 @@ def collect_due_items(*, branch_id=None, as_of: date | None = None) -> list[dict
                 "branchId": str(plan.branch_id),
                 "label": installment.label,
                 "amount": installment.outstanding,
+                # The whole remaining plan, not just this installment — see
+                # the matching note on the monthly branch above.
+                "outstandingTotal": plan.outstanding_total(),
                 "dueDate": installment.due_date,
                 "status": installment.effective_status(),
                 "installmentIndex": installment.index,
