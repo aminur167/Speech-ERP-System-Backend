@@ -146,18 +146,35 @@ class Command(BaseCommand):
         numbers, which is what the screen's search is actually used with.
         Invented ones are stamped so `--undo` can tell them apart.
         """
-        # Skips anyone who already has a monthly enrollment, so running this
-        # twice builds a second set of scenarios rather than giving the same
-        # patient two overlapping subscriptions to the same service.
-        existing = list(
+        # Real people first, in the order that keeps the scenarios readable:
+        # someone with no monthly service at all, then someone who already has
+        # one (a patient may legitimately hold a second), and only then an
+        # invented patient. Inventing is the last resort rather than the first
+        # move -- a scenario carrying a real name and phone number is what the
+        # screen's search is actually used with.
+        free = list(
             Patient.objects.filter(branch=branch)
             .exclude(monthly_enrollments__isnull=False)
             .order_by("id")[:needed]
         )
-        self.stdout.write(f"Reusing {len(existing)} existing patient(s) with no monthly service.")
+        chosen = list(free)
 
-        for index in range(len(existing), needed):
-            existing.append(
+        if len(chosen) < needed:
+            already_enrolled = (
+                Patient.objects.filter(branch=branch)
+                .exclude(pk__in=[p.pk for p in chosen])
+                .order_by("id")[: needed - len(chosen)]
+            )
+            chosen.extend(already_enrolled)
+
+        self.stdout.write(
+            f"Reusing {len(chosen)} of the branch's own patient(s)"
+            + (f", {len(free)} of them with no monthly service yet." if free else ".")
+        )
+
+        invented = 0
+        for index in range(len(chosen), needed):
+            chosen.append(
                 create_patient(
                     actor=manager,
                     branch=branch,
@@ -168,7 +185,11 @@ class Command(BaseCommand):
                     },
                 )
             )
-        return existing
+            invented += 1
+
+        if invented:
+            self.stdout.write(f"Invented {invented} patient(s) to make up the numbers.")
+        return chosen
 
     def _build(self, *, actor, branch, service, patient, label, unpaid_months, outcome):
         enrollment = services.create_monthly_enrollment(
