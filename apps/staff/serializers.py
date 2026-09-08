@@ -127,6 +127,17 @@ class DisburseSalaryPaymentSerializer(serializers.Serializer):
     paymentMethod = serializers.ChoiceField(choices=PaymentMethod.choices)
 
 
+class SalaryPaymentBranchSummaryRowSerializer(serializers.Serializer):
+    """One branch's Admin-approved salary totals — split into awaiting disbursement vs. already paid."""
+
+    branchId = serializers.CharField()
+    branchName = serializers.CharField()
+    approvedAmount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    paidAmount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    totalApprovedAmount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    paymentCount = serializers.IntegerField()
+
+
 class StaffMonthlyReportRowSerializer(serializers.Serializer):
     """One row of the monthly payroll + attendance report."""
 

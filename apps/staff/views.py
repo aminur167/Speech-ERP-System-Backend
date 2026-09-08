@@ -21,6 +21,7 @@ from apps.staff.serializers import (
     MarkAttendanceSerializer,
     RequestSalaryPaymentSerializer,
     ReviewSalaryPaymentSerializer,
+    SalaryPaymentBranchSummaryRowSerializer,
     SalaryPaymentSerializer,
     StaffAttendanceSerializer,
     StaffBonusSerializer,
@@ -255,6 +256,19 @@ class SalaryPaymentViewSet(BranchScopedQuerySetMixin, viewsets.ReadOnlyModelView
             )
 
         return Response(SalaryPaymentSerializer(payment).data)
+
+    @action(detail=False, methods=["get"], url_path="branch-summary")
+    def branch_summary(self, request):
+        """
+        `?month=YYYY-MM` (all months if omitted) — one row per branch with
+        Admin-approved salary totals, split into awaiting disbursement vs.
+        already paid. For a Manager this is just their own branch's row;
+        it's Admin narrowing across branches where this earns its keep.
+        """
+        rows = services.salary_payments_branch_summary(
+            self.get_queryset(), month=request.query_params.get("month")
+        )
+        return Response(SalaryPaymentBranchSummaryRowSerializer(rows, many=True).data)
 
     @action(detail=True, methods=["post"])
     def disburse(self, request, pk=None):
