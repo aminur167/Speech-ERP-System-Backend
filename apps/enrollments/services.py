@@ -533,7 +533,13 @@ def terminate(*, actor, container, reason: str = "") -> None:
 
     container.status = EnrollmentStatus.TERMINATED
     container.terminated_at = timezone.now()
-    container.save(update_fields=["status", "terminated_at"])
+    fields = ["status", "terminated_at"]
+    if isinstance(container, MonthlyEnrollment):
+        # Says this was a person's decision, not the unpaid-due job's — the
+        # two are resumed on completely different terms.
+        container.terminated_kind = MonthlyEnrollment.TerminationKind.MANUAL
+        fields.append("terminated_kind")
+    container.save(update_fields=fields)
 
     audit.record(
         actor=actor,
@@ -730,3 +736,215 @@ def cancel_booking(*, actor, booking: Booking, reason: str = "") -> Booking:
         reason=reason,
     )
     return booking
+
+
+# ---------------------------------------------------------------------------
+# Automatic termination for an unpaid month, and resuming afterwards
+# ---------------------------------------------------------------------------
+
+
+@transaction.atomic
+def terminate_unpaid_monthly_services(*, actor=None, on: date | None = None) -> dict:
+    """
+    End every monthly service whose due for a finished month is still unpaid.
+
+    The confirmed rule: a patient has until the last day of the month to
+    clear that month's due. October's due unpaid when October ends stops the
+    service; cleared in time, nothing happens.
+
+    Written as "any unpaid bill for a month earlier than the current one"
+    rather than "last month's bill", so the job is **catch-up capable** the
+    same way `generate_due_bills` is: if it doesn't run for a week, the next
+    run still ends the services that should have ended, instead of skipping
+    them forever. It is also idempotent — an already-terminated enrollment is
+    not in the queryset at all, so a service can never be terminated twice.
+
+    Crucially this does **not** write the debt off, which is the whole
+    difference from `terminate()`. A manager stopping a service forgives what
+    is owed; a service stopped for non-payment keeps every taka of it, because
+    the patient may come back in December and settle up (see
+    `resume_monthly_service`).
+    """
+    today = on or timezone.localdate()
+    current_month = month_key(today.replace(day=1))
+
+    ended = []
+    enrollments = MonthlyEnrollment.objects.filter(
+        status=EnrollmentStatus.ACTIVE
+    ).select_related("patient", "service", "branch")
+
+    for enrollment in enrollments:
+        overdue = enrollment.unpaid_bills().filter(month__lt=current_month).first()
+        if overdue is None:
+            continue
+
+        _end_for_unpaid_due(actor=actor, enrollment=enrollment, month=overdue.month)
+        ended.append(enrollment)
+
+    return {
+        "terminated": len(ended),
+        "enrollmentIds": [enrollment.id for enrollment in ended],
+    }
+
+
+def _end_for_unpaid_due(*, actor, enrollment: MonthlyEnrollment, month: str) -> None:
+    """
+    Stop one enrollment, keeping the debt and dropping the empty schedule.
+
+    Bills after the month that ended it are placeholders and nothing more:
+    created upfront as the billing lookahead, never payable, never paid, for
+    service that will now not be delivered. Removing them is what keeps the
+    arrears honest — left behind, they would be counted into "previous due"
+    and charge the patient for months they were not enrolled, and on resume
+    `oldest_unpaid_bill` would hand the manager a bill from the gap instead of
+    the new cycle's. Nothing historical goes with them: no payment, no
+    receipt, no audit entry ever pointed at one.
+    """
+    enrollment.bills.filter(
+        month__gt=month, status=BillStatus.UPCOMING, amount_paid=Decimal("0.00")
+    ).delete()
+
+    outstanding = enrollment.outstanding_total()
+
+    enrollment.status = EnrollmentStatus.TERMINATED
+    enrollment.terminated_at = timezone.now()
+    enrollment.terminated_kind = MonthlyEnrollment.TerminationKind.UNPAID_DUE
+    enrollment.terminated_month = month
+    enrollment.save(
+        update_fields=["status", "terminated_at", "terminated_kind", "terminated_month"]
+    )
+
+    audit.record(
+        actor=actor,
+        action=AuditLog.Action.TERMINATE,
+        target=enrollment,
+        branch=enrollment.branch,
+        reason=f"{month} due went unpaid to the end of the month",
+        changes={"month": month, "outstanding": str(outstanding)},
+    )
+
+
+@transaction.atomic
+def resume_monthly_service(
+    *, actor, enrollment: MonthlyEnrollment, carry_due: bool,
+    method: str = "", idempotency_key: str | None = None,
+):
+    """
+    Restart a service that was stopped for an unpaid due.
+
+    Two ways, and the difference is only what happens to the arrears:
+
+    * `carry_due=True` — the patient pays what they owed. Every unpaid bill is
+      collected oldest-first, each keeping its own payment and receipt, so the
+      arrears stay attributable to the months they belong to rather than
+      collapsing into one undated lump.
+    * `carry_due=False` — the arrears are written off, the same explicit
+      WRITTEN_OFF that closing a plan produces, with an audit entry naming the
+      amount forgiven. Forgiven, never quietly dropped.
+
+    Either way the new cycle starts at the **current** month. The gap months
+    are not backfilled: the patient was not enrolled during them, and billing
+    for service nobody delivered is the one thing this must not do.
+
+    Only an automatic termination can be resumed. A manager who stopped a
+    service already forgave the debt and closed it deliberately; reopening
+    that is a fresh enrollment, not a resumption.
+    """
+    if enrollment.status != EnrollmentStatus.TERMINATED:
+        raise EnrollmentError(
+            "This service is not terminated.", code="not_terminated"
+        )
+    if enrollment.terminated_kind != MonthlyEnrollment.TerminationKind.UNPAID_DUE:
+        raise EnrollmentError(
+            "Only a service stopped for an unpaid due can be resumed. "
+            "Enroll the patient again instead.",
+            code="not_resumable",
+        )
+    if carry_due and not method:
+        raise EnrollmentError(
+            "A payment method is required to settle the previous due.",
+            code="method_required",
+        )
+
+    arrears = enrollment.outstanding_total()
+
+    # Reopened before collecting: `collect_bill_payment` refuses to take money
+    # for a terminated enrollment, and rightly so. If any part of the
+    # collection fails, this whole transaction rolls back and the service
+    # stays terminated — it never ends up active with the arrears unpaid.
+    enrollment.status = EnrollmentStatus.ACTIVE
+    enrollment.terminated_at = None
+    enrollment.terminated_kind = ""
+    enrollment.terminated_month = ""
+    enrollment.save(
+        update_fields=["status", "terminated_at", "terminated_kind", "terminated_month"]
+    )
+
+    payments = []
+    if carry_due:
+        # Re-read each time: settling one bill promotes the next, so the list
+        # has to be walked from the database rather than from a snapshot.
+        while (bill := enrollment.oldest_unpaid_bill()) is not None:
+            payment, _ = collect_bill_payment(
+                actor=actor, branch=enrollment.branch, bill=bill, method=method,
+                idempotency_key=None,
+            )
+            payments.append(payment)
+    elif arrears > 0:
+        for bill in enrollment.unpaid_bills():
+            bill.status = BillStatus.WRITTEN_OFF
+            bill.save(update_fields=["status"])
+
+        audit.record(
+            actor=actor,
+            action=AuditLog.Action.WRITE_OFF,
+            target=enrollment,
+            branch=enrollment.branch,
+            reason="Previous due waived when the service was resumed",
+            changes={"writtenOff": str(arrears)},
+        )
+
+    _open_cycle_from(enrollment, timezone.localdate())
+
+    audit.record(
+        actor=actor,
+        action=AuditLog.Action.UPDATE,
+        target=enrollment,
+        branch=enrollment.branch,
+        reason="Service resumed",
+        changes={
+            "status": {"from": EnrollmentStatus.TERMINATED, "to": EnrollmentStatus.ACTIVE},
+            "previousDue": str(arrears),
+            "previousDueSettled": carry_due,
+        },
+    )
+
+    enrollment.refresh_from_db()
+    return enrollment, payments
+
+
+def _open_cycle_from(enrollment: MonthlyEnrollment, day: date, months_ahead: int = 3) -> None:
+    """
+    Start billing again at `day`'s month, with the same lookahead a fresh
+    enrollment gets.
+
+    `get_or_create` rather than `bulk_create`: the unique (enrollment, month)
+    constraint is what actually guarantees no duplicate, and a resumed
+    enrollment may already own a bill for one of these months if it was
+    stopped and restarted inside an unusual window.
+    """
+    first_of_month = day.replace(day=1)
+
+    for offset in range(months_ahead):
+        month_date = add_months(first_of_month, offset)
+        key = month_key(month_date)
+        MonthlyBill.objects.get_or_create(
+            enrollment=enrollment,
+            month=key,
+            defaults={
+                "label": month_label(month_date),
+                "amount": enrollment.service.fee,
+                "due_date": due_date_for_month(key),
+                "status": BillStatus.DUE if offset == 0 else BillStatus.UPCOMING,
+            },
+        )

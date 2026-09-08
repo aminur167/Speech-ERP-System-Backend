@@ -1,5 +1,6 @@
 """Enrollment, plan, bill and booking serializers."""
 
+from datetime import date
 from decimal import Decimal
 
 from rest_framework import serializers
@@ -175,3 +176,73 @@ class BookingCreateSerializer(serializers.Serializer):
 
 class CancelBookingSerializer(serializers.Serializer):
     reason = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class TerminatedMonthlyServiceSerializer(serializers.ModelSerializer):
+    """
+    One row of the Terminated Services screen.
+
+    Carries the patient's phone and code alongside the service, because that
+    screen is reached by someone holding a phone in one hand: the manager is
+    looking a patient up, not browsing enrollments.
+    """
+
+    patientId = serializers.CharField(source="patient_id", read_only=True)
+    patientCode = serializers.CharField(source="patient.patient_code", read_only=True)
+    patientName = serializers.CharField(source="patient.name", read_only=True)
+    patientPhone = serializers.CharField(source="patient.phone", read_only=True)
+    serviceId = serializers.CharField(source="service_id", read_only=True)
+    serviceCode = serializers.CharField(source="service.code", read_only=True)
+    serviceName = serializers.CharField(source="service.name", read_only=True)
+    monthlyFee = serializers.DecimalField(
+        source="service.fee", max_digits=12, decimal_places=2, read_only=True
+    )
+    branchId = serializers.CharField(source="branch_id", read_only=True)
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+    terminatedAt = serializers.DateTimeField(source="terminated_at", read_only=True)
+    terminatedMonth = serializers.CharField(source="terminated_month", read_only=True)
+    terminatedMonthLabel = serializers.SerializerMethodField()
+    terminatedKind = serializers.CharField(source="terminated_kind", read_only=True)
+    # What resuming "with the previous due" would collect.
+    previousDue = serializers.SerializerMethodField()
+    unpaidMonths = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MonthlyEnrollment
+        fields = [
+            "id", "patientId", "patientCode", "patientName", "patientPhone",
+            "serviceId", "serviceCode", "serviceName", "monthlyFee",
+            "branchId", "status", "terminatedAt", "terminatedMonth",
+            "terminatedMonthLabel", "terminatedKind", "previousDue",
+            "unpaidMonths", "createdAt",
+        ]
+        read_only_fields = fields
+
+    def get_terminatedMonthLabel(self, enrollment) -> str:
+        from apps.enrollments.services import month_label
+
+        if not enrollment.terminated_month:
+            return ""
+        year, month = (int(part) for part in enrollment.terminated_month.split("-"))
+        return month_label(date(year, month, 1))
+
+    def get_previousDue(self, enrollment) -> Decimal:
+        return enrollment.outstanding_total()
+
+    def get_unpaidMonths(self, enrollment) -> list[str]:
+        """The cycles the arrears are made of — what a manager is asked to collect."""
+        return [bill.label for bill in enrollment.unpaid_bills()]
+
+
+class ResumeMonthlyServiceSerializer(serializers.Serializer):
+    """
+    `carryDue` picks between the two ways to resume: settle the previous due
+    now, or waive it and start clean. `method` is only meaningful for the
+    first, and the service layer refuses that one without it rather than
+    silently taking money by an unnamed method.
+    """
+
+    carryDue = serializers.BooleanField()
+    method = serializers.ChoiceField(
+        choices=PaymentMethod.choices, required=False, allow_blank=True
+    )

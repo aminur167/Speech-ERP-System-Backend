@@ -234,7 +234,41 @@ its contents.
 
 ---
 
-## 10. Scheduled jobs (reminders)
+## 10. Scheduled jobs (billing)
+
+Not optional, unlike the reminders below: without these two the clinic stops
+invoicing and stops enforcing its own payment deadline, and neither failure
+announces itself.
+
+```bash
+sudo crontab -u speecherp -e
+# add:
+0 1 1 * * SPEECH_ERP_ENV_FILE=/etc/speech-erp/backend.env DJANGO_SETTINGS_MODULE=config.settings.production /opt/speech-erp/backend/.venv/bin/python /opt/speech-erp/backend/manage.py generate_monthly_bills >> /var/log/speech-erp/billing.log 2>&1
+5 0 * * * SPEECH_ERP_ENV_FILE=/etc/speech-erp/backend.env DJANGO_SETTINGS_MODULE=config.settings.production /opt/speech-erp/backend/.venv/bin/python /opt/speech-erp/backend/manage.py terminate_unpaid_monthly_services >> /var/log/speech-erp/billing.log 2>&1
+```
+
+`generate_monthly_bills` opens each active enrollment's next month.
+
+`terminate_unpaid_monthly_services` enforces the confirmed rule that a
+patient has until the last day of the month to clear that month's due: a due
+still unpaid once the month is over stops the service. It runs **daily**
+rather than monthly on purpose — the rule is about a month ending, but a
+service that dodged one run because the server was down has to be caught the
+next day rather than never.
+
+Both are idempotent and catch-up capable, so a missed night is repaired by
+the next run and a double run changes nothing. Both exit non-zero on failure
+for the scheduler to alert on. `--dry-run` reports what either would do
+without writing.
+
+The termination job never writes the debt off. What the patient owed stays
+owed and stays collectable from the Terminated Services screen, where a
+manager can resume the service either by taking the arrears or by waiving
+them explicitly.
+
+---
+
+## 11. Scheduled jobs (reminders)
 
 Status: built, pending final confirmation with the client on whether it
 ships (`apps/notifications`). Both commands no-op safely (log instead of
@@ -254,7 +288,7 @@ being invoked) or be deleted outright.
 
 ---
 
-## 11. Staging
+## 12. Staging
 
 Staging is **the same `config.settings.production` module**, not a forked
 settings file — the whole point of a staging environment is to run what
@@ -268,7 +302,7 @@ staging first, verify, then repeat the same steps against production.
 
 ---
 
-## 12. Release checklist
+## 13. Release checklist
 
 For every deploy after the first:
 

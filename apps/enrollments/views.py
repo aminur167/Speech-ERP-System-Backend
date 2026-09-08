@@ -6,6 +6,7 @@ Admin can see everything but shouldn't transact on a branch's behalf.
 """
 
 from drf_spectacular.utils import OpenApiParameter, extend_schema
+from django.db.models import Q
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
@@ -18,6 +19,7 @@ from apps.common.permissions import IsManager
 from apps.enrollments import services
 from apps.enrollments.models import (
     Booking,
+    EnrollmentStatus,
     Installment,
     InstallmentPlan,
     MonthlyBill,
@@ -32,6 +34,8 @@ from apps.enrollments.serializers import (
     InstallmentPlanSerializer,
     MonthlyEnrollmentCreateSerializer,
     MonthlyEnrollmentSerializer,
+    ResumeMonthlyServiceSerializer,
+    TerminatedMonthlyServiceSerializer,
 )
 from apps.patients.models import Patient
 from apps.payments.serializers import PaymentSerializer
@@ -151,6 +155,92 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
 
         enrollment.refresh_from_db()
         return Response(MonthlyEnrollmentSerializer(enrollment).data)
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                "search",
+                str,
+                description=(
+                    "Patient name, patient code, phone, or service code/name — "
+                    "the four things a manager has to hand when looking one up."
+                ),
+            ),
+            OpenApiParameter("month", str, description='Terminated cycle, "YYYY-MM".'),
+            OpenApiParameter("pageSize", int),
+        ],
+        responses=TerminatedMonthlyServiceSerializer(many=True),
+    )
+    @action(detail=False, methods=["get"])
+    def terminated(self, request):
+        """
+        Services stopped automatically for an unpaid due — the only ones that
+        can be resumed.
+
+        A manager's own termination is excluded on purpose: that already
+        forgave the debt and closed the service deliberately, so it belongs in
+        a new enrollment rather than on a screen offering to reinstate it.
+        """
+        queryset = (
+            self.get_queryset()
+            .filter(
+                status=EnrollmentStatus.TERMINATED,
+                terminated_kind=MonthlyEnrollment.TerminationKind.UNPAID_DUE,
+            )
+            .order_by("-terminated_at")
+        )
+
+        month = request.query_params.get("month")
+        if month:
+            queryset = queryset.filter(terminated_month=month)
+
+        search = request.query_params.get("search", "").strip()
+        if search:
+            queryset = queryset.filter(
+                Q(patient__name__icontains=search)
+                | Q(patient__patient_code__icontains=search)
+                | Q(patient__phone__icontains=search)
+                | Q(service__code__icontains=search)
+                | Q(service__name__icontains=search)
+            )
+
+        paginator = PageNumberPagination()
+        paginator.page_size = int(request.query_params.get("pageSize", 10) or 10)
+        page = paginator.paginate_queryset(queryset, request)
+
+        return paginator.get_paginated_response(
+            TerminatedMonthlyServiceSerializer(page, many=True).data
+        )
+
+    @extend_schema(request=ResumeMonthlyServiceSerializer)
+    @action(detail=True, methods=["post"])
+    def resume(self, request, pk=None):
+        """
+        Restart a service stopped for an unpaid due, with or without settling
+        the arrears first (`carryDue`).
+        """
+        enrollment = self.get_object()
+        serializer = ResumeMonthlyServiceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            enrollment, payments = services.resume_monthly_service(
+                actor=request.user,
+                enrollment=enrollment,
+                carry_due=serializer.validated_data["carryDue"],
+                method=serializer.validated_data.get("method", ""),
+            )
+        except services.EnrollmentError as exc:
+            return _error(exc)
+
+        return Response(
+            {
+                "enrollment": MonthlyEnrollmentSerializer(
+                    MonthlyEnrollment.objects.prefetch_related("bills").get(pk=enrollment.pk)
+                ).data,
+                "payments": PaymentSerializer(payments, many=True).data,
+            }
+        )
 
 
 class InstallmentPlanViewSet(_EnrollmentBase):

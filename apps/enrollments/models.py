@@ -114,6 +114,20 @@ class PayableMixin(models.Model):
 
 
 class MonthlyEnrollment(TimeStampedModel):
+    class TerminationKind(models.TextChoices):
+        """
+        Why a monthly service stopped — which decides what can happen next.
+
+        A manager stopping a service forgives whatever is owed (see
+        `services.terminate`), so there is nothing left to collect and nothing
+        to resume *with*. A service stopped automatically for an unpaid due
+        keeps the debt intact, because the patient may come back and settle
+        it. Only the second kind appears on the Terminated Services screen.
+        """
+
+        MANUAL = "manual", "Stopped by a manager"
+        UNPAID_DUE = "unpaid_due", "Stopped automatically — the month's due went unpaid"
+
     patient = models.ForeignKey(
         "patients.Patient", on_delete=models.PROTECT, related_name="monthly_enrollments"
     )
@@ -128,6 +142,12 @@ class MonthlyEnrollment(TimeStampedModel):
         default=EnrollmentStatus.ACTIVE, db_index=True,
     )
     terminated_at = models.DateTimeField(null=True, blank=True)
+    terminated_kind = models.CharField(
+        max_length=16, choices=TerminationKind.choices, blank=True, db_index=True
+    )
+    # The cycle whose unpaid due ended it, e.g. "2026-10". Blank when a
+    # manager stopped it: no single month is to blame for that.
+    terminated_month = models.CharField(max_length=7, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -135,6 +155,8 @@ class MonthlyEnrollment(TimeStampedModel):
             models.Index(fields=["branch", "status"]),
             models.Index(fields=["patient", "status"]),
             models.Index(fields=["service", "status"]),
+            # The Terminated Services screen's own listing.
+            models.Index(fields=["branch", "terminated_kind", "-terminated_at"]),
         ]
 
     def __str__(self):
@@ -147,6 +169,20 @@ class MonthlyEnrollment(TimeStampedModel):
     def outstanding_total(self) -> Decimal:
         return sum((bill.outstanding for bill in self.bills.all()), Decimal("0.00"))
 
+    def unpaid_bills(self):
+        """
+        Every bill still owed, oldest first.
+
+        `amount_paid < amount` rather than status alone: a part-paid bill
+        still has a balance, and one left DUE with nothing outstanding would
+        otherwise look collectable.
+        """
+        return (
+            self.bills.exclude(status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF])
+            .filter(amount_paid__lt=models.F("amount"))
+            .order_by("month")
+        )
+
     def oldest_unpaid_bill(self):
         """
         The only bill that may be paid next.
@@ -155,12 +191,7 @@ class MonthlyEnrollment(TimeStampedModel):
         outstanding, or old debt ages forever while they keep paying the
         current month.
         """
-        return (
-            self.bills.exclude(status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF])
-            .filter(amount_paid__lt=models.F("amount"))
-            .order_by("month")
-            .first()
-        )
+        return self.unpaid_bills().first()
 
 
 class MonthlyBill(PayableMixin):
