@@ -1,7 +1,7 @@
 from django.contrib import admin
 
 from apps.common.admin import ReadOnlyAdminMixin
-from apps.staff.models import StaffAttendance, StaffBonus, StaffMember
+from apps.staff.models import SalaryPayment, StaffAttendance, StaffBonus, StaffMember
 
 
 class StaffAttendanceInline(ReadOnlyAdminMixin, admin.TabularInline):
@@ -46,4 +46,15 @@ class StaffBonusAdmin(ReadOnlyAdminMixin, admin.ModelAdmin):
     list_filter = ["branch"]
     search_fields = ["staff__name", "staff__staff_code", "reason"]
     autocomplete_fields = ["staff", "branch", "awarded_by"]
+    date_hierarchy = "created_at"
+
+
+@admin.register(SalaryPayment)
+class SalaryPaymentAdmin(ReadOnlyAdminMixin, admin.ModelAdmin):
+    """Read-only — every state change goes through the service layer so the approval trail and the auto-created Expense stay consistent."""
+
+    list_display = ["staff", "month", "amount", "status", "requested_by", "reviewed_by", "branch"]
+    list_filter = ["status", "branch"]
+    search_fields = ["staff__name", "staff__staff_code", "month"]
+    autocomplete_fields = ["staff", "branch", "requested_by", "reviewed_by", "expense"]
     date_hierarchy = "created_at"

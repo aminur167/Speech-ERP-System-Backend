@@ -19,7 +19,7 @@ from django.utils import timezone
 from apps.common import audit
 from apps.common.models import AuditLog
 from apps.common.sequences import next_value
-from apps.staff.models import StaffAttendance, StaffBonus, StaffMember
+from apps.staff.models import SalaryPayment, StaffAttendance, StaffBonus, StaffMember
 
 # Check-ins at or after this hour are "late" rather than "present" — mirrors
 # the frontend mock's LATE_AFTER_HOUR so behaviour doesn't change when the
@@ -176,3 +176,148 @@ def monthly_report(staff_queryset, *, year: int, month: int) -> list[dict]:
             }
         )
     return rows
+
+
+class SalaryPaymentError(Exception):
+    def __init__(self, message: str, *, code: str = "invalid"):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+# A request already at one of these is "live" — a second request for the
+# same staff member and month would either duplicate a pending ask or pay
+# twice, so it's blocked until this one is resolved.
+_ACTIVE_SALARY_PAYMENT_STATUSES = [
+    SalaryPayment.Status.PENDING_APPROVAL,
+    SalaryPayment.Status.APPROVED,
+    SalaryPayment.Status.PAID,
+]
+
+
+@transaction.atomic
+def request_salary_payment(*, actor, staff: StaffMember, month: str) -> SalaryPayment:
+    """
+    A Manager's ask to pay one staff member for one month — nothing moves
+    until Admin approves it (see `review_salary_payment`).
+
+    The amount is never taken from the client: it's this month's net payable
+    (base salary plus any bonus already awarded), computed the same way the
+    monthly report computes it, and frozen onto the request at the moment
+    it's made.
+    """
+    # Locks any existing row for this staff+month first, so two concurrent
+    # requests can't both see "nothing active yet" and both insert.
+    existing = (
+        SalaryPayment.objects.select_for_update()
+        .filter(staff=staff, month=month, status__in=_ACTIVE_SALARY_PAYMENT_STATUSES)
+        .first()
+    )
+    if existing is not None:
+        raise SalaryPaymentError(
+            f"A salary payment for {month} is already {existing.get_status_display().lower()}.",
+            code="duplicate",
+        )
+
+    year, month_number = (int(part) for part in month.split("-"))
+    rows = monthly_report([staff], year=year, month=month_number)
+    amount = rows[0]["netPayable"] if rows else staff.monthly_salary
+
+    payment = SalaryPayment.objects.create(
+        staff=staff, branch=staff.branch, month=month, amount=amount, requested_by=actor,
+    )
+
+    audit.record(
+        actor=actor,
+        action=AuditLog.Action.CREATE,
+        target=payment,
+        branch=staff.branch,
+        changes={"amount": str(amount), "month": month, "staff": staff.name},
+    )
+    return payment
+
+
+@transaction.atomic
+def review_salary_payment(
+    *, actor, payment: SalaryPayment, approve: bool, review_note: str = ""
+) -> SalaryPayment:
+    """Admin approves or rejects a pending request. Rejecting requires a reason — the manager needs to know why before trying again."""
+    if payment.status != SalaryPayment.Status.PENDING_APPROVAL:
+        raise SalaryPaymentError(
+            f"This request is already {payment.get_status_display().lower()}.", code="no_change"
+        )
+    if not approve and not review_note.strip():
+        raise SalaryPaymentError(
+            "A reason is required when rejecting a salary payment.", code="note_required"
+        )
+
+    payment.status = SalaryPayment.Status.APPROVED if approve else SalaryPayment.Status.REJECTED
+    payment.review_note = review_note
+    payment.reviewed_by = actor
+    payment.reviewed_at = timezone.now()
+    payment.save(update_fields=["status", "review_note", "reviewed_by", "reviewed_at"])
+
+    audit.record(
+        actor=actor,
+        action=AuditLog.Action.APPROVE if approve else AuditLog.Action.REJECT,
+        target=payment,
+        branch=payment.branch,
+        reason=review_note,
+        changes={"status": {"from": SalaryPayment.Status.PENDING_APPROVAL, "to": payment.status}},
+    )
+    return payment
+
+
+@transaction.atomic
+def disburse_salary_payment(*, actor, payment: SalaryPayment, payment_method: str) -> SalaryPayment:
+    """
+    The Manager actually pays it, now that Admin has approved it.
+
+    This is the one moment the money genuinely leaves the clinic, so this is
+    where the Expense record is created — not at request time, and not at
+    approval time. It's created already `approved` (not run through Expense's
+    own auto-approve-threshold pending logic): Admin already authorized this
+    exact amount via this request, so routing it through a second, unrelated
+    approval gate would be redundant and would understate payroll while it
+    waited.
+    """
+    from apps.expenses.models import Expense
+
+    if payment.status != SalaryPayment.Status.APPROVED:
+        raise SalaryPaymentError(
+            "This salary payment must be approved before it can be paid.", code="not_approved"
+        )
+
+    year = timezone.localdate().year
+    value = next_value("expense", year)
+
+    expense = Expense.objects.create(
+        expense_code=f"EXP-{year}-{str(value).zfill(5)}",
+        category=Expense.Category.SALARIES,
+        amount=payment.amount,
+        description=f"Salary — {payment.staff.name} ({payment.month})",
+        paid_to=payment.staff.name,
+        payment_method=payment_method,
+        branch=payment.branch,
+        submitted_by=actor,
+        status=Expense.Status.APPROVED,
+        reviewed_by=payment.reviewed_by,
+        reviewed_at=timezone.now(),
+        review_note=f"Salary payment approved by {payment.reviewed_by.name if payment.reviewed_by else 'Admin'}.",
+    )
+
+    payment.status = SalaryPayment.Status.PAID
+    payment.payment_method = payment_method
+    payment.paid_at = timezone.now()
+    payment.expense = expense
+    payment.save(update_fields=["status", "payment_method", "paid_at", "expense"])
+
+    audit.record(
+        actor=actor,
+        action=AuditLog.Action.CREATE,
+        target=expense,
+        branch=payment.branch,
+        reason="Salary disbursement",
+        changes={"amount": str(payment.amount), "staff": payment.staff.name, "month": payment.month},
+    )
+    return payment

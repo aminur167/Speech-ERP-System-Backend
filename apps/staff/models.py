@@ -117,3 +117,73 @@ class StaffBonus(TimeStampedModel):
 
     def __str__(self):
         return f"{self.amount} to {self.staff_id}"
+
+
+class SalaryPayment(TimeStampedModel):
+    """
+    A Manager's request to pay one staff member's salary for one month,
+    gated on Admin approval before the money moves.
+
+    Deliberately **not** built on Expense's own pending/approved status: an
+    Expense records money *already spent* (docs: a pending expense is cash
+    that has left the clinic, awaiting verification) — the opposite of what
+    this is. This is a pre-spend authorization. Only once a Manager actually
+    disburses an *approved* request does an Expense get created, at which
+    point the money really has left and Expense's own "already spent"
+    invariant holds true.
+    """
+
+    class Status(models.TextChoices):
+        PENDING_APPROVAL = "pending_approval", "Pending Approval"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+        PAID = "paid", "Paid"
+
+    staff = models.ForeignKey(
+        StaffMember, on_delete=models.PROTECT, related_name="salary_payments"
+    )
+    branch = models.ForeignKey(
+        "branches.Branch", on_delete=models.PROTECT, related_name="staff_salary_payments"
+    )
+    month = models.CharField(max_length=7, db_index=True)  # "YYYY-MM"
+    # Snapshot at request time (base salary + that month's bonuses so far) —
+    # never recomputed later, so approving this request always pays exactly
+    # what the Manager asked for, even if a bonus is added afterwards.
+    amount = models.DecimalField(
+        max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))]
+    )
+
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.PENDING_APPROVAL, db_index=True
+    )
+
+    requested_by = models.ForeignKey(
+        "accounts.User", null=True, on_delete=models.SET_NULL,
+        related_name="salary_payments_requested",
+    )
+
+    review_note = models.TextField(blank=True)
+    reviewed_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="salary_payments_reviewed",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+
+    payment_method = models.CharField(max_length=20, blank=True)
+    paid_at = models.DateTimeField(null=True, blank=True)
+    # The Expense this disbursement created — the paper trail a bookkeeper
+    # follows from "why did payroll go up this month" back to who approved it.
+    expense = models.ForeignKey(
+        "expenses.Expense", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="salary_payment",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["branch", "status"]),
+            models.Index(fields=["staff", "-created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.staff_id} {self.month} {self.status}"

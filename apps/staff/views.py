@@ -12,12 +12,16 @@ from rest_framework.response import Response
 
 from apps.branches.models import Branch
 from apps.common.mixins import BranchScopedQuerySetMixin
-from apps.common.permissions import IsManager
+from apps.common.permissions import IsAdmin, IsManager
 from apps.staff import services
-from apps.staff.models import StaffAttendance, StaffMember
+from apps.staff.models import SalaryPayment, StaffAttendance, StaffMember
 from apps.staff.serializers import (
     AddBonusSerializer,
+    DisburseSalaryPaymentSerializer,
     MarkAttendanceSerializer,
+    RequestSalaryPaymentSerializer,
+    ReviewSalaryPaymentSerializer,
+    SalaryPaymentSerializer,
     StaffAttendanceSerializer,
     StaffBonusSerializer,
     StaffMemberSerializer,
@@ -184,3 +188,90 @@ class StaffMemberViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
 
         rows = services.monthly_report(self.get_queryset(), year=year, month=month)
         return Response(StaffMonthlyReportRowSerializer(rows, many=True).data)
+
+    @action(
+        detail=True, methods=["post"], url_path="request-salary-payment",
+        permission_classes=[IsManager],
+    )
+    def request_salary_payment(self, request, pk=None):
+        """Manager asks Admin to approve paying this staff member's salary for a month — see SalaryPaymentViewSet for review/disbursement."""
+        member = self.get_object()
+        serializer = RequestSalaryPaymentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            payment = services.request_salary_payment(
+                actor=request.user, staff=member, month=serializer.validated_data["month"]
+            )
+        except services.SalaryPaymentError as exc:
+            return Response(
+                {"detail": exc.message, "code": exc.code}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        return Response(SalaryPaymentSerializer(payment).data, status=status.HTTP_201_CREATED)
+
+
+class SalaryPaymentViewSet(BranchScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet):
+    """
+    /api/staff/salary-payments/
+
+    The Admin-facing approval queue and the Manager-facing disbursement
+    action for salary payment requests. Read-only at the list/detail level —
+    a request is only ever created via StaffMemberViewSet.request_salary_payment
+    and moved forward via `review`/`disburse` below, never edited directly.
+    """
+
+    queryset = SalaryPayment.objects.select_related(
+        "staff", "branch", "requested_by", "reviewed_by", "expense"
+    ).all()
+    serializer_class = SalaryPaymentSerializer
+    filterset_fields = ["status", "month", "staff"]
+    ordering_fields = ["created_at"]
+
+    def get_permissions(self):
+        if self.action == "review":
+            return [IsAdmin()]
+        if self.action == "disburse":
+            return [IsManager()]
+        return [IsAuthenticated()]
+
+    @action(detail=True, methods=["post"])
+    def review(self, request, pk=None):
+        """Admin approves or rejects a pending request."""
+        payment = self.get_object()
+        serializer = ReviewSalaryPaymentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            payment = services.review_salary_payment(
+                actor=request.user,
+                payment=payment,
+                approve=serializer.validated_data["approve"],
+                review_note=serializer.validated_data.get("reviewNote", ""),
+            )
+        except services.SalaryPaymentError as exc:
+            return Response(
+                {"detail": exc.message, "code": exc.code}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        return Response(SalaryPaymentSerializer(payment).data)
+
+    @action(detail=True, methods=["post"])
+    def disburse(self, request, pk=None):
+        """Manager pays out an approved request — creates the Expense that records the money actually leaving."""
+        payment = self.get_object()
+        serializer = DisburseSalaryPaymentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            payment = services.disburse_salary_payment(
+                actor=request.user,
+                payment=payment,
+                payment_method=serializer.validated_data["paymentMethod"],
+            )
+        except services.SalaryPaymentError as exc:
+            return Response(
+                {"detail": exc.message, "code": exc.code}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        return Response(SalaryPaymentSerializer(payment).data)
