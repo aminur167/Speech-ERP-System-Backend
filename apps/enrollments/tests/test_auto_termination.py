@@ -307,17 +307,73 @@ class TestResume:
 
         assert caught.value.code == "not_terminated"
 
-    def test_a_manually_stopped_service_cannot_be_resumed(self, manager, enrollment):
-        """That termination already forgave the debt — reopening it is a new enrollment."""
+    def test_a_manually_stopped_service_resumes_with_nothing_to_collect(
+        self, manager, enrollment
+    ):
+        """Stopping it by hand already forgave the debt, so resuming is free."""
         services.terminate(actor=manager, container=enrollment)
         enrollment.refresh_from_db()
 
-        with pytest.raises(services.EnrollmentError) as caught:
-            services.resume_monthly_service(
-                actor=manager, enrollment=enrollment, carry_due=False
-            )
+        resumed, payments = services.resume_monthly_service(
+            actor=manager, enrollment=enrollment, carry_due=True, method="cash"
+        )
 
-        assert caught.value.code == "not_resumable"
+        assert resumed.status == EnrollmentStatus.ACTIVE
+        assert payments == []
+
+    def test_a_manually_stopped_service_is_billable_again_once_resumed(
+        self, manager, enrollment
+    ):
+        """
+        The trap: stopping by hand writes off the lookahead months too, so a
+        naive resume finds those rows already there and creates nothing —
+        leaving the service active and quietly never invoicing again.
+        """
+        services.terminate(actor=manager, container=enrollment)
+        enrollment.refresh_from_db()
+
+        resumed, _ = services.resume_monthly_service(
+            actor=manager, enrollment=enrollment, carry_due=False
+        )
+
+        payable = resumed.oldest_unpaid_bill()
+        assert payable is not None
+        assert payable.month == services.month_key(timezone.localdate())
+        assert payable.outstanding == Decimal("5000.00")
+
+    def test_reopening_a_written_off_month_is_recorded(self, manager, enrollment):
+        """A write-off being undone is never allowed to be silent."""
+        from apps.common.models import AuditLog
+
+        services.terminate(actor=manager, container=enrollment)
+        enrollment.refresh_from_db()
+        services.resume_monthly_service(
+            actor=manager, enrollment=enrollment, carry_due=False
+        )
+
+        entry = AuditLog.objects.filter(
+            target_type="MonthlyEnrollment", action=AuditLog.Action.UPDATE
+        ).latest("created_at")
+        assert entry.changes["reinstatedMonths"]
+
+    def test_an_already_paid_month_is_not_billed_twice_on_resume(
+        self, manager, branch, enrollment
+    ):
+        """Reinstating must never reach a month the patient already settled."""
+        paid = enrollment.oldest_unpaid_bill()
+        services.collect_bill_payment(
+            actor=manager, branch=branch, bill=paid, method="cash"
+        )
+        services.terminate(actor=manager, container=enrollment)
+        enrollment.refresh_from_db()
+
+        services.resume_monthly_service(
+            actor=manager, enrollment=enrollment, carry_due=False
+        )
+
+        paid.refresh_from_db()
+        assert paid.status == BillStatus.PAID
+        assert paid.outstanding == Decimal("0.00")
 
     def test_settling_the_due_needs_a_payment_method(self, manager, lapsed):
         with pytest.raises(services.EnrollmentError) as caught:
@@ -384,13 +440,38 @@ class TestTerminatedServicesEndpoint:
     def test_a_running_service_is_not_listed(self, manager_client, enrollment):
         assert manager_client.get(TERMINATED_URL).json()["count"] == 0
 
-    def test_a_manually_stopped_service_is_not_listed(
+    def test_a_manually_stopped_service_is_listed_too(
         self, manager_client, manager, enrollment
     ):
-        """It was closed deliberately and its debt forgiven — nothing to resume."""
+        """
+        Both kinds describe the same thing to whoever is looking: this
+        patient's monthly service is not running. What differs is only what
+        resuming costs.
+        """
         services.terminate(actor=manager, container=enrollment)
 
-        assert manager_client.get(TERMINATED_URL).json()["count"] == 0
+        row = manager_client.get(TERMINATED_URL).json()["results"][0]
+
+        assert row["terminatedKind"] == MonthlyEnrollment.TerminationKind.MANUAL
+        # Stopping it already wrote the debt off, so there is nothing left.
+        assert Decimal(row["previousDue"]) == Decimal("0.00")
+
+    def test_the_two_kinds_can_be_told_apart(
+        self, manager_client, manager, branch, patient_factory, monthly_service, lapsed
+    ):
+        stopped_by_hand = services.create_monthly_enrollment(
+            actor=manager, branch=branch,
+            patient=patient_factory(name="Rafiq Islam"), service=monthly_service,
+        )
+        services.terminate(actor=manager, container=stopped_by_hand)
+
+        everything = manager_client.get(TERMINATED_URL).json()
+        automatic = manager_client.get(TERMINATED_URL, {"kind": "unpaid_due"}).json()
+        by_hand = manager_client.get(TERMINATED_URL, {"kind": "manual"}).json()
+
+        assert everything["count"] == 2
+        assert [row["id"] for row in automatic["results"]] == [lapsed.id]
+        assert [row["id"] for row in by_hand["results"]] == [stopped_by_hand.id]
 
     @pytest.mark.parametrize(
         "term", ["nusrat", "01712", "MON-AT", "Individual"]

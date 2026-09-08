@@ -846,19 +846,14 @@ def resume_monthly_service(
     are not backfilled: the patient was not enrolled during them, and billing
     for service nobody delivered is the one thing this must not do.
 
-    Only an automatic termination can be resumed. A manager who stopped a
-    service already forgave the debt and closed it deliberately; reopening
-    that is a fresh enrollment, not a resumption.
+    Both kinds of termination resume through here. A service a manager
+    stopped by hand simply has nothing left to collect — stopping it already
+    wrote the debt off — so both options lead to the same place for it, and
+    the screen says as much rather than offering a choice that isn't one.
     """
     if enrollment.status != EnrollmentStatus.TERMINATED:
         raise EnrollmentError(
             "This service is not terminated.", code="not_terminated"
-        )
-    if enrollment.terminated_kind != MonthlyEnrollment.TerminationKind.UNPAID_DUE:
-        raise EnrollmentError(
-            "Only a service stopped for an unpaid due can be resumed. "
-            "Enroll the patient again instead.",
-            code="not_resumable",
         )
     if carry_due and not method:
         raise EnrollmentError(
@@ -904,7 +899,17 @@ def resume_monthly_service(
             changes={"writtenOff": str(arrears)},
         )
 
-    _open_cycle_from(enrollment, timezone.localdate())
+    reinstated = _open_cycle_from(enrollment, timezone.localdate())
+
+    changes = {
+        "status": {"from": EnrollmentStatus.TERMINATED, "to": EnrollmentStatus.ACTIVE},
+        "previousDue": str(arrears),
+        "previousDueSettled": carry_due,
+    }
+    if reinstated:
+        # A write-off being undone is never allowed to be silent, even when
+        # it is the right thing to do.
+        changes["reinstatedMonths"] = reinstated
 
     audit.record(
         actor=actor,
@@ -912,39 +917,57 @@ def resume_monthly_service(
         target=enrollment,
         branch=enrollment.branch,
         reason="Service resumed",
-        changes={
-            "status": {"from": EnrollmentStatus.TERMINATED, "to": EnrollmentStatus.ACTIVE},
-            "previousDue": str(arrears),
-            "previousDueSettled": carry_due,
-        },
+        changes=changes,
     )
 
     enrollment.refresh_from_db()
     return enrollment, payments
 
 
-def _open_cycle_from(enrollment: MonthlyEnrollment, day: date, months_ahead: int = 3) -> None:
+def _open_cycle_from(
+    enrollment: MonthlyEnrollment, day: date, months_ahead: int = 3
+) -> list[str]:
     """
     Start billing again at `day`'s month, with the same lookahead a fresh
-    enrollment gets.
+    enrollment gets. Returns the months that had to be reinstated.
 
     `get_or_create` rather than `bulk_create`: the unique (enrollment, month)
     constraint is what actually guarantees no duplicate, and a resumed
-    enrollment may already own a bill for one of these months if it was
-    stopped and restarted inside an unusual window.
+    enrollment may already own a bill for one of these months.
+
+    **Reinstating is the subtle part.** Stopping a service by hand writes off
+    every unpaid bill it owns, and that includes the lookahead months for
+    service never delivered. Resume it and `get_or_create` finds those rows
+    already there, written off — so the enrollment would come back active
+    with no payable bill at all, quietly never invoicing again. A written-off
+    month from here on is therefore reopened, because the charge is no longer
+    a forgiven old debt: it is this month's fee for service now being
+    delivered. A month already PAID is left alone; nobody is billed twice.
     """
     first_of_month = day.replace(day=1)
+    reinstated: list[str] = []
 
     for offset in range(months_ahead):
         month_date = add_months(first_of_month, offset)
         key = month_key(month_date)
-        MonthlyBill.objects.get_or_create(
+        status = BillStatus.DUE if offset == 0 else BillStatus.UPCOMING
+
+        bill, created = MonthlyBill.objects.get_or_create(
             enrollment=enrollment,
             month=key,
             defaults={
                 "label": month_label(month_date),
                 "amount": enrollment.service.fee,
                 "due_date": due_date_for_month(key),
-                "status": BillStatus.DUE if offset == 0 else BillStatus.UPCOMING,
+                "status": status,
             },
         )
+        if created:
+            continue
+
+        if bill.status == BillStatus.WRITTEN_OFF and bill.amount_paid <= 0:
+            bill.status = status
+            bill.save(update_fields=["status"])
+            reinstated.append(bill.label)
+
+    return reinstated

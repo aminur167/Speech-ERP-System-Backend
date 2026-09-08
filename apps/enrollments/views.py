@@ -167,6 +167,11 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
                 ),
             ),
             OpenApiParameter("month", str, description='Terminated cycle, "YYYY-MM".'),
+            OpenApiParameter(
+                "kind",
+                str,
+                description='"unpaid_due" (the nightly job) or "manual" (a manager).',
+            ),
             OpenApiParameter("pageSize", int),
         ],
         responses=TerminatedMonthlyServiceSerializer(many=True),
@@ -174,21 +179,24 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
     @action(detail=False, methods=["get"])
     def terminated(self, request):
         """
-        Services stopped automatically for an unpaid due — the only ones that
-        can be resumed.
+        Every stopped monthly service — the job's, for an unpaid due, and the
+        manager's own — and the one place either can be restarted.
 
-        A manager's own termination is excluded on purpose: that already
-        forgave the debt and closed the service deliberately, so it belongs in
-        a new enrollment rather than on a screen offering to reinstate it.
+        Both belong here because both describe the same thing to whoever is
+        looking: this patient's monthly service is not running. `kind` tells
+        them apart, and narrows the list when only one is wanted. What
+        differs is only what resuming costs: a manager's termination already
+        wrote the debt off, so there is nothing left to collect.
         """
         queryset = (
             self.get_queryset()
-            .filter(
-                status=EnrollmentStatus.TERMINATED,
-                terminated_kind=MonthlyEnrollment.TerminationKind.UNPAID_DUE,
-            )
+            .filter(status=EnrollmentStatus.TERMINATED)
             .order_by("-terminated_at")
         )
+
+        kind = request.query_params.get("kind")
+        if kind:
+            queryset = queryset.filter(terminated_kind=kind)
 
         month = request.query_params.get("month")
         if month:
