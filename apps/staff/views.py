@@ -234,7 +234,15 @@ class SalaryPaymentViewSet(BranchScopedQuerySetMixin, viewsets.ReadOnlyModelView
             return [IsAdmin()]
         if self.action == "disburse":
             return [IsManager()]
+        if self.action == "pending_count":
+            return [IsAdmin()]
         return [IsAuthenticated()]
+
+    @action(detail=False, methods=["get"], url_path="pending-count")
+    def pending_count(self, request):
+        """Admin-only — powers the sidebar's Salary Approvals badge, independent of whatever page is open."""
+        count = self.get_queryset().filter(status=SalaryPayment.Status.PENDING_APPROVAL).count()
+        return Response({"count": count})
 
     @action(detail=True, methods=["post"])
     def review(self, request, pk=None):

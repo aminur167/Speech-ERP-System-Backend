@@ -19,6 +19,7 @@ from django.utils import timezone
 from apps.common import audit
 from apps.common.models import AuditLog
 from apps.common.sequences import next_value
+from apps.notifications.inapp import notify, notify_many
 from apps.staff.models import SalaryPayment, StaffAttendance, StaffBonus, StaffMember
 
 # Check-ins at or after this hour are "late" rather than "present" — mirrors
@@ -234,6 +235,18 @@ def request_salary_payment(*, actor, staff: StaffMember, month: str) -> SalaryPa
         branch=staff.branch,
         changes={"amount": str(amount), "month": month, "staff": staff.name},
     )
+
+    from apps.accounts.models import User
+
+    notify_many(
+        recipients=User.objects.filter(role=User.Role.ADMIN),
+        title="New salary payment request",
+        message=(
+            f"{staff.branch.name} requested BDT {amount} for {staff.name}'s "
+            f"salary ({month})."
+        ),
+        link="/admin/salary-approvals",
+    )
     return payment
 
 
@@ -265,6 +278,15 @@ def review_salary_payment(
         reason=review_note,
         changes={"status": {"from": SalaryPayment.Status.PENDING_APPROVAL, "to": payment.status}},
     )
+
+    if payment.requested_by_id:
+        if approve:
+            title = "Salary payment approved"
+            message = f"{payment.staff.name}'s salary for {payment.month} was approved — you can pay it out now."
+        else:
+            title = "Salary payment rejected"
+            message = f"{payment.staff.name}'s salary for {payment.month} was rejected: {review_note}"
+        notify(recipient=payment.requested_by, title=title, message=message, link="/manager/staff")
     return payment
 
 
