@@ -59,6 +59,7 @@ LOCAL_APPS = [
     "apps.payments",
     "apps.enrollments",
     "apps.materials",
+    "apps.staff",
     "apps.duepayments",
     "apps.expenses",
     "apps.dailyclosing",
