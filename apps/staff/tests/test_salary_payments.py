@@ -10,6 +10,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from apps.expenses.models import Expense
+from apps.notifications.models import Notification
 from apps.staff import services
 
 pytestmark = pytest.mark.django_db
@@ -293,3 +294,78 @@ class TestBranchSummary:
             reverse("staff:salarypayment-branch-summary"), {"month": "2026-02"}
         )
         assert response.json() == []
+
+
+class TestNotifications:
+    def test_requesting_notifies_every_admin(
+        self, manager, admin_user, farhana, current_month, staff_member_factory
+    ):
+        from apps.accounts.models import User
+
+        other_admin = User.objects.create_user(
+            email="other-admin@speechlab.test", password="x", name="Other Admin",
+            role=User.Role.ADMIN,
+        )
+
+        services.request_salary_payment(actor=manager, staff=farhana, month=current_month)
+
+        assert Notification.objects.filter(recipient=admin_user, title="New salary payment request").exists()
+        assert Notification.objects.filter(recipient=other_admin, title="New salary payment request").exists()
+        # The manager who asked isn't an admin and shouldn't get the admin-facing copy.
+        assert not Notification.objects.filter(recipient=manager).exists()
+
+    def test_requesting_manager_is_not_notified_of_their_own_request(
+        self, manager, farhana, current_month
+    ):
+        services.request_salary_payment(actor=manager, staff=farhana, month=current_month)
+        assert Notification.objects.filter(recipient=manager).count() == 0
+
+    def test_approval_notifies_the_requesting_manager(self, manager, admin_user, farhana, current_month):
+        payment = services.request_salary_payment(actor=manager, staff=farhana, month=current_month)
+        Notification.objects.all().delete()  # clear the admin-facing one from the request itself
+
+        services.review_salary_payment(actor=admin_user, payment=payment, approve=True)
+
+        notification = Notification.objects.get(recipient=manager)
+        assert notification.title == "Salary payment approved"
+        assert payment.staff.name in notification.message
+
+    def test_rejection_notifies_the_requesting_manager_with_the_reason(
+        self, manager, admin_user, farhana, current_month
+    ):
+        payment = services.request_salary_payment(actor=manager, staff=farhana, month=current_month)
+        Notification.objects.all().delete()
+
+        services.review_salary_payment(
+            actor=admin_user, payment=payment, approve=False, review_note="Wrong month"
+        )
+
+        notification = Notification.objects.get(recipient=manager)
+        assert notification.title == "Salary payment rejected"
+        assert "Wrong month" in notification.message
+
+
+class TestPendingCount:
+    def test_counts_only_pending_approval(self, admin_client, manager, admin_user, farhana, current_month):
+        payment = services.request_salary_payment(actor=manager, staff=farhana, month=current_month)
+        response = admin_client.get(reverse("staff:salarypayment-pending-count"))
+        assert response.json()["count"] == 1
+
+        services.review_salary_payment(actor=admin_user, payment=payment, approve=True)
+        response = admin_client.get(reverse("staff:salarypayment-pending-count"))
+        assert response.json()["count"] == 0
+
+    def test_manager_cannot_read_the_pending_count(self, manager_client):
+        response = manager_client.get(reverse("staff:salarypayment-pending-count"))
+        assert response.status_code == 403
+
+    def test_admin_sees_pending_count_across_every_branch(
+        self, admin_client, manager, other_manager, farhana, staff_member_factory,
+        other_branch, current_month,
+    ):
+        other_staff = staff_member_factory(name="Other", branch=other_branch)
+        services.request_salary_payment(actor=manager, staff=farhana, month=current_month)
+        services.request_salary_payment(actor=other_manager, staff=other_staff, month=current_month)
+
+        response = admin_client.get(reverse("staff:salarypayment-pending-count"))
+        assert response.json()["count"] == 2
