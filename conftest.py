@@ -182,6 +182,34 @@ def material_factory(db, branch):
     return _create
 
 
+@pytest.fixture
+def staff_member_factory(db, branch):
+    """Roster entries. Branch-scoped, like Material."""
+    from decimal import Decimal
+
+    from apps.staff.models import StaffMember
+
+    counter = {"n": 0}
+
+    def _create(**overrides):
+        counter["n"] += 1
+        n = counter["n"]
+        defaults = {
+            "staff_code": f"STF-DHK-{n:03d}",
+            "name": f"Staff Member {n}",
+            "designation": StaffMember.Designation.THERAPIST,
+            "phone": f"017120000{n:02d}",
+            "joined_at": date(2024, 1, 1),
+            "monthly_salary": Decimal("20000.00"),
+            "status": StaffMember.Status.ACTIVE,
+            "branch": branch,
+        }
+        defaults.update(overrides)
+        return StaffMember.objects.create(**defaults)
+
+    return _create
+
+
 def _authenticate(client: APIClient, user: User) -> APIClient:
     """
     Attach a real JWT rather than force_authenticate.
