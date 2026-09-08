@@ -11,6 +11,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from apps.branches.models import Branch
+from apps.common.filters import apply_date_range
 from apps.common.mixins import BranchScopedQuerySetMixin
 from apps.common.permissions import IsAdmin, IsManager
 from apps.expenses import services
@@ -70,7 +71,9 @@ class ExpenseViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
                 created_at__year=today.year, created_at__month=today.month
             )
 
-        return queryset
+        # The Summary page's dateFrom/dateTo, shared with every other list it
+        # reads (apps/common/filters.py).
+        return apply_date_range(queryset, self.request.query_params)
 
     def create(self, request, *args, **kwargs):
         serializer = ExpenseWriteSerializer(data=request.data)

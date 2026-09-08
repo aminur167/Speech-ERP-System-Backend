@@ -28,6 +28,7 @@ from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
 from django.db.models import Count, Q, Sum
+from django.db.models.functions import TruncDate
 from django.utils import timezone
 
 from apps.dailyclosing.models import DailyClosing
@@ -347,3 +348,107 @@ def branch_summary(*, branch_id=None, date_from: date, date_to: date) -> dict:
         "closingsSubmitted": closings.count(),
         "closingsMismatched": closings.exclude(status=DailyClosing.Status.MATCHED).count(),
     }
+
+
+def daily_ledger(*, branch_id=None, date_from: date, date_to: date) -> list[dict]:
+    """
+    The branch's day-by-day ledger: one row per day that anything happened on.
+
+    Same accounting rules as `branch_summary` above, just resolved per day
+    instead of rolled into one figure — so the two always reconcile: summing a
+    column here equals the matching total there.
+
+    Days with no activity at all are omitted rather than padded with zeros. A
+    year-long range would otherwise be mostly empty rows, and a reader
+    scanning for the day something went wrong has to skip past them.
+
+    Viewed across every branch (Admin without `?branch=`), the closing columns
+    aggregate: `closingDifference` sums each branch's variance for that day and
+    `closingStatus` reads "mismatched" if any one of them did not balance —
+    the safe direction to round, since it can only draw attention to a day
+    that deserves it.
+    """
+    rows: dict[date, dict] = {}
+
+    def row_for(day: date) -> dict:
+        return rows.setdefault(
+            day,
+            {
+                "date": day,
+                "transactionCount": 0,
+                "patientsSeen": 0,
+                "collected": Decimal("0.00"),
+                "refundCount": 0,
+                "refunded": Decimal("0.00"),
+                "expenseCount": 0,
+                "expenses": Decimal("0.00"),
+                "closingsSubmitted": 0,
+                "closingStatus": "",
+                "closingDifference": Decimal("0.00"),
+            },
+        )
+
+    revenue = (
+        _revenue_queryset(branch_id)
+        .filter(created_at__date__gte=date_from, created_at__date__lte=date_to)
+        .annotate(day=TruncDate("created_at"))
+        .values("day")
+        .annotate(
+            amount=Sum("amount"),
+            count=Count("id"),
+            patients=Count("patient_id", distinct=True),
+        )
+    )
+    for entry in revenue:
+        row = row_for(entry["day"])
+        row["collected"] = entry["amount"] or Decimal("0.00")
+        row["transactionCount"] = entry["count"]
+        row["patientsSeen"] = entry["patients"]
+
+    # Dated by approval, not by when the refund was asked for — the module
+    # header's rule, and what keeps a closed month closed.
+    refunds = (
+        _refund_queryset(branch_id)
+        .filter(reviewed_at__date__gte=date_from, reviewed_at__date__lte=date_to)
+        .annotate(day=TruncDate("reviewed_at"))
+        .values("day")
+        .annotate(amount=Sum("amount"), count=Count("id"))
+    )
+    for entry in refunds:
+        row = row_for(entry["day"])
+        row["refunded"] = entry["amount"] or Decimal("0.00")
+        row["refundCount"] = entry["count"]
+
+    expenses = Expense.objects.filter(
+        status__in=COUNTED_EXPENSE_STATUSES,
+        created_at__date__gte=date_from,
+        created_at__date__lte=date_to,
+    )
+    if branch_id:
+        expenses = expenses.filter(branch_id=branch_id)
+    for entry in (
+        expenses.annotate(day=TruncDate("created_at"))
+        .values("day")
+        .annotate(amount=Sum("amount"), count=Count("id"))
+    ):
+        row = row_for(entry["day"])
+        row["expenses"] = entry["amount"] or Decimal("0.00")
+        row["expenseCount"] = entry["count"]
+
+    closings = DailyClosing.objects.filter(date__gte=date_from, date__lte=date_to)
+    if branch_id:
+        closings = closings.filter(branch_id=branch_id)
+    for closing in closings:
+        row = row_for(closing.date)
+        row["closingsSubmitted"] += 1
+        row["closingDifference"] += closing.difference
+        if closing.status != DailyClosing.Status.MATCHED:
+            row["closingStatus"] = "mismatched"
+        elif not row["closingStatus"]:
+            row["closingStatus"] = "matched"
+
+    for row in rows.values():
+        row["netRevenue"] = row["collected"] - row["refunded"] - row["expenses"]
+
+    # Newest first: a ledger is read from what just happened backwards.
+    return [rows[day] for day in sorted(rows, reverse=True)]

@@ -955,3 +955,283 @@ class TestBranchSummary:
         assert Decimal(body["grossCollected"]) == Decimal("0.00")
         assert body["paymentCount"] == 0
         assert body["byMethod"] == []
+
+
+DAILY_LEDGER_URL = reverse("reporting:branch-summary-daily")
+
+
+@pytest.mark.money
+class TestDailyLedger:
+    """
+    The Summary page's day-by-day table.
+
+    Its one hard requirement is that it reconciles with `branch_summary` over
+    the same range: the page shows both, and a reader who adds the column up
+    and gets a different number than the total has no way to tell which one
+    lied.
+    """
+
+    def test_each_day_gets_its_own_row_newest_first(self, manager_client, pay):
+        pay("1000.00", when=local_midnight(date(2026, 5, 2)))
+        pay("2000.00", when=local_midnight(date(2026, 5, 4)))
+
+        rows = manager_client.get(
+            DAILY_LEDGER_URL, {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"}
+        ).json()
+
+        assert [row["date"] for row in rows] == ["2026-05-04", "2026-05-02"]
+        assert Decimal(rows[0]["collected"]) == Decimal("2000.00")
+        assert Decimal(rows[1]["collected"]) == Decimal("1000.00")
+
+    def test_days_with_no_activity_are_omitted(self, manager_client, pay):
+        pay("1000.00", when=local_midnight(date(2026, 5, 2)))
+
+        rows = manager_client.get(
+            DAILY_LEDGER_URL, {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"}
+        ).json()
+
+        assert len(rows) == 1
+
+    def test_a_refund_lands_on_its_approval_day_not_the_payment_day(
+        self, manager_client, manager, admin_user, pay
+    ):
+        """The module's period rule, resolved per day rather than per month."""
+        payment = pay("5000.00", when=local_midnight(date(2026, 5, 10)))
+        refund_fully(
+            payment, requester=manager, approver=admin_user,
+            approved_at=local_midnight(date(2026, 5, 20)),
+        )
+
+        rows = {
+            row["date"]: row
+            for row in manager_client.get(
+                DAILY_LEDGER_URL, {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"}
+            ).json()
+        }
+
+        assert Decimal(rows["2026-05-10"]["collected"]) == Decimal("5000.00")
+        assert Decimal(rows["2026-05-10"]["refunded"]) == Decimal("0.00")
+        assert Decimal(rows["2026-05-20"]["refunded"]) == Decimal("5000.00")
+        assert Decimal(rows["2026-05-20"]["netRevenue"]) == Decimal("-5000.00")
+
+    def test_a_void_leaves_its_day_entirely(self, manager_client, manager, pay):
+        """
+        Dated to today rather than backdated like the tests around it: a
+        manager can only void the same day's payment, which is precisely the
+        rule that keeps a void from ever disturbing a closed period.
+        """
+        pay("1000.00")
+        voided = pay("400.00")
+        payment_services.void_payment(actor=manager, payment=voided, reason="duplicate")
+
+        today = timezone.localdate().isoformat()
+        rows = manager_client.get(
+            DAILY_LEDGER_URL, {"dateFrom": today, "dateTo": today}
+        ).json()
+
+        assert Decimal(rows[0]["collected"]) == Decimal("1000.00")
+        assert rows[0]["transactionCount"] == 1
+
+    def test_a_reversed_range_is_rejected(self, manager_client):
+        response = manager_client.get(
+            DAILY_LEDGER_URL, {"dateFrom": "2026-06-30", "dateTo": "2026-06-01"}
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "invalid_range"
+
+    def test_the_columns_add_up_to_the_branch_summary_totals(
+        self, manager_client, manager, branch, admin_user, pay
+    ):
+        from apps.expenses.models import Expense
+
+        pay("4000.00", when=local_midnight(date(2026, 5, 2)))
+        refunded = pay("1000.00", when=local_midnight(date(2026, 5, 3)))
+        refund_fully(
+            refunded, requester=manager, approver=admin_user,
+            approved_at=local_midnight(date(2026, 5, 6)),
+        )
+        expense = expense_services.create_expense(
+            actor=manager, branch=branch,
+            data={
+                "category": "supplies", "amount": Decimal("700.00"),
+                "description": "Cards", "paid_to": "Shop", "payment_method": "cash",
+            },
+        )
+        Expense.objects.filter(pk=expense.pk).update(
+            created_at=local_midnight(date(2026, 5, 8))
+        )
+
+        params = {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"}
+        rows = manager_client.get(DAILY_LEDGER_URL, params).json()
+        summary = manager_client.get(BRANCH_SUMMARY_URL, params).json()
+
+        def column(name):
+            return sum((Decimal(row[name]) for row in rows), Decimal("0.00"))
+
+        assert column("collected") == Decimal(summary["grossCollected"])
+        assert column("refunded") == Decimal(summary["refunded"])
+        assert column("expenses") == Decimal(summary["expenses"])
+        assert column("netRevenue") == Decimal(summary["netRevenue"])
+
+
+@pytest.mark.isolation
+class TestDailyLedgerBranchIsolation:
+    def test_a_manager_sees_only_their_own_branch(
+        self, manager_client, other_branch, other_manager, pay
+    ):
+        pay("1000.00", when=local_midnight(date(2026, 5, 2)))
+        pay(
+            "9999.00", actor=other_manager, target_branch=other_branch,
+            when=local_midnight(date(2026, 5, 2)),
+        )
+
+        rows = manager_client.get(
+            DAILY_LEDGER_URL, {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"}
+        ).json()
+
+        assert Decimal(rows[0]["collected"]) == Decimal("1000.00")
+
+    def test_admin_can_narrow_to_one_branch(
+        self, admin_client, branch, other_branch, other_manager, pay
+    ):
+        pay("1000.00", when=local_midnight(date(2026, 5, 2)))
+        pay(
+            "9999.00", actor=other_manager, target_branch=other_branch,
+            when=local_midnight(date(2026, 5, 2)),
+        )
+
+        combined = admin_client.get(
+            DAILY_LEDGER_URL, {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"}
+        ).json()
+        narrowed = admin_client.get(
+            DAILY_LEDGER_URL,
+            {"dateFrom": "2026-05-01", "dateTo": "2026-05-31", "branch": str(branch.id)},
+        ).json()
+
+        assert Decimal(combined[0]["collected"]) == Decimal("10999.00")
+        assert Decimal(narrowed[0]["collected"]) == Decimal("1000.00")
+
+
+class TestListDateRanges:
+    """
+    `dateFrom`/`dateTo` on the plain list endpoints — what lets the Summary
+    page's tables answer for exactly the range its totals do. One shared
+    implementation (apps/common/filters.py), so these check the wiring.
+    """
+
+    def test_transactions_honour_the_range_inclusively(self, manager_client, pay):
+        pay("100.00", when=local_midnight(date(2026, 5, 1)))
+        pay("200.00", when=local_midnight(date(2026, 5, 31)))
+        pay("300.00", when=local_midnight(date(2026, 6, 1)))
+
+        body = manager_client.get(
+            TRANSACTIONS_URL, {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"}
+        ).json()
+
+        assert body["count"] == 2
+
+    def test_a_transaction_late_on_the_last_day_is_still_included(
+        self, manager_client, pay
+    ):
+        late = timezone.make_aware(datetime.combine(date(2026, 5, 31), time(23, 30)))
+        pay("150.00", when=late)
+
+        body = manager_client.get(
+            TRANSACTIONS_URL, {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"}
+        ).json()
+
+        assert body["count"] == 1
+
+    def test_expenses_honour_the_range(self, manager_client, manager, branch):
+        from apps.expenses.models import Expense
+
+        def spend(description):
+            return expense_services.create_expense(
+                actor=manager, branch=branch,
+                data={
+                    "category": "rent", "amount": Decimal("100.00"),
+                    "description": description, "paid_to": "X",
+                    "payment_method": "cash",
+                },
+            )
+
+        Expense.objects.filter(pk=spend("In").pk).update(
+            created_at=local_midnight(date(2026, 5, 10))
+        )
+        Expense.objects.filter(pk=spend("Out").pk).update(
+            created_at=local_midnight(date(2026, 6, 10))
+        )
+
+        body = manager_client.get(
+            reverse("expenses:expense-list"),
+            {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"},
+        ).json()
+
+        assert body["count"] == 1
+        assert body["results"][0]["description"] == "In"
+
+    def test_refund_requests_honour_the_range(self, manager_client, manager, pay):
+        payment = pay("500.00")
+        request = payment_services.request_refund(
+            actor=manager, payment=payment, amount=payment.amount, reason="Cancelled"
+        )
+        RefundRequest.objects.filter(pk=request.pk).update(
+            requested_at=local_midnight(date(2026, 5, 10))
+        )
+
+        url = reverse("payments:refund-request-list")
+        inside = manager_client.get(
+            url, {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"}
+        ).json()
+        outside = manager_client.get(
+            url, {"dateFrom": "2026-06-01", "dateTo": "2026-06-30"}
+        ).json()
+
+        assert inside["count"] == 1
+        assert outside["count"] == 0
+
+    def test_daily_closings_honour_the_range(self, manager_client, manager, branch):
+        from apps.dailyclosing.models import DailyClosing
+
+        def close(day):
+            DailyClosing.objects.create(
+                branch=branch, date=day, system_total=Decimal("0.00"),
+                actual_total=Decimal("0.00"), difference=Decimal("0.00"),
+                status=DailyClosing.Status.MATCHED, submitted_by=manager,
+            )
+
+        close(date(2026, 5, 10))
+        close(date(2026, 6, 10))
+
+        body = manager_client.get(
+            reverse("dailyclosing:daily-closing-list"),
+            {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"},
+        ).json()
+
+        assert body["count"] == 1
+        assert body["results"][0]["date"] == "2026-05-10"
+
+    def test_daily_closings_can_be_narrowed_by_status(
+        self, manager_client, manager, branch
+    ):
+        from apps.dailyclosing.models import DailyClosing
+
+        DailyClosing.objects.create(
+            branch=branch, date=date(2026, 5, 10), system_total=Decimal("100.00"),
+            actual_total=Decimal("100.00"), difference=Decimal("0.00"),
+            status=DailyClosing.Status.MATCHED, submitted_by=manager,
+        )
+        DailyClosing.objects.create(
+            branch=branch, date=date(2026, 5, 11), system_total=Decimal("100.00"),
+            actual_total=Decimal("90.00"), difference=Decimal("-10.00"),
+            status=DailyClosing.Status.SHORT, submitted_by=manager,
+        )
+
+        body = manager_client.get(
+            reverse("dailyclosing:daily-closing-list"),
+            {"dateFrom": "2026-05-01", "dateTo": "2026-05-31", "status": "short"},
+        ).json()
+
+        assert body["count"] == 1
+        assert body["results"][0]["date"] == "2026-05-11"

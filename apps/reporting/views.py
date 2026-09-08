@@ -16,12 +16,14 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.common.filters import apply_date_range
 from apps.payments.models import Payment, PaymentStatus
 from apps.payments.serializers import PaymentSerializer
 from apps.reporting import services
 from apps.reporting.serializers import (
     BranchSummarySerializer,
     CollectionForDateSerializer,
+    DailyLedgerRowSerializer,
     DashboardMetricsSerializer,
     NetRevenueSerializer,
     RefundOrVoidRowSerializer,
@@ -38,6 +40,11 @@ _BRANCH_PARAM = OpenApiParameter(
 _DATE_PARAM = OpenApiParameter(
     "date", str, description="ISO date (YYYY-MM-DD). Defaults to today."
 )
+# The Summary page's range, understood by every list it reads.
+_RANGE_PARAMS = [
+    OpenApiParameter("dateFrom", str, description="ISO date. Inclusive lower bound."),
+    OpenApiParameter("dateTo", str, description="ISO date. Inclusive upper bound."),
+]
 
 
 def _branch_id_for(request):
@@ -76,6 +83,7 @@ class TransactionListView(_ReportView):
             OpenApiParameter("method", str),
             OpenApiParameter("status", str),
             OpenApiParameter("period", str, description='"today" or "month"; `date` overrides.'),
+            *_RANGE_PARAMS,
             OpenApiParameter("search", str),
             OpenApiParameter("pageSize", int),
         ],
@@ -113,6 +121,11 @@ class TransactionListView(_ReportView):
             queryset = queryset.filter(
                 created_at__year=today.year, created_at__month=today.month
             )
+
+        # Applied on top of the single-day/period filters above rather than
+        # instead of them: the Summary page sends only a range, the older
+        # screens send only a day, and neither has to know about the other.
+        queryset = apply_date_range(queryset, request.query_params)
 
         search = request.query_params.get("search", "").strip()
         if search:
@@ -287,6 +300,45 @@ class BranchSummaryView(_ReportView):
 
         return Response(
             services.branch_summary(
+                branch_id=_branch_id_for(request),
+                date_from=date_from,
+                date_to=date_to,
+            )
+        )
+
+
+class BranchDailyLedgerView(_ReportView):
+    """
+    GET /api/transactions/branch-summary/daily/
+
+    The Summary page's day-by-day table. Deliberately not paginated: the rows
+    only cover days something actually happened on, and the page charts and
+    exports the whole range at once — a page boundary through the middle of a
+    range would make both wrong.
+    """
+
+    @extend_schema(
+        tags=["reporting"],
+        parameters=[
+            _BRANCH_PARAM,
+            OpenApiParameter("dateFrom", str, description="ISO date. Defaults to the 1st of the current month."),
+            OpenApiParameter("dateTo", str, description="ISO date. Defaults to today."),
+        ],
+        responses=DailyLedgerRowSerializer(many=True),
+    )
+    def get(self, request):
+        today = timezone.localdate()
+        date_to = _parse_date(request.query_params.get("dateTo")) or today
+        date_from = _parse_date(request.query_params.get("dateFrom")) or date_to.replace(day=1)
+
+        if date_from > date_to:
+            return Response(
+                {"detail": "dateFrom cannot be after dateTo.", "code": "invalid_range"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(
+            services.daily_ledger(
                 branch_id=_branch_id_for(request),
                 date_from=date_from,
                 date_to=date_to,

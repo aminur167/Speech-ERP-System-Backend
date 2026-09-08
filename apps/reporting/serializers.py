@@ -87,3 +87,21 @@ class BranchSummarySerializer(serializers.Serializer):
 
     byMethod = ByMethodRowSerializer(many=True)
     byCategory = RevenueByCategoryRowSerializer(many=True)
+
+
+class DailyLedgerRowSerializer(serializers.Serializer):
+    """One day of the branch ledger — the Summary page's opening table."""
+
+    date = serializers.DateField()
+    transactionCount = serializers.IntegerField()
+    patientsSeen = serializers.IntegerField()
+    collected = serializers.DecimalField(max_digits=14, decimal_places=2)
+    refundCount = serializers.IntegerField()
+    refunded = serializers.DecimalField(max_digits=14, decimal_places=2)
+    expenseCount = serializers.IntegerField()
+    expenses = serializers.DecimalField(max_digits=14, decimal_places=2)
+    netRevenue = serializers.DecimalField(max_digits=14, decimal_places=2)
+    closingsSubmitted = serializers.IntegerField()
+    # "", "matched" or "mismatched" — empty when the day was never closed.
+    closingStatus = serializers.CharField(allow_blank=True)
+    closingDifference = serializers.DecimalField(max_digits=14, decimal_places=2)

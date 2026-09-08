@@ -8,6 +8,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from apps.branches.models import Branch
+from apps.common.filters import apply_date_range
 from apps.common.mixins import BranchScopedQuerySetMixin
 from apps.common.permissions import IsAdmin, IsManager
 from apps.dailyclosing import services
@@ -33,6 +34,15 @@ class DailyClosingViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
     )
     serializer_class = DailyClosingSerializer
     http_method_names = ["get", "post", "head", "options"]
+    filterset_fields = ["status"]
+
+    def get_queryset(self):
+        # `date` is a real DateField here, so the range compares against it
+        # directly rather than through `__date`.
+        return apply_date_range(
+            super().get_queryset(), self.request.query_params,
+            field="date", is_date_field=True,
+        )
 
     def get_permissions(self):
         if self.action == "create":

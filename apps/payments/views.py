@@ -6,6 +6,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from apps.branches.models import Branch
+from apps.common.filters import apply_date_range
 from apps.common.mixins import BranchScopedQuerySetMixin
 from apps.common.permissions import IsAdmin, IsManager
 from apps.patients.models import Patient
@@ -154,6 +155,15 @@ class RefundRequestViewSet(BranchScopedQuerySetMixin, viewsets.ReadOnlyModelView
     ).prefetch_related("items__material")
     serializer_class = RefundRequestSerializer
     filterset_fields = ["status"]
+
+    def get_queryset(self):
+        # Dated by when the refund was *asked for*, which is what a manager
+        # reading their branch's activity for a range is looking for. The
+        # accounting side deliberately dates an approved refund by its review
+        # instead (apps/reporting/services.py) — two different questions.
+        return apply_date_range(
+            super().get_queryset(), self.request.query_params, field="requested_at"
+        )
 
     @action(detail=True, methods=["post"], permission_classes=[IsAdmin])
     def approve(self, request, pk=None):
