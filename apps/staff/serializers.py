@@ -4,7 +4,8 @@ from decimal import Decimal
 
 from rest_framework import serializers
 
-from apps.staff.models import StaffAttendance, StaffBonus, StaffMember
+from apps.payments.models import PaymentMethod
+from apps.staff.models import SalaryPayment, StaffAttendance, StaffBonus, StaffMember
 
 
 class StaffMemberSerializer(serializers.ModelSerializer):
@@ -83,6 +84,47 @@ class StaffSummarySerializer(serializers.Serializer):
     onLeaveToday = serializers.IntegerField()
     monthlySalaryPayout = serializers.DecimalField(max_digits=14, decimal_places=2)
     monthlyBonusPayout = serializers.DecimalField(max_digits=14, decimal_places=2)
+
+
+class SalaryPaymentSerializer(serializers.ModelSerializer):
+    staffId = serializers.CharField(source="staff_id", read_only=True)
+    staffName = serializers.CharField(source="staff.name", read_only=True)
+    staffCode = serializers.CharField(source="staff.staff_code", read_only=True)
+    branchId = serializers.CharField(source="branch_id", read_only=True)
+    branchName = serializers.CharField(source="branch.name", read_only=True)
+    requestedBy = serializers.CharField(source="requested_by.name", read_only=True, default="")
+    reviewNote = serializers.CharField(source="review_note", read_only=True)
+    reviewedBy = serializers.CharField(source="reviewed_by.name", read_only=True, default="")
+    reviewedAt = serializers.DateTimeField(source="reviewed_at", read_only=True)
+    paymentMethod = serializers.CharField(source="payment_method", read_only=True)
+    paidAt = serializers.DateTimeField(source="paid_at", read_only=True)
+    expenseId = serializers.CharField(source="expense_id", read_only=True, default=None)
+    expenseCode = serializers.CharField(source="expense.expense_code", read_only=True, default="")
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        model = SalaryPayment
+        fields = [
+            "id", "staffId", "staffName", "staffCode", "branchId", "branchName",
+            "month", "amount", "status", "requestedBy", "reviewNote", "reviewedBy",
+            "reviewedAt", "paymentMethod", "paidAt", "expenseId", "expenseCode", "createdAt",
+        ]
+        read_only_fields = fields
+
+
+class RequestSalaryPaymentSerializer(serializers.Serializer):
+    """`month` is an ISO "YYYY-MM"; amount is never accepted from the client — it's computed server-side from the roster and that month's bonuses, same reasoning as materials pricing a sale from the database."""
+
+    month = serializers.RegexField(r"^\d{4}-\d{2}$")
+
+
+class ReviewSalaryPaymentSerializer(serializers.Serializer):
+    approve = serializers.BooleanField()
+    reviewNote = serializers.CharField(required=False, allow_blank=True)
+
+
+class DisburseSalaryPaymentSerializer(serializers.Serializer):
+    paymentMethod = serializers.ChoiceField(choices=PaymentMethod.choices)
 
 
 class StaffMonthlyReportRowSerializer(serializers.Serializer):
