@@ -266,6 +266,28 @@ owed and stays collectable from the Terminated Services screen, where a
 manager can resume the service either by taking the arrears or by waiving
 them explicitly.
 
+**On Render**, these are declared as two `type: cron` services in
+`render.yaml` instead of a crontab. Render does not offer cron jobs on the
+free plan, so a free web service has no scheduler at all — the app will serve
+perfectly while quietly never invoicing again after the initial three-month
+lookahead runs out. Either put the cron services on a paid instance, or drive
+the same two commands from an external scheduler with access to this
+database.
+
+**Before the first termination run**, on any clinic that has been running
+without it, check what it would do:
+
+```bash
+python manage.py terminate_unpaid_monthly_services --dry-run
+```
+
+Every patient carrying an unpaid due from a finished month is terminated on
+that first run — correct by the rule, but it can be a lot of people at once
+if the deadline has not been enforced until now. Their debt is kept and each
+one can be resumed from the Terminated Services screen, so nothing is lost
+either way; it is worth knowing the number before it happens rather than
+after.
+
 ---
 
 ## 11. Scheduled jobs (reminders)
