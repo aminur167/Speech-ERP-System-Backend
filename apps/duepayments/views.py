@@ -7,6 +7,7 @@ second chance to get that wrong.
 """
 
 from datetime import datetime
+from decimal import Decimal
 
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework.permissions import IsAuthenticated
@@ -28,6 +29,20 @@ def _branch_id_for(request):
     return request.query_params.get("branch") or None
 
 
+def _parse_month(value):
+    """
+    A "YYYY-MM" cycle, or None. A malformed one is ignored rather than 400ing:
+    the filter narrows a list, so the safe failure is showing everything.
+    """
+    if not value:
+        return None
+    try:
+        datetime.strptime(value, "%Y-%m")
+    except (ValueError, TypeError):
+        return None
+    return value
+
+
 def _parse_date(value):
     if not value:
         return None
@@ -47,6 +62,15 @@ class DuePaymentListView(APIView):
         parameters=[
             _BRANCH_PARAM,
             OpenApiParameter("type", str, description='"monthly" or "installment".'),
+            OpenApiParameter(
+                "month",
+                str,
+                description=(
+                    'Cycle month as "YYYY-MM". Keeps monthly rows whose payable '
+                    "bill is that month or earlier — i.e. who owes as of the end "
+                    "of it. Installments ignore it."
+                ),
+            ),
             OpenApiParameter("search", str),
             OpenApiParameter("page", int),
             OpenApiParameter("pageSize", int),
@@ -54,7 +78,10 @@ class DuePaymentListView(APIView):
         responses=DuePaymentListSerializer,
     )
     def get(self, request):
-        items = services.collect_due_items(branch_id=_branch_id_for(request))
+        items = services.collect_due_items(
+            branch_id=_branch_id_for(request),
+            month=_parse_month(request.query_params.get("month")),
+        )
 
         type_filter = request.query_params.get("type")
         if type_filter:
@@ -84,6 +111,12 @@ class DuePaymentListView(APIView):
         return Response(
             {
                 "count": len(items),
+                # Across everything the filters matched, not just this page:
+                # the screen puts it next to the table's own heading, and a
+                # per-page subtotal labelled as the total is worse than none.
+                "totalAmount": sum(
+                    (i["amount"] for i in items), Decimal("0.00")
+                ),
                 "next": str(page + 1) if start + page_size < len(items) else None,
                 "previous": str(page - 1) if page > 1 else None,
                 "results": window,

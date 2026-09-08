@@ -66,13 +66,31 @@ def _outstanding_at(payable, cutoff) -> Decimal:
     return payable.amount - payable.amount_paid
 
 
-def collect_due_items(*, branch_id=None, as_of: date | None = None) -> list[dict]:
+def collect_due_items(
+    *, branch_id=None, as_of: date | None = None, month: str | None = None
+) -> list[dict]:
     """
     Every currently-payable item, one per enrollment/plan.
 
     Only the **oldest** unpaid item per enrollment appears: that's the only one
     payable next under the oldest-first rule, so listing the rest would offer
     the manager actions that would be refused.
+
+    `month` ("2026-09") answers "who owes as of the end of this month", which
+    is the question the Due Payments screen's month picker asks. A monthly row
+    is kept when its payable bill belongs to that month **or an earlier one**:
+
+      * a patient who has settled September has October as their oldest unpaid
+        bill, so September's view drops them — paying the running month moves
+        the debt to the next one, which is the whole point of the picker;
+      * a patient who has not paid September still shows in September, and so
+        does one who last paid in July: they owe for September too, and hiding
+        the longest-overdue patient from the current month would be the worst
+        possible thing this filter could do.
+
+    Installments are untouched by it — a plan is one agreed debt with its own
+    schedule, not a monthly cycle, and the screen shows them side by side
+    rather than mixed in.
     """
     items: list[dict] = []
 
@@ -95,6 +113,12 @@ def collect_due_items(*, branch_id=None, as_of: date | None = None) -> list[dict
             continue
         seen_enrollments.add(bill.enrollment_id)
 
+        # Marked seen before the month check so a filtered-out enrollment
+        # can't fall through to its *second* unpaid bill and reappear as a
+        # row the manager isn't allowed to collect yet.
+        if month and bill.month > month:
+            continue
+
         enrollment = bill.enrollment
         items.append(
             {
@@ -109,6 +133,9 @@ def collect_due_items(*, branch_id=None, as_of: date | None = None) -> list[dict
                 "serviceName": enrollment.service.name,
                 "branchId": str(enrollment.branch_id),
                 "label": bill.label,
+                # The bill's own month, so the screen can say which cycle a
+                # row belongs to without parsing it back out of the label.
+                "month": bill.month,
                 "amount": bill.outstanding,
                 # Everything unpaid on the enrollment, not just this bill —
                 # what terminating would write off, which the confirmation

@@ -292,3 +292,141 @@ class TestOutstandingTotalOnRows:
 
         assert Decimal(row["amount"]) == Decimal("3000.00")
         assert Decimal(row["outstandingTotal"]) == Decimal("9000.00")
+
+
+class TestMonthlyCycleFilter:
+    """
+    The Due Payments screen's month picker.
+
+    The rule it implements, in the manager's words: pay this month and your
+    due moves to the next one; don't, and it stays under this one.
+    """
+
+    def _months(self, enrollment):
+        return list(enrollment.bills.order_by("month").values_list("month", flat=True))
+
+    def test_an_unpaid_running_month_stays_under_that_month(
+        self, manager_client, enrollment
+    ):
+        this_month = self._months(enrollment)[0]
+
+        results = manager_client.get(
+            reverse("duepayments:due-list"), {"month": this_month}
+        ).json()["results"]
+
+        assert len(results) == 1
+        assert results[0]["month"] == this_month
+
+    def test_paying_the_running_month_moves_the_due_to_the_next_one(
+        self, manager_client, manager, branch, enrollment
+    ):
+        this_month, next_month = self._months(enrollment)[:2]
+
+        enrollment_services.collect_bill_payment(
+            actor=manager, branch=branch,
+            bill=enrollment.oldest_unpaid_bill(), method="cash",
+        )
+
+        gone = manager_client.get(
+            reverse("duepayments:due-list"), {"month": this_month}
+        ).json()
+        moved = manager_client.get(
+            reverse("duepayments:due-list"), {"month": next_month}
+        ).json()
+
+        assert gone["count"] == 0
+        assert moved["count"] == 1
+        assert moved["results"][0]["month"] == next_month
+
+    def test_someone_who_owes_an_older_month_still_shows_in_this_one(
+        self, manager_client, enrollment
+    ):
+        """
+        The worst thing this filter could do is hide the most overdue patient
+        from the month the manager is actually looking at.
+        """
+        this_month, next_month = self._months(enrollment)[:2]
+
+        results = manager_client.get(
+            reverse("duepayments:due-list"), {"month": next_month}
+        ).json()["results"]
+
+        assert len(results) == 1
+        # Still the older bill: oldest-first is what's payable, and the row
+        # has to be the item the collect action would actually settle.
+        assert results[0]["month"] == this_month
+
+    def test_a_future_month_is_not_offered_early(self, manager_client, enrollment):
+        """
+        Next month's bill exists from the day the enrollment is created. Under
+        the running month it must not be collectable yet, or the screen would
+        invite payment for a cycle nobody has started.
+        """
+        this_month = self._months(enrollment)[0]
+
+        body = manager_client.get(
+            reverse("duepayments:due-list"), {"month": this_month}
+        ).json()
+
+        assert [row["month"] for row in body["results"]] == [this_month]
+
+    def test_installments_ignore_the_month_filter(
+        self, manager_client, manager, branch, patient_factory, service_factory
+    ):
+        from apps.services.models import Service
+
+        enrollment_services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient_factory(),
+            service=service_factory(
+                code="INS-M", category=Service.Category.INSTALLMENT, fee=Decimal("6000.00")
+            ),
+            number_of_installments=3,
+        )
+
+        body = manager_client.get(
+            reverse("duepayments:due-list"),
+            {"type": "installment", "month": "2020-01"},
+        ).json()
+
+        assert body["count"] == 1
+
+    def test_a_malformed_month_narrows_nothing(self, manager_client, enrollment):
+        """Showing everything is the safe failure for a filter that narrows."""
+        body = manager_client.get(
+            reverse("duepayments:due-list"), {"month": "not-a-month"}
+        ).json()
+
+        assert body["count"] == 1
+
+    def test_the_response_totals_every_matched_row_not_just_the_page(
+        self, manager_client, manager, branch, patient_factory, monthly_service
+    ):
+        for name in ("A", "B", "C"):
+            enrollment_services.create_monthly_enrollment(
+                actor=manager, branch=branch,
+                patient=patient_factory(name=name), service=monthly_service,
+            )
+
+        body = manager_client.get(
+            reverse("duepayments:due-list"), {"pageSize": 1}
+        ).json()
+
+        assert len(body["results"]) == 1
+        assert body["count"] == 3
+        assert Decimal(body["totalAmount"]) == Decimal("15000.00")
+
+    def test_the_total_follows_the_month_filter(
+        self, manager_client, manager, branch, enrollment
+    ):
+        this_month = self._months(enrollment)[0]
+
+        enrollment_services.collect_bill_payment(
+            actor=manager, branch=branch,
+            bill=enrollment.oldest_unpaid_bill(), method="cash",
+        )
+
+        body = manager_client.get(
+            reverse("duepayments:due-list"), {"month": this_month}
+        ).json()
+
+        assert Decimal(body["totalAmount"]) == Decimal("0.00")

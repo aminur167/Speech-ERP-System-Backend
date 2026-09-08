@@ -27,6 +27,8 @@ class DuePaymentItemSerializer(serializers.Serializer):
     serviceName = serializers.CharField()
     branchId = serializers.CharField()
     label = serializers.CharField()
+    # Monthly only: the cycle the payable bill belongs to, as "YYYY-MM".
+    month = serializers.CharField(required=False)
     amount = serializers.DecimalField(max_digits=12, decimal_places=2)
     # Everything unpaid on the enrollment/plan, which is what terminating
     # writes off — `amount` is only the part payable right now.
@@ -47,6 +49,8 @@ class DuePaymentListSerializer(serializers.Serializer):
     """
 
     count = serializers.IntegerField()
+    # What every matched row adds up to — not just the page being returned.
+    totalAmount = serializers.DecimalField(max_digits=14, decimal_places=2)
     next = serializers.CharField(allow_null=True)
     previous = serializers.CharField(allow_null=True)
     results = DuePaymentItemSerializer(many=True)
