@@ -227,3 +227,69 @@ class TestSalaryPaymentBranchIsolation:
             format="json",
         )
         assert response.status_code == 404
+
+
+class TestBranchSummary:
+    def test_splits_approved_from_paid(self, admin_client, manager, admin_user, farhana, current_month):
+        payment = services.request_salary_payment(actor=manager, staff=farhana, month=current_month)
+        services.review_salary_payment(actor=admin_user, payment=payment, approve=True)
+        services.disburse_salary_payment(actor=manager, payment=payment, payment_method="cash")
+
+        response = admin_client.get(reverse("staff:salarypayment-branch-summary"))
+        assert response.status_code == 200
+        row = response.json()[0]
+        assert row["branchId"] == str(farhana.branch_id)
+        assert row["approvedAmount"] == "0.00"
+        assert row["paidAmount"] == "42000.00"
+        assert row["totalApprovedAmount"] == "42000.00"
+        assert row["paymentCount"] == 1
+
+    def test_pending_and_rejected_are_excluded(self, admin_client, manager, admin_user, farhana, current_month):
+        payment = services.request_salary_payment(actor=manager, staff=farhana, month=current_month)
+        services.review_salary_payment(
+            actor=admin_user, payment=payment, approve=False, review_note="no"
+        )
+
+        response = admin_client.get(reverse("staff:salarypayment-branch-summary"))
+        assert response.json() == []
+
+    def test_admin_sees_every_branch_broken_out_separately(
+        self, admin_client, manager, other_manager, admin_user, farhana, staff_member_factory,
+        other_branch, current_month,
+    ):
+        other_staff = staff_member_factory(name="Other", branch=other_branch, monthly_salary=Decimal("20000.00"))
+
+        first = services.request_salary_payment(actor=manager, staff=farhana, month=current_month)
+        services.review_salary_payment(actor=admin_user, payment=first, approve=True)
+
+        second = services.request_salary_payment(actor=other_manager, staff=other_staff, month=current_month)
+        services.review_salary_payment(actor=admin_user, payment=second, approve=True)
+
+        response = admin_client.get(reverse("staff:salarypayment-branch-summary"))
+        rows = {row["branchId"]: row for row in response.json()}
+        assert rows[str(farhana.branch_id)]["approvedAmount"] == "42000.00"
+        assert rows[str(other_staff.branch_id)]["approvedAmount"] == "20000.00"
+
+    def test_manager_only_sees_own_branch(
+        self, manager_client, manager, other_manager, admin_user, farhana, staff_member_factory,
+        other_branch, current_month,
+    ):
+        other_staff = staff_member_factory(name="Other", branch=other_branch)
+        first = services.request_salary_payment(actor=manager, staff=farhana, month=current_month)
+        services.review_salary_payment(actor=admin_user, payment=first, approve=True)
+        second = services.request_salary_payment(actor=other_manager, staff=other_staff, month=current_month)
+        services.review_salary_payment(actor=admin_user, payment=second, approve=True)
+
+        response = manager_client.get(reverse("staff:salarypayment-branch-summary"))
+        rows = response.json()
+        assert len(rows) == 1
+        assert rows[0]["branchId"] == str(farhana.branch_id)
+
+    def test_month_filter_narrows_the_summary(self, admin_client, manager, admin_user, farhana):
+        payment = services.request_salary_payment(actor=manager, staff=farhana, month="2026-01")
+        services.review_salary_payment(actor=admin_user, payment=payment, approve=True)
+
+        response = admin_client.get(
+            reverse("staff:salarypayment-branch-summary"), {"month": "2026-02"}
+        )
+        assert response.json() == []

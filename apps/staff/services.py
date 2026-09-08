@@ -13,7 +13,7 @@ from datetime import date, time
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count, Sum
+from django.db.models import Count, Q, Sum
 from django.utils import timezone
 
 from apps.common import audit
@@ -321,3 +321,45 @@ def disburse_salary_payment(*, actor, payment: SalaryPayment, payment_method: st
         changes={"amount": str(payment.amount), "staff": payment.staff.name, "month": payment.month},
     )
     return payment
+
+
+def salary_payments_branch_summary(queryset, *, month: str | None = None) -> list[dict]:
+    """
+    Branch-wise totals of Admin-approved salary — one row per branch, split
+    into what's approved-but-not-yet-paid and what's already been disbursed.
+
+    A single conditional aggregate (`Sum(..., filter=Q(...))`) grouped by
+    branch on `queryset` itself, not a join to a different related table, so
+    this doesn't have the fan-out risk `monthly_report` avoids by hand
+    (see its docstring) — every row summed here already belongs to the one
+    table being grouped.
+    """
+    if month:
+        queryset = queryset.filter(month=month)
+
+    rows = (
+        queryset.filter(status__in=[SalaryPayment.Status.APPROVED, SalaryPayment.Status.PAID])
+        .values("branch_id", "branch__name")
+        .annotate(
+            approved_amount=Sum("amount", filter=Q(status=SalaryPayment.Status.APPROVED)),
+            paid_amount=Sum("amount", filter=Q(status=SalaryPayment.Status.PAID)),
+            payment_count=Count("id"),
+        )
+        .order_by("branch__name")
+    )
+
+    result = []
+    for row in rows:
+        approved_amount = row["approved_amount"] or Decimal("0.00")
+        paid_amount = row["paid_amount"] or Decimal("0.00")
+        result.append(
+            {
+                "branchId": str(row["branch_id"]),
+                "branchName": row["branch__name"],
+                "approvedAmount": approved_amount,
+                "paidAmount": paid_amount,
+                "totalApprovedAmount": approved_amount + paid_amount,
+                "paymentCount": row["payment_count"],
+            }
+        )
+    return result
