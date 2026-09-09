@@ -162,7 +162,7 @@ def add_bonus(*, actor, staff: StaffMember, amount, reason: str) -> StaffBonus:
     return bonus
 
 
-def _month_range(year: int, month: int) -> tuple[date, date]:
+def month_range(year: int, month: int) -> tuple[date, date]:
     """[start, end) — end is the 1st of the following month, so date/datetime filters can use a plain `lt`."""
     start = date(year, month, 1)
     end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
@@ -183,7 +183,7 @@ def monthly_report(staff_queryset, *, year: int, month: int) -> list[dict]:
     """
     staff_list = list(staff_queryset)
     staff_ids = [member.id for member in staff_list]
-    start, end = _month_range(year, month)
+    start, end = month_range(year, month)
 
     bonus_totals = dict(
         StaffBonus.objects.filter(staff_id__in=staff_ids, created_at__date__gte=start, created_at__date__lt=end)

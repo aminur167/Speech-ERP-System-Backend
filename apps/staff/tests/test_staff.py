@@ -222,6 +222,45 @@ class TestAttendance:
         assert history[0].id == newer.id
         assert history[-1].id in (older.id, history[-1].id)  # newest-first ordering holds
 
+    def test_attendance_history_endpoint_scopes_to_the_requested_month(self, manager_client, farhana):
+        """Powers the calendar view — a month picker means only that month's rows should come back."""
+        today = timezone.localdate()
+        this_month = StaffAttendance.objects.create(
+            staff=farhana, branch=farhana.branch, date=today.replace(day=1),
+            status=StaffAttendance.Status.PRESENT,
+        )
+        last_month = today.replace(day=1) - timedelta(days=1)
+        StaffAttendance.objects.create(
+            staff=farhana, branch=farhana.branch, date=last_month,
+            status=StaffAttendance.Status.ABSENT,
+        )
+
+        response = manager_client.get(
+            reverse("staff:staffmember-attendance-history", args=[farhana.id]),
+            {"month": today.strftime("%Y-%m")},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert len(body) == 1
+        assert body[0]["id"] == this_month.id
+
+    def test_attendance_history_endpoint_defaults_to_current_month(self, manager_client, farhana):
+        StaffAttendance.objects.create(
+            staff=farhana, branch=farhana.branch, date=timezone.localdate(),
+            status=StaffAttendance.Status.PRESENT,
+        )
+        response = manager_client.get(
+            reverse("staff:staffmember-attendance-history", args=[farhana.id])
+        )
+        assert len(response.json()) == 1
+
+    def test_attendance_history_endpoint_rejects_malformed_month(self, manager_client, farhana):
+        response = manager_client.get(
+            reverse("staff:staffmember-attendance-history", args=[farhana.id]),
+            {"month": "not-a-month"},
+        )
+        assert response.status_code == 400
+
 
 def _at_hour(hour: int):
     return timezone.make_aware(datetime.combine(date.today(), datetime.min.time()) + timedelta(hours=hour))

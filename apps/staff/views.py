@@ -32,6 +32,20 @@ from apps.staff.serializers import (
 )
 
 
+def _parse_month_param(request) -> tuple[int, int]:
+    """`?month=YYYY-MM`, defaulting to the current month — shared by monthly-report and attendance-history."""
+    month_param = request.query_params.get("month")
+    if not month_param:
+        today = timezone.localdate()
+        return today.year, today.month
+    try:
+        year, month = (int(part) for part in month_param.split("-", 1))
+        date(year, month, 1)
+    except (ValueError, TypeError):
+        raise ValidationError({"month": ["Expected YYYY-MM."]}) from None
+    return year, month
+
+
 class StaffMemberViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
     """
     /api/staff/
@@ -125,8 +139,11 @@ class StaffMemberViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"], url_path="attendance-history")
     def attendance_history(self, request, pk=None):
+        """`?month=YYYY-MM` (defaults to the current month) — powers the calendar view."""
         member = self.get_object()
-        records = member.attendance_records.all()[:31]
+        year, month = _parse_month_param(request)
+        start, end = services.month_range(year, month)
+        records = member.attendance_records.filter(date__gte=start, date__lt=end)
         return Response(StaffAttendanceSerializer(records, many=True).data)
 
     @action(detail=True, methods=["post"], url_path="check-in", permission_classes=[IsManager])
@@ -176,20 +193,10 @@ class StaffMemberViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
     def monthly_report(self, request):
         """
         `?month=YYYY-MM` (defaults to the current month) — one row per staff
-        member with salary, bonuses, and present/late/absent/leave counts for
-        that month. Powers the frontend's CSV export.
+        member with salary, bonuses, and present/early-leave/absent/leave
+        counts for that month. Powers the frontend's PDF export.
         """
-        month_param = request.query_params.get("month")
-        if month_param:
-            try:
-                year, month = (int(part) for part in month_param.split("-", 1))
-                date(year, month, 1)
-            except (ValueError, TypeError):
-                raise ValidationError({"month": ["Expected YYYY-MM."]}) from None
-        else:
-            today = timezone.localdate()
-            year, month = today.year, today.month
-
+        year, month = _parse_month_param(request)
         rows = services.monthly_report(self.get_queryset(), year=year, month=month)
         return Response(StaffMonthlyReportRowSerializer(rows, many=True).data)
 
