@@ -2,10 +2,16 @@
 Staff HR business logic: roster codes, attendance check-in/out, and bonuses.
 
 Attendance and bonus writes go through here rather than a plain serializer
-`.save()` so that "late" is always derived from the check-in time server-side
+`.save()` so that status is always derived from the actual clock server-side
 (a client claiming "present" at 2pm would otherwise be trusted) and so a
 bonus is always attributed to the manager who is actually authenticated,
 never to a name the client sends.
+
+Day-of attendance is deliberately only ever one of three derived states:
+Present, Absent (no show by close — see `mark_no_show_absentees`), or Early
+Leave (checked out before closing). "On Leave" remains a manual override via
+`mark_attendance` for planned absences. Older "late" rows from before this
+model existed are left as recorded, not backfilled.
 """
 
 from collections import defaultdict
@@ -22,13 +28,11 @@ from apps.common.sequences import next_value
 from apps.notifications.inapp import notify, notify_many
 from apps.staff.models import SalaryPayment, StaffAttendance, StaffBonus, StaffMember
 
-# Office hours: 9am-4pm. Check-ins at or after the start hour are "late"
-# rather than "present"; anyone still unmarked once the end hour passes is
-# auto-marked absent (see `mark_no_show_absentees`).
+# Office hours: 9am-4pm. Anyone still unmarked once the end hour passes is
+# auto-marked absent (see `mark_no_show_absentees`); checking out before the
+# end hour is an early leave rather than a plain present.
 OFFICE_START_HOUR = 9
 OFFICE_END_HOUR = 16
-
-LATE_AFTER_HOUR = OFFICE_START_HOUR
 
 
 @transaction.atomic
@@ -48,10 +52,10 @@ def create_staff_member(*, actor, branch, data: dict) -> StaffMember:
     return member
 
 
-def _today_status_for_check_in(check_in_at) -> str:
+def _status_for_check_out(check_out_at) -> str:
     return (
-        StaffAttendance.Status.LATE
-        if check_in_at.time() >= time(LATE_AFTER_HOUR, 0)
+        StaffAttendance.Status.EARLY_LEAVE
+        if check_out_at.time() < time(OFFICE_END_HOUR, 0)
         else StaffAttendance.Status.PRESENT
     )
 
@@ -68,13 +72,14 @@ def check_in(*, staff: StaffMember) -> StaffAttendance:
     )
     record.check_in_at = now
     record.check_out_at = None
-    record.status = _today_status_for_check_in(now)
+    record.status = StaffAttendance.Status.PRESENT
     record.save(update_fields=["check_in_at", "check_out_at", "status"])
     return record
 
 
 @transaction.atomic
 def check_out(*, staff: StaffMember) -> StaffAttendance:
+    now = timezone.now()
     today = timezone.localdate()
     record, _created = StaffAttendance.objects.select_for_update().get_or_create(
         staff=staff,
@@ -82,11 +87,12 @@ def check_out(*, staff: StaffMember) -> StaffAttendance:
         defaults={
             "branch": staff.branch,
             "status": StaffAttendance.Status.PRESENT,
-            "check_in_at": timezone.now(),
+            "check_in_at": now,
         },
     )
-    record.check_out_at = timezone.now()
-    record.save(update_fields=["check_out_at"])
+    record.check_out_at = now
+    record.status = _status_for_check_out(now)
+    record.save(update_fields=["check_out_at", "status"])
     return record
 
 
@@ -210,6 +216,7 @@ def monthly_report(staff_queryset, *, year: int, month: int) -> list[dict]:
                 "netPayable": member.monthly_salary + bonus_total,
                 "presentCount": counts.get(StaffAttendance.Status.PRESENT, 0),
                 "lateCount": counts.get(StaffAttendance.Status.LATE, 0),
+                "earlyLeaveCount": counts.get(StaffAttendance.Status.EARLY_LEAVE, 0),
                 "absentCount": counts.get(StaffAttendance.Status.ABSENT, 0),
                 "leaveCount": counts.get(StaffAttendance.Status.ON_LEAVE, 0),
             }
