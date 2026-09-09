@@ -5,6 +5,7 @@ bonuses, and the monthly payroll report.
 
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from unittest import mock
 
 import pytest
 from django.urls import reverse
@@ -148,13 +149,15 @@ class TestAttendance:
     def test_check_in_at_or_after_cutoff_is_derived_as_late(self):
         """Exercises the derivation function directly for a fixed, non-flaky time."""
         late_time = timezone.make_aware(
-            datetime.combine(date.today(), datetime.min.time()) + timedelta(hours=11)
+            datetime.combine(date.today(), datetime.min.time())
+            + timedelta(hours=services.LATE_AFTER_HOUR + 1)
         )
         assert services._today_status_for_check_in(late_time) == StaffAttendance.Status.LATE
 
     def test_check_in_before_cutoff_is_derived_as_present(self):
         early_time = timezone.make_aware(
-            datetime.combine(date.today(), datetime.min.time()) + timedelta(hours=9)
+            datetime.combine(date.today(), datetime.min.time())
+            + timedelta(hours=services.LATE_AFTER_HOUR - 1)
         )
         assert services._today_status_for_check_in(early_time) == StaffAttendance.Status.PRESENT
 
@@ -209,6 +212,60 @@ class TestAttendance:
         history = list(farhana.attendance_records.all())
         assert history[0].id == newer.id
         assert history[-1].id in (older.id, history[-1].id)  # newest-first ordering holds
+
+
+def _at_hour(hour: int):
+    return timezone.make_aware(datetime.combine(date.today(), datetime.min.time()) + timedelta(hours=hour))
+
+
+class TestNoShowAutoAbsent:
+    """Office hours are 9am-4pm — anyone still unmarked once 4pm passes is auto-marked absent."""
+
+    def test_no_effect_before_office_end(self, farhana):
+        with mock.patch(
+            "apps.staff.services.timezone.localtime",
+            return_value=_at_hour(services.OFFICE_END_HOUR - 1),
+        ):
+            services.mark_no_show_absentees(StaffMember.objects.filter(pk=farhana.id))
+        assert not StaffAttendance.objects.filter(staff=farhana, date=date.today()).exists()
+
+    def test_marks_absent_after_office_end(self, farhana):
+        with mock.patch(
+            "apps.staff.services.timezone.localtime",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            services.mark_no_show_absentees(StaffMember.objects.filter(pk=farhana.id))
+        record = StaffAttendance.objects.get(staff=farhana, date=date.today())
+        assert record.status == StaffAttendance.Status.ABSENT
+
+    def test_does_not_overwrite_an_existing_record(self, farhana):
+        checked_in = services.check_in(staff=farhana)
+        with mock.patch(
+            "apps.staff.services.timezone.localtime",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            services.mark_no_show_absentees(StaffMember.objects.filter(pk=farhana.id))
+        records = StaffAttendance.objects.filter(staff=farhana, date=date.today())
+        assert records.count() == 1
+        assert records.first().status == checked_in.status
+
+    def test_manual_check_in_after_auto_absent_overrides_it(self, farhana):
+        with mock.patch(
+            "apps.staff.services.timezone.localtime",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            services.mark_no_show_absentees(StaffMember.objects.filter(pk=farhana.id))
+        record = services.check_in(staff=farhana)
+        assert record.status in (StaffAttendance.Status.PRESENT, StaffAttendance.Status.LATE)
+        assert record.check_in_at is not None
+
+    def test_today_attendance_endpoint_reflects_auto_absent(self, manager_client, farhana):
+        with mock.patch(
+            "apps.staff.services.timezone.localtime",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            body = manager_client.get(reverse("staff:staffmember-today-attendance")).json()
+        assert body[str(farhana.id)]["status"] == "absent"
 
 
 @pytest.mark.money
