@@ -246,6 +246,16 @@ MONTHLY_BILL_DUE_DAY = env.int("MONTHLY_BILL_DUE_DAY", default=5)
 # Age below which guardian details are required on patient registration.
 PATIENT_MINOR_AGE = env.int("PATIENT_MINOR_AGE", default=18)
 
+# Attendance: how many days without a visit before the roster flags a patient
+# as having stopped coming. There is no session schedule in this system, so
+# this measures the gap since they were last seen — not missed appointments,
+# which nothing could know about.
+PATIENT_ABSENCE_ALERT_DAYS = env.int("PATIENT_ABSENCE_ALERT_DAYS", default=14)
+
+# An informed absence with no stated return date holds the alert off for this
+# long. With a stated date, that date wins.
+PATIENT_ABSENCE_GRACE_DAYS = env.int("PATIENT_ABSENCE_GRACE_DAYS", default=7)
+
 # Online booking advance = this fraction of the service fee, always computed
 # server-side -- never trusted from the client.
 BOOKING_ADVANCE_RATIO = env.float("BOOKING_ADVANCE_RATIO", default=0.5)

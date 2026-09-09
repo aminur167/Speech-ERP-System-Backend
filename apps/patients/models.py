@@ -150,3 +150,81 @@ class Patient(TimeStampedModel, SoftDeleteModel, IdempotentModel):
         if age is None:
             return False
         return age < settings.PATIENT_MINOR_AGE
+
+
+class PatientAttendance(TimeStampedModel):
+    """
+    One row per patient per service kind per day.
+
+    **Monthly and installment are counted separately** because the manager
+    takes them as two separate sheets — the same person can be in ongoing
+    monthly therapy and paying off a package, and each is its own attendance
+    question. Two *monthly* services are still one row: the patient came in
+    or they didn't, and asking twice would be asking the same question twice.
+    That is what `(patient, service_kind, date)` encodes, and the constraint
+    is what makes marking an upsert rather than a growing pile of rows.
+
+    **Nothing here touches money.** Attendance never changes what a patient
+    owes; billing is a subscription, not a per-visit charge. The service
+    module enforces that structurally by importing no money code at all.
+
+    There are deliberately no check-in/check-out times. A therapy visit is
+    not a shift, and punch times would invite someone to compute session
+    durations out of data nobody enters accurately.
+    """
+
+    class ServiceKind(models.TextChoices):
+        MONTHLY = "monthly", "Monthly service"
+        INSTALLMENT = "installment", "Installment service"
+
+    class Status(models.TextChoices):
+        PRESENT = "present", "Present"
+        # Said in advance that they wouldn't come. The distinction from
+        # `absent` is the whole point: it is what stops the "has this patient
+        # quietly stopped coming?" clock, which is the question this feature
+        # exists to answer.
+        INFORMED_ABSENCE = "informed_absence", "Informed absence"
+        ABSENT = "absent", "Absent"
+
+    patient = models.ForeignKey(
+        "patients.Patient", on_delete=models.CASCADE, related_name="attendance_records"
+    )
+    # Denormalised from the patient so the branch filter is one join shorter
+    # on a table that grows by the whole roster every single day.
+    branch = models.ForeignKey(
+        "branches.Branch", on_delete=models.PROTECT, related_name="patient_attendance"
+    )
+    service_kind = models.CharField(
+        max_length=16, choices=ServiceKind.choices, db_index=True
+    )
+    date = models.DateField(db_index=True)
+
+    status = models.CharField(max_length=20, choices=Status.choices, db_index=True)
+    note = models.CharField(max_length=255, blank=True)
+    # Informed absence only — when they said they would be back. While this
+    # is in the future the patient is not counted as having stopped coming.
+    expected_return_on = models.DateField(null=True, blank=True)
+
+    # Stored, unlike staff attendance, because a patient cannot mark
+    # themselves: every row is one named manager's assertion, and it is the
+    # evidence behind stopping someone's service later.
+    marked_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="marked_attendance",
+    )
+
+    class Meta:
+        ordering = ["-date"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["patient", "service_kind", "date"],
+                name="uniq_patient_attendance_per_kind_day",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["branch", "service_kind", "date"]),
+            models.Index(fields=["patient", "-date"]),
+        ]
+
+    def __str__(self):
+        return f"{self.patient_id} {self.date} {self.service_kind} — {self.status}"

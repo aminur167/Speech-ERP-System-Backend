@@ -13,6 +13,8 @@ explains why it is built the way it is.
 from datetime import datetime
 
 from django.db.models import Q
+from django.utils import timezone
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -29,9 +31,13 @@ from apps.enrollments.serializers import (
     InstallmentPlanSerializer,
     MonthlyEnrollmentSerializer,
 )
+from apps.patients import attendance as attendance_services
 from apps.patients import directory, services
-from apps.patients.models import Patient
+from apps.patients.models import Patient, PatientAttendance
 from apps.patients.serializers import (
+    AttendanceRosterRowSerializer,
+    MarkAttendanceSerializer,
+    PatientAttendanceSerializer,
     PatientListSerializer,
     PatientSerializer,
     PatientWriteSerializer,
@@ -48,9 +54,9 @@ class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
     ordering = ["-created_at"]
 
     def get_permissions(self):
-        # Registration is a branch desk action — the frontend hides it from
-        # Admin, and that has to hold server-side too.
-        if self.action == "create":
+        # Registration and marking attendance are branch desk actions — the
+        # frontend hides them from Admin, and that has to hold server-side too.
+        if self.action in {"create", "mark_attendance"}:
             return [IsManager()]
         return [IsAuthenticated()]
 
@@ -210,6 +216,119 @@ class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         patient = self.get_object()
         patient.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # -- attendance --------------------------------------------------------
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter("kind", str, description='"monthly" or "installment".'),
+            OpenApiParameter("date", str, description="ISO date. Defaults to today."),
+            OpenApiParameter("search", str),
+            OpenApiParameter("unmarked", bool, description="Only patients not yet marked."),
+            OpenApiParameter("alerts", bool, description="Only patients who have stopped coming."),
+        ],
+        responses=AttendanceRosterRowSerializer(many=True),
+    )
+    @action(detail=False, methods=["get"], url_path="attendance/roster")
+    def attendance_roster(self, request):
+        """
+        The day's sheet for one kind of service.
+
+        Monthly and installment are separate sheets because the manager takes
+        them separately. A patient holding two *monthly* services appears once
+        with both names on the row — they either came in or they didn't.
+
+        Paginated, unlike the staff roster which deliberately loads whole: a
+        branch has a handful of staff but can have hundreds of patients.
+        """
+        kind = request.query_params.get("kind") or PatientAttendance.ServiceKind.MONTHLY
+        if kind not in PatientAttendance.ServiceKind.values:
+            raise ValidationError({"kind": ['Expected "monthly" or "installment".']})
+
+        on = _parse_date(request.query_params.get("date")) or timezone.localdate()
+        branch_id = self._attendance_branch_id()
+
+        roster_ids = attendance_services.roster_patient_ids(kind=kind, branch_id=branch_id)
+        queryset = self.get_queryset().filter(id__in=roster_ids).order_by("name")
+
+        search = request.query_params.get("search", "").strip()
+        if search:
+            queryset = queryset.filter(self._search_filter(search))
+
+        # Assembled whole, then filtered, then paged — not paged first.
+        # Both flags are derived rather than stored (one from the day's marks,
+        # one from the gap clock), so filtering after a database page would
+        # return a short page while matching patients sat on later pages, and
+        # report a count for the unfiltered set. Same reasoning and same shape
+        # as `collect_due_items`. Assembly is a fixed number of queries
+        # whatever the roster size, so this costs rows in memory, not queries.
+        rows = attendance_services.build_roster(
+            patients=list(queryset), kind=kind, on=on, branch_id=branch_id
+        )
+
+        if request.query_params.get("unmarked") in {"1", "true", "True"}:
+            rows = [row for row in rows if row["record"] is None]
+        if request.query_params.get("alerts") in {"1", "true", "True"}:
+            rows = [row for row in rows if row["alert"]]
+
+        try:
+            page_number = max(1, int(request.query_params.get("page", 1)))
+            page_size = min(200, max(1, int(request.query_params.get("pageSize", 25))))
+        except ValueError:
+            page_number, page_size = 1, 25
+
+        start = (page_number - 1) * page_size
+        window = rows[start : start + page_size]
+
+        return Response(
+            {
+                "count": len(rows),
+                "next": str(page_number + 1) if start + page_size < len(rows) else None,
+                "previous": str(page_number - 1) if page_number > 1 else None,
+                "results": AttendanceRosterRowSerializer(window, many=True).data,
+            }
+        )
+
+    @extend_schema(request=MarkAttendanceSerializer, responses=PatientAttendanceSerializer)
+    @action(detail=True, methods=["post"], url_path="attendance")
+    def mark_attendance(self, request, pk=None):
+        """Mark one patient for one day — an upsert, so pressing twice is safe."""
+        patient = self.get_object()
+        serializer = MarkAttendanceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        record = attendance_services.mark(
+            actor=request.user,
+            patient=patient,
+            kind=data["serviceKind"],
+            status=data["status"],
+            on=data.get("date"),
+            note=data.get("note", ""),
+            expected_return_on=data.get("expectedReturnOn"),
+        )
+        return Response(PatientAttendanceSerializer(record).data)
+
+    @extend_schema(
+        parameters=[OpenApiParameter("days", int, description="How far back. Default 60.")],
+        responses=PatientAttendanceSerializer(many=True),
+    )
+    @action(detail=True, methods=["get"], url_path="attendance-history")
+    def attendance_history(self, request, pk=None):
+        try:
+            days = max(1, min(365, int(request.query_params.get("days", 60))))
+        except ValueError:
+            days = 60
+
+        records = self.get_object().attendance_records.order_by("-date")[:days]
+        return Response(PatientAttendanceSerializer(records, many=True).data)
+
+    def _attendance_branch_id(self):
+        """Manager: their own branch. Admin: optionally narrowed, else all."""
+        user = self.request.user
+        if user.is_manager:
+            return user.branch_id
+        return self.request.query_params.get("branch") or None
 
 
 def _parse_date(value):

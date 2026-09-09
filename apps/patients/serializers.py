@@ -13,7 +13,7 @@ from rest_framework import serializers
 
 from apps.common.validators import normalize_phone, validate_bd_phone
 from apps.patients.directory import overdue_status_by_patient
-from apps.patients.models import Patient, calculate_age
+from apps.patients.models import Patient, PatientAttendance, calculate_age
 
 GUARDIAN_FIELDS = ("guardian_name", "guardian_relation", "guardian_phone")
 
@@ -201,3 +201,54 @@ class PatientWriteSerializer(serializers.ModelSerializer):
 
     def validate_emergency_contact(self, value):
         return normalize_phone(value)
+
+
+class PatientAttendanceSerializer(serializers.ModelSerializer):
+    """One day's mark, read-only — writes go through the mark endpoint."""
+
+    patientId = serializers.CharField(source="patient_id", read_only=True)
+    branchId = serializers.CharField(source="branch_id", read_only=True)
+    serviceKind = serializers.CharField(source="service_kind", read_only=True)
+    expectedReturnOn = serializers.DateField(source="expected_return_on", read_only=True)
+    markedBy = serializers.CharField(source="marked_by.name", read_only=True, default="")
+    markedAt = serializers.DateTimeField(source="updated_at", read_only=True)
+
+    class Meta:
+        model = PatientAttendance
+        fields = [
+            "id", "patientId", "branchId", "serviceKind", "date", "status",
+            "note", "expectedReturnOn", "markedBy", "markedAt",
+        ]
+        read_only_fields = fields
+
+
+class MarkAttendanceSerializer(serializers.Serializer):
+    """
+    `expectedReturnOn` is only meaningful for an informed absence; the service
+    layer clears it for every other status rather than trusting the caller,
+    so a stale date can't go on silencing the alert.
+    """
+
+    serviceKind = serializers.ChoiceField(choices=PatientAttendance.ServiceKind.choices)
+    status = serializers.ChoiceField(choices=PatientAttendance.Status.choices)
+    date = serializers.DateField(required=False)
+    note = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    expectedReturnOn = serializers.DateField(required=False, allow_null=True)
+
+
+class AttendanceRosterRowSerializer(serializers.Serializer):
+    """One line of the day's sheet."""
+
+    patientId = serializers.CharField()
+    patientCode = serializers.CharField()
+    patientName = serializers.CharField()
+    patientPhone = serializers.CharField()
+    branchId = serializers.CharField()
+    # Every active service of the chosen kind: a patient holding two is
+    # marked once, and the row says which two that mark covers.
+    serviceNames = serializers.ListField(child=serializers.CharField())
+    record = PatientAttendanceSerializer(allow_null=True)
+    lastPresentOn = serializers.DateField(allow_null=True)
+    daysSinceLastVisit = serializers.IntegerField()
+    excusedUntil = serializers.DateField(allow_null=True)
+    alert = serializers.BooleanField()
