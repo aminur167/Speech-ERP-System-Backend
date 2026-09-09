@@ -101,7 +101,11 @@ class StaffMemberViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
                 {
                     "totalStaff": len(active),
                     "presentToday": today_records.filter(
-                        status__in=[StaffAttendance.Status.PRESENT, StaffAttendance.Status.LATE]
+                        status__in=[
+                            StaffAttendance.Status.PRESENT,
+                            StaffAttendance.Status.LATE,
+                            StaffAttendance.Status.EARLY_LEAVE,
+                        ]
                     ).count(),
                     "onLeaveToday": today_records.filter(
                         status__in=[StaffAttendance.Status.ON_LEAVE, StaffAttendance.Status.ABSENT]

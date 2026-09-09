@@ -131,35 +131,26 @@ class TestBranchIsolation:
 
 
 class TestAttendance:
-    def test_check_in_status_matches_the_real_clock(self, farhana):
-        """
-        The service reads the real clock, so assert on whatever "now" actually
-        produces rather than assuming a fixed hour — that keeps the test
-        honest without making it flaky depending on when it runs.
-        """
+    def test_check_in_is_always_present(self, farhana):
+        """Arrival time no longer affects status — only Present, Absent (no-show), and Early Leave are derived."""
         record = services.check_in(staff=farhana)
-        expected = (
-            StaffAttendance.Status.LATE
-            if timezone.now().hour >= services.LATE_AFTER_HOUR
-            else StaffAttendance.Status.PRESENT
-        )
-        assert record.status == expected
+        assert record.status == StaffAttendance.Status.PRESENT
         assert record.check_in_at is not None
 
-    def test_check_in_at_or_after_cutoff_is_derived_as_late(self):
+    def test_check_out_before_office_end_is_derived_as_early_leave(self):
         """Exercises the derivation function directly for a fixed, non-flaky time."""
-        late_time = timezone.make_aware(
+        early_checkout = timezone.make_aware(
             datetime.combine(date.today(), datetime.min.time())
-            + timedelta(hours=services.LATE_AFTER_HOUR + 1)
+            + timedelta(hours=services.OFFICE_END_HOUR - 1)
         )
-        assert services._today_status_for_check_in(late_time) == StaffAttendance.Status.LATE
+        assert services._status_for_check_out(early_checkout) == StaffAttendance.Status.EARLY_LEAVE
 
-    def test_check_in_before_cutoff_is_derived_as_present(self):
-        early_time = timezone.make_aware(
+    def test_check_out_at_or_after_office_end_is_derived_as_present(self):
+        on_time_checkout = timezone.make_aware(
             datetime.combine(date.today(), datetime.min.time())
-            + timedelta(hours=services.LATE_AFTER_HOUR - 1)
+            + timedelta(hours=services.OFFICE_END_HOUR + 1)
         )
-        assert services._today_status_for_check_in(early_time) == StaffAttendance.Status.PRESENT
+        assert services._status_for_check_out(on_time_checkout) == StaffAttendance.Status.PRESENT
 
     def test_check_in_is_idempotent_per_day(self, farhana):
         first = services.check_in(staff=farhana)
@@ -177,6 +168,24 @@ class TestAttendance:
         assert checked_out.id == checked_in.id
         assert checked_out.check_in_at == checked_in.check_in_at
         assert checked_out.check_out_at is not None
+
+    def test_check_out_before_office_end_sets_early_leave(self, farhana):
+        services.check_in(staff=farhana)
+        with mock.patch(
+            "apps.staff.services.timezone.now",
+            return_value=_at_hour(services.OFFICE_END_HOUR - 1),
+        ):
+            record = services.check_out(staff=farhana)
+        assert record.status == StaffAttendance.Status.EARLY_LEAVE
+
+    def test_check_out_at_office_end_or_later_stays_present(self, farhana):
+        services.check_in(staff=farhana)
+        with mock.patch(
+            "apps.staff.services.timezone.now",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            record = services.check_out(staff=farhana)
+        assert record.status == StaffAttendance.Status.PRESENT
 
     def test_mark_on_leave_clears_times(self, farhana):
         services.check_in(staff=farhana)
@@ -198,7 +207,7 @@ class TestAttendance:
         manager_client.post(reverse("staff:staffmember-check-in", args=[farhana.id]))
         body = manager_client.get(reverse("staff:staffmember-today-attendance")).json()
         assert str(farhana.id) in body
-        assert body[str(farhana.id)]["status"] in ("present", "late")
+        assert body[str(farhana.id)]["status"] == "present"
 
     def test_attendance_history_orders_newest_first(self, farhana):
         older = StaffAttendance.objects.create(
@@ -325,6 +334,15 @@ class TestSummary:
         body = other_manager_client.get(reverse("staff:staffmember-summary")).json()
         assert body["totalStaff"] == 0
 
+    def test_early_leave_still_counts_as_present_today(self, manager_client, farhana):
+        """Leaving early is still showing up — it shouldn't drop out of `presentToday`."""
+        StaffAttendance.objects.create(
+            staff=farhana, branch=farhana.branch, date=timezone.localdate(),
+            status=StaffAttendance.Status.EARLY_LEAVE,
+        )
+        body = manager_client.get(reverse("staff:staffmember-summary")).json()
+        assert body["presentToday"] == 1
+
 
 class TestMonthlyReport:
     def test_report_aggregates_salary_bonus_and_attendance(self, manager, farhana):
@@ -341,12 +359,17 @@ class TestMonthlyReport:
             staff=farhana, branch=farhana.branch, date=today.replace(day=3),
             status=StaffAttendance.Status.ON_LEAVE,
         )
+        StaffAttendance.objects.create(
+            staff=farhana, branch=farhana.branch, date=today.replace(day=4),
+            status=StaffAttendance.Status.EARLY_LEAVE,
+        )
         services.add_bonus(actor=manager, staff=farhana, amount=Decimal("1500.00"), reason="x")
 
         rows = services.monthly_report([farhana], year=today.year, month=today.month)
         row = rows[0]
         assert row["presentCount"] == 1
         assert row["lateCount"] == 1
+        assert row["earlyLeaveCount"] == 1
         assert row["leaveCount"] == 1
         assert row["absentCount"] == 0
         assert row["bonusTotal"] == Decimal("1500.00")

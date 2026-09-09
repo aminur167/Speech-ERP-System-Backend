@@ -150,5 +150,6 @@ class StaffMonthlyReportRowSerializer(serializers.Serializer):
     netPayable = serializers.DecimalField(max_digits=12, decimal_places=2)
     presentCount = serializers.IntegerField()
     lateCount = serializers.IntegerField()
+    earlyLeaveCount = serializers.IntegerField()
     absentCount = serializers.IntegerField()
     leaveCount = serializers.IntegerField()
