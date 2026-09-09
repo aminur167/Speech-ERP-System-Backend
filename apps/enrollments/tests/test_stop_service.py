@@ -35,15 +35,23 @@ def enrollment(manager, branch, patient_factory, monthly_service):
 
 @pytest.fixture
 def owing_two_months(enrollment):
-    """Two months that have actually fallen due, plus the usual lookahead."""
-    start = services.add_months(timezone.localdate().replace(day=1), -1)
-    for offset, bill in enumerate(enrollment.bills.order_by("month")):
-        month_date = services.add_months(start, offset)
-        bill.month = services.month_key(month_date)
-        bill.label = services.month_label(month_date)
-        bill.due_date = due_date_for_month(bill.month)
-        bill.status = BillStatus.DUE if offset < 2 else BillStatus.UPCOMING
-        bill.save()
+    """
+    Two months that have actually fallen due.
+
+    An enrollment now opens with the current month alone, so the arrears are
+    built the way a real one arises: last month's bill goes unpaid, and the
+    billing job raises this month's on top of it.
+    """
+    bill = enrollment.bills.get()
+    previous = services.add_months(timezone.localdate().replace(day=1), -1)
+    bill.month = services.month_key(previous)
+    bill.label = services.month_label(previous)
+    bill.due_date = due_date_for_month(bill.month)
+    bill.status = BillStatus.DUE
+    bill.save()
+
+    services.generate_due_bills()
+    enrollment.refresh_from_db()
     return enrollment
 
 
@@ -67,8 +75,9 @@ class TestPreview:
 
         assert len(body["owed"]) == 2
         assert Decimal(body["owedTotal"]) == Decimal("10000.00")
-        # The third bill is a lookahead nobody was ever asked to pay.
-        assert len(body["droppedMonths"]) == 1
+        # Nothing to drop any more: future months are not created until they
+        # arrive, so the manager is never asked about one.
+        assert body["droppedMonths"] == []
         assert body["prepaid"] == []
 
 
@@ -96,7 +105,7 @@ class TestStopping:
         bills[0].refresh_from_db()
         bills[1].refresh_from_db()
         assert bills[0].status == BillStatus.DUE
-        assert bills[1].status == BillStatus.WRITTEN_OFF
+        assert bills[1].status == BillStatus.CANCELLED
 
     def test_the_waived_month_and_its_reason_reach_the_audit_log(
         self, manager_client, owing_two_months
@@ -125,6 +134,10 @@ class TestStopping:
         assert Decimal(entry.changes["writtenOff"]) == Decimal("5000.00")
         assert entry.changes["months"][0]["reason"] == "Family could not pay"
         assert entry.changes["months"][0]["label"] == bills[1].label
+        # The per-month figure, not just the total. Read after the status
+        # changed it would be 0.00 for every row — a breakdown naming the
+        # months correctly and saying each cost nothing.
+        assert Decimal(entry.changes["months"][0]["amount"]) == Decimal("5000.00")
 
     def test_the_kept_total_is_recorded_too(self, manager_client, owing_two_months):
         """A partial write-off has to be as legible as a wholesale one."""
@@ -231,9 +244,11 @@ class TestStopping:
         self, manager_client, manager, owing_two_months
     ):
         """
-        The note's rule: come back, clear the due, then the service runs again.
-        Kept months land on the Terminated Services screen and are collected
-        by the existing resume flow — no new machinery.
+        The rule: come back, clear the due, *then* the service runs again —
+        in that order. A kept month is still collectable on Due Payments even
+        though the service is inactive, and reactivating is refused until it
+        is paid. Waiving it a second time at resume is no longer offered:
+        that would undo the decision the reason requirement exists to record.
         """
         bills = two_owed(owing_two_months)
         manager_client.post(
@@ -248,15 +263,25 @@ class TestStopping:
         )
         owing_two_months.refresh_from_db()
 
-        listed = manager_client.get(
-            reverse("enrollments:monthly-enrollment-terminated")
-        ).json()["results"][0]
-        assert Decimal(listed["previousDue"]) == Decimal("5000.00")
+        assert owing_two_months.outstanding_total() == Decimal("5000.00")
 
-        _, payments = services.resume_monthly_service(
-            actor=manager, enrollment=owing_two_months, carry_due=True, method="cash"
+        # Reactivation is refused while it is owed...
+        with pytest.raises(services.EnrollmentError) as exc:
+            services.resume_monthly_service(
+                actor=manager, enrollment=owing_two_months
+            )
+        assert exc.value.code == "outstanding_dues"
+
+        # ...and allowed once the kept month is collected, which an inactive
+        # service still permits.
+        kept = owing_two_months.oldest_unpaid_bill()
+        services.collect_bill_payment(
+            actor=manager, branch=owing_two_months.branch, bill=kept, method="cash"
         )
-        assert [payment.amount for payment in payments] == [Decimal("5000.00")]
+        resumed = services.resume_monthly_service(
+            actor=manager, enrollment=owing_two_months
+        )
+        assert resumed.status == EnrollmentStatus.ACTIVE
 
     def test_stopping_a_service_that_is_not_running_is_refused(
         self, manager_client, manager, owing_two_months

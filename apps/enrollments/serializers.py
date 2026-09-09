@@ -234,20 +234,6 @@ class TerminatedMonthlyServiceSerializer(serializers.ModelSerializer):
         return [bill.label for bill in enrollment.unpaid_bills()]
 
 
-class ResumeMonthlyServiceSerializer(serializers.Serializer):
-    """
-    `carryDue` picks between the two ways to resume: settle the previous due
-    now, or waive it and start clean. `method` is only meaningful for the
-    first, and the service layer refuses that one without it rather than
-    silently taking money by an unnamed method.
-    """
-
-    carryDue = serializers.BooleanField()
-    method = serializers.ChoiceField(
-        choices=PaymentMethod.choices, required=False, allow_blank=True
-    )
-
-
 class StopDecisionSerializer(serializers.Serializer):
     """
     One month's fate. A waive carries its own reason — the record exists so
@@ -285,24 +271,65 @@ class StopPreviewSerializer(serializers.Serializer):
     droppedMonths = serializers.ListField(child=serializers.CharField())
 
 
-class AdvanceMonthSerializer(serializers.Serializer):
+class OutstandingDueItemSerializer(serializers.Serializer):
+    type = serializers.CharField()
+    refId = serializers.CharField()
+    itemId = serializers.CharField()
+    serviceName = serializers.CharField()
+    month = serializers.CharField(allow_blank=True)
+    label = serializers.CharField()
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    # False for a due kept when the service was made inactive — still owed,
+    # and still what blocks the patient from enrolling or reactivating.
+    serviceActive = serializers.BooleanField()
+
+
+class OutstandingDuesSerializer(serializers.Serializer):
+    items = OutstandingDueItemSerializer(many=True)
+    total = serializers.DecimalField(max_digits=14, decimal_places=2)
+
+
+class AdvanceMonthOptionSerializer(serializers.Serializer):
     month = serializers.CharField()
     label = serializers.CharField()
     amount = serializers.DecimalField(max_digits=12, decimal_places=2)
-    # Arrears are called out separately: asking to "pay through December"
-    # and being charged for an unpaid September as well must not be a
-    # surprise discovered after the money is taken.
-    isArrears = serializers.BooleanField()
+    # Already settled — shown, but not tickable. "December is already paid"
+    # is the answer the manager came for; hiding the row does not give it.
+    covered = serializers.BooleanField()
+    status = serializers.CharField(allow_blank=True)
+
+
+class AdvanceOptionsSerializer(serializers.Serializer):
+    months = AdvanceMonthOptionSerializer(many=True)
+    fee = serializers.DecimalField(max_digits=12, decimal_places=2)
+    # Why Confirm may be disabled: nothing can be paid ahead while anything
+    # is still owed.
+    outstandingTotal = serializers.DecimalField(max_digits=14, decimal_places=2)
+    outstandingItems = OutstandingDueItemSerializer(many=True)
+
+
+class AdvancePreviewMonthSerializer(serializers.Serializer):
+    month = serializers.CharField()
+    label = serializers.CharField()
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
 
 
 class AdvancePreviewSerializer(serializers.Serializer):
-    months = AdvanceMonthSerializer(many=True)
+    months = AdvancePreviewMonthSerializer(many=True)
     total = serializers.DecimalField(max_digits=14, decimal_places=2)
-    arrearsTotal = serializers.DecimalField(max_digits=14, decimal_places=2)
-    monthsAhead = serializers.IntegerField()
 
 
 class CollectAdvanceSerializer(serializers.Serializer):
-    throughMonth = serializers.CharField(max_length=7)
+    """
+    The months ticked on the Advance Payment screen, each named explicitly.
+
+    A list rather than a "pay through" month: October and December with
+    November deliberately left alone is a real choice, and a range cannot
+    express it.
+    """
+
+    months = serializers.ListField(
+        child=serializers.CharField(max_length=7), allow_empty=False, max_length=36
+    )
     method = serializers.ChoiceField(choices=PaymentMethod.choices)
     idempotencyKey = serializers.CharField(required=False, allow_blank=True, max_length=64)

@@ -26,9 +26,10 @@ from apps.branches.models import Branch
 from apps.common.mixins import BranchScopedQuerySetMixin
 from apps.common.permissions import IsManager
 from apps.common.validators import normalize_phone
-from apps.enrollments.models import EnrollmentStatus
+from apps.enrollments import services as enrollment_services
 from apps.enrollments.serializers import (
     InstallmentPlanSerializer,
+    OutstandingDuesSerializer,
     MonthlyEnrollmentSerializer,
 )
 from apps.patients import attendance as attendance_services
@@ -141,11 +142,17 @@ class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], url_path="active-services")
     def active_services(self, request, pk=None):
         """
-        Every active service the patient holds, newest first.
+        Every service the patient holds, active and inactive, newest first.
 
         A list rather than one-of-each: a patient can be in monthly therapy
         and paying off an installment package at the same time, and the
         profile screen has to show both.
+
+        Inactive ones are included so the profile can offer Reactivate and
+        still show what was kept or cancelled. `isActive` says which is which
+        — the screen groups them, rather than this endpoint deciding for it.
+        Making a service inactive is a decision about that service alone, so
+        the patient's other services keep appearing here untouched.
         """
         patient = self.get_object()
 
@@ -155,26 +162,43 @@ class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
                 "id": str(enrollment.id),
                 "serviceName": enrollment.service.name,
                 "createdAt": enrollment.created_at,
+                "isActive": enrollment.is_active,
                 "enrollment": MonthlyEnrollmentSerializer(enrollment).data,
             }
-            for enrollment in patient.monthly_enrollments.filter(
-                status=EnrollmentStatus.ACTIVE
-            ).select_related("service").prefetch_related("bills")
+            for enrollment in patient.monthly_enrollments.select_related(
+                "service"
+            ).prefetch_related("bills")
         ] + [
             {
                 "type": "installment",
                 "id": str(plan.id),
                 "serviceName": plan.service.name,
                 "createdAt": plan.created_at,
+                "isActive": plan.is_active,
                 "plan": InstallmentPlanSerializer(plan).data,
             }
-            for plan in patient.installment_plans.filter(
-                status=EnrollmentStatus.ACTIVE
-            ).select_related("service").prefetch_related("installments")
+            for plan in patient.installment_plans.select_related(
+                "service"
+            ).prefetch_related("installments")
         ]
 
         items.sort(key=lambda item: item["createdAt"], reverse=True)
         return Response(items)
+
+    @extend_schema(responses=OutstandingDuesSerializer)
+    @action(detail=True, methods=["get"], url_path="outstanding-dues")
+    def outstanding_dues(self, request, pk=None):
+        """
+        Everything the patient still owes, across every service.
+
+        The screen calls this before offering a new enrollment or a
+        reactivation, so it can say which months and how much rather than
+        waiting to be refused. The refusal itself lives in the service layer —
+        this endpoint is the explanation, never the enforcement.
+        """
+        return Response(
+            enrollment_services.patient_outstanding_dues(self.get_object())
+        )
 
     def create(self, request, *args, **kwargs):
         serializer = PatientWriteSerializer(data=request.data)

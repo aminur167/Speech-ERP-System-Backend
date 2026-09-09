@@ -101,7 +101,7 @@ class TestRoster:
 
     def test_two_monthly_services_are_one_row_naming_both(
         self, manager_client, manager, branch, monthly_patient, service_factory
-    ):
+    , settle_dues):
         """
         The patient came in or they didn't — asking twice would be asking the
         same question twice. But the row has to say what the one mark covers.
@@ -109,6 +109,9 @@ class TestRoster:
         second = service_factory(
             name="Group Therapy", code="ATT-M2", category=Service.Category.MONTHLY
         )
+        # The first service's month has to be settled before a second one can
+        # be started — a patient with an unpaid due cannot enroll again.
+        settle_dues(monthly_patient)
         enrollment_services.create_monthly_enrollment(
             actor=manager, branch=branch, patient=monthly_patient, service=second
         )
@@ -172,11 +175,12 @@ class TestMarking:
 
     def test_the_two_sheets_are_marked_independently(
         self, manager_client, manager, branch, monthly_patient, installment_service
-    ):
+    , settle_dues):
         """
         The same person can be in monthly therapy and paying off a package;
         each is its own attendance question, so each gets its own row.
         """
+        settle_dues(monthly_patient)
         enrollment_services.create_installment_plan(
             actor=manager, branch=branch, patient=monthly_patient,
             service=installment_service, number_of_installments=3,
@@ -402,8 +406,9 @@ class TestStoppedComingAlert:
 
     def test_attendance_on_the_other_sheet_does_not_reset_this_clock(
         self, manager_client, manager, branch, monthly_patient, installment_service, settings
-    ):
+    , settle_dues):
         """Coming in for the package doesn't mean they showed up for therapy."""
+        settle_dues(monthly_patient)
         enrollment_services.create_installment_plan(
             actor=manager, branch=branch, patient=monthly_patient,
             service=installment_service, number_of_installments=3,

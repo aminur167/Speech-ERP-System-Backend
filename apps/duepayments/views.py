@@ -89,12 +89,18 @@ class DuePaymentListView(APIView):
 
         search = request.query_params.get("search", "").strip().lower()
         if search:
+            # One box, four things a manager might have in front of them: the
+            # patient's name, the code on their card, the service, or a
+            # service id copied from another screen. Ids match exactly —
+            # a substring match on a numeric id turns "1" into a wildcard.
             items = [
                 i
                 for i in items
                 if search in i["patientName"].lower()
                 or search in i["patientCode"].lower()
                 or search in i["serviceName"].lower()
+                or search == i["serviceId"].lower()
+                or search == i["patientId"].lower()
             ]
 
         # Paginated in Python: these rows are assembled across two tables and

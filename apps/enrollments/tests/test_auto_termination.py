@@ -113,7 +113,10 @@ class TestAutomaticTermination:
         services.collect_bill_payment(
             actor=manager, branch=branch, bill=paid, method="cash"
         )
-        # Now let the *next* month lapse instead.
+        # Let the next month arrive, then let *it* lapse instead.
+        services.generate_due_bills(
+            up_to=services.add_months(timezone.localdate(), 1)
+        )
         second = months_of(enrollment)[1]
         year, month = (int(part) for part in second.split("-"))
         services.terminate_unpaid_monthly_services(
@@ -124,11 +127,11 @@ class TestAutomaticTermination:
         assert paid.status == BillStatus.PAID
         assert paid.payment is not None
 
-    def test_the_unbilled_lookahead_is_dropped(self, enrollment):
+    def test_no_month_beyond_the_one_that_ended_it_is_left_behind(self, enrollment):
         """
-        The months after the one that ended it were never payable and never
-        will be. Left behind they would be charged as "previous due" for
-        service nobody delivered.
+        There is nothing to drop any more — future months are not created
+        until they arrive — so the enrollment must end owning exactly the
+        month that stopped it, and no invented one.
         """
         services.terminate_unpaid_monthly_services(on=next_month_day(enrollment))
 
@@ -183,18 +186,25 @@ def lapse(enrollment, *, months_back: int = 2, due_months: int = 2):
     Each bill gets its own month rather than a shared one: (enrollment,
     month) is unique, and stacking them would fail on the constraint instead
     of producing the history being described.
+
+    The bills are written out rather than reshaped from a lookahead, because
+    there is no lookahead any more — an enrollment opens with one month, and
+    the rest arrive as time passes.
     """
     start = services.add_months(timezone.localdate().replace(day=1), -months_back)
 
-    for offset, bill in enumerate(enrollment.bills.order_by("month")):
+    enrollment.bills.all().delete()
+    for offset in range(due_months):
         month_date = services.add_months(start, offset)
-        bill.month = services.month_key(month_date)
-        bill.label = services.month_label(month_date)
-        bill.due_date = due_date_for_month(bill.month)
-        # The past months genuinely fell due; anything from today on is still
-        # a lookahead placeholder.
-        bill.status = BillStatus.DUE if offset < due_months else BillStatus.UPCOMING
-        bill.save()
+        key = services.month_key(month_date)
+        MonthlyBill.objects.create(
+            enrollment=enrollment,
+            month=key,
+            label=services.month_label(month_date),
+            amount=enrollment.service.fee,
+            due_date=due_date_for_month(key),
+            status=BillStatus.DUE,
+        )
 
     services.terminate_unpaid_monthly_services()
     enrollment.refresh_from_db()
@@ -208,132 +218,128 @@ def lapsed(enrollment):
 
 
 @pytest.mark.money
-class TestResume:
+class TestReactivating:
+    """
+    Coming back means clearing the debt first, then the service runs again —
+    in that order.
+
+    The old resume offered a second choice at this moment: settle the arrears,
+    or waive them. Waiving is gone. A due that survived an explicit keep
+    decision could otherwise be forgiven later with no fresh justification,
+    quietly undoing the reason the keep-or-cancel choice exists. The debt is
+    collected on Due Payments, and reactivation is refused until it is.
+    """
+
     def test_the_two_lapsed_months_are_what_is_owed(self, lapsed):
         assert lapsed.status == EnrollmentStatus.TERMINATED
         assert lapsed.unpaid_bills().count() == 2
         assert lapsed.outstanding_total() == Decimal("10000.00")
 
-    def test_resuming_with_the_due_collects_every_unpaid_month(self, manager, lapsed):
-        enrollment, payments = services.resume_monthly_service(
-            actor=manager, enrollment=lapsed, carry_due=True, method="cash"
+    def test_reactivating_is_refused_while_anything_is_owed(self, manager, lapsed):
+        with pytest.raises(services.EnrollmentError) as caught:
+            services.resume_monthly_service(actor=manager, enrollment=lapsed)
+
+        assert caught.value.code == "outstanding_dues"
+        lapsed.refresh_from_db()
+        assert lapsed.status == EnrollmentStatus.TERMINATED
+
+    def test_the_refusal_names_the_months_and_the_total(self, manager, lapsed):
+        """The manager has to be able to say what has to be paid, not just that."""
+        with pytest.raises(services.EnrollmentError) as caught:
+            services.resume_monthly_service(actor=manager, enrollment=lapsed)
+
+        assert caught.value.extra["total"] == "10000.00"
+        assert len(caught.value.extra["items"]) == 2
+
+    def test_a_due_on_another_service_blocks_it_too(
+        self, manager, branch, lapsed, service_factory, settle_dues
+    ):
+        """
+        The gate is the patient's whole balance, not this service's. Otherwise
+        a patient walks away from one debt and reactivates around it.
+        """
+        settle_dues(lapsed.patient)
+        other = services.create_monthly_enrollment(
+            actor=manager, branch=branch, patient=lapsed.patient,
+            service=service_factory(name="Group Therapy", code="MON-AT2"),
         )
+        assert other.outstanding_total() > 0
 
-        assert enrollment.status == EnrollmentStatus.ACTIVE
-        # Two months owed, two receipts, each naming its own month —
-        # collapsing them into one undated payment would lose which cycle was
-        # settled.
-        assert len(payments) == 2
-        assert sum(payment.amount for payment in payments) == Decimal("10000.00")
-        assert not enrollment.bills.filter(status=BillStatus.WRITTEN_OFF).exists()
+        with pytest.raises(services.EnrollmentError) as caught:
+            services.resume_monthly_service(actor=manager, enrollment=lapsed)
+        assert caught.value.code == "outstanding_dues"
 
-    def test_resuming_without_the_due_writes_it_off_explicitly(self, manager, lapsed):
-        """Waived, never quietly dropped — the same WRITTEN_OFF an admin sees."""
-        enrollment, payments = services.resume_monthly_service(
-            actor=manager, enrollment=lapsed, carry_due=False
-        )
+    def test_clearing_the_arrears_allows_it(self, manager, lapsed, settle_dues):
+        settle_dues(lapsed.patient)
 
-        assert payments == []
-        assert enrollment.status == EnrollmentStatus.ACTIVE
-        assert enrollment.bills.filter(status=BillStatus.WRITTEN_OFF).count() == 2
+        resumed = services.resume_monthly_service(actor=manager, enrollment=lapsed)
 
-    def test_the_waived_amount_is_recorded_in_the_audit_log(self, manager, lapsed):
-        from apps.common.models import AuditLog
+        assert resumed.status == EnrollmentStatus.ACTIVE
 
-        services.resume_monthly_service(
-            actor=manager, enrollment=lapsed, carry_due=False
-        )
+    def test_the_new_cycle_starts_at_the_current_month(
+        self, manager, lapsed, settle_dues
+    ):
+        settle_dues(lapsed.patient)
+        resumed = services.resume_monthly_service(actor=manager, enrollment=lapsed)
 
-        entry = AuditLog.objects.filter(
-            target_type="MonthlyEnrollment", action=AuditLog.Action.WRITE_OFF
-        ).latest("created_at")
-        assert entry.changes["writtenOff"] == "10000.00"
-
-    def test_the_new_cycle_starts_at_the_current_month(self, manager, lapsed):
-        enrollment, _ = services.resume_monthly_service(
-            actor=manager, enrollment=lapsed, carry_due=False
-        )
-
-        payable = enrollment.oldest_unpaid_bill()
+        payable = resumed.oldest_unpaid_bill()
         assert payable is not None
         assert payable.month == services.month_key(timezone.localdate())
+        assert payable.outstanding == Decimal("5000.00")
 
     def test_the_arrears_are_not_re_billed_as_part_of_the_new_cycle(
-        self, manager, lapsed
+        self, manager, lapsed, settle_dues
     ):
         """
         Settling the arrears must not leave them looking payable again — the
         previous due and the new cycle stay separate sums.
         """
-        enrollment, _ = services.resume_monthly_service(
-            actor=manager, enrollment=lapsed, carry_due=True, method="cash"
-        )
+        settle_dues(lapsed.patient)
+        resumed = services.resume_monthly_service(actor=manager, enrollment=lapsed)
 
         current = services.month_key(timezone.localdate())
-        payable = enrollment.oldest_unpaid_bill()
+        assert not resumed.unpaid_bills().filter(month__lt=current).exists()
 
-        # Nothing before the new cycle is owed any more, and what is payable
-        # is one month's fee — not the arrears coming back around.
-        assert not enrollment.unpaid_bills().filter(month__lt=current).exists()
-        assert payable.month == current
-        assert payable.outstanding == Decimal("5000.00")
-
-    def test_the_gap_month_is_never_billed(self, manager, enrollment):
+    def test_the_gap_month_is_never_billed(self, manager, enrollment, settle_dues):
         """
-        Stopped after one lapsed month, resumed later: the months in between
-        had no service and must not appear as bills.
+        Stopped after one lapsed month, reactivated later: the months in
+        between had no service and must not appear as bills.
         """
         today = timezone.localdate()
         start = services.add_months(today.replace(day=1), -3)
         lapse(enrollment, months_back=3, due_months=1)
+        settle_dues(enrollment.patient)
 
-        resumed, _ = services.resume_monthly_service(
-            actor=manager, enrollment=enrollment, carry_due=False
-        )
+        resumed = services.resume_monthly_service(actor=manager, enrollment=enrollment)
 
         lapsed_month = services.month_key(start)
         current = services.month_key(today)
         gap = [m for m in months_of(resumed) if lapsed_month < m < current]
         assert gap == []
 
-    def test_resuming_twice_is_refused(self, manager, lapsed):
-        services.resume_monthly_service(actor=manager, enrollment=lapsed, carry_due=False)
+    def test_reactivating_twice_is_refused(self, manager, lapsed, settle_dues):
+        settle_dues(lapsed.patient)
+        services.resume_monthly_service(actor=manager, enrollment=lapsed)
         lapsed.refresh_from_db()
 
         with pytest.raises(services.EnrollmentError) as caught:
-            services.resume_monthly_service(
-                actor=manager, enrollment=lapsed, carry_due=False
-            )
+            services.resume_monthly_service(actor=manager, enrollment=lapsed)
 
         assert caught.value.code == "not_terminated"
 
-    def test_a_manually_stopped_service_resumes_with_nothing_to_collect(
-        self, manager, enrollment
-    ):
-        """Stopping it by hand already forgave the debt, so resuming is free."""
-        services.terminate(actor=manager, container=enrollment)
-        enrollment.refresh_from_db()
-
-        resumed, payments = services.resume_monthly_service(
-            actor=manager, enrollment=enrollment, carry_due=True, method="cash"
-        )
-
-        assert resumed.status == EnrollmentStatus.ACTIVE
-        assert payments == []
-
-    def test_a_manually_stopped_service_is_billable_again_once_resumed(
+    def test_a_manually_stopped_service_is_billable_again_once_reactivated(
         self, manager, enrollment
     ):
         """
-        The trap: stopping by hand writes off the lookahead months too, so a
-        naive resume finds those rows already there and creates nothing —
+        The trap: stopping by hand forgives the current month's bill, so a
+        naive reactivation finds that row already there and creates nothing —
         leaving the service active and quietly never invoicing again.
         """
         services.terminate(actor=manager, container=enrollment)
         enrollment.refresh_from_db()
 
-        resumed, _ = services.resume_monthly_service(
-            actor=manager, enrollment=enrollment, carry_due=False
+        resumed = services.resume_monthly_service(
+            actor=manager, enrollment=enrollment
         )
 
         payable = resumed.oldest_unpaid_bill()
@@ -341,22 +347,20 @@ class TestResume:
         assert payable.month == services.month_key(timezone.localdate())
         assert payable.outstanding == Decimal("5000.00")
 
-    def test_reopening_a_written_off_month_is_recorded(self, manager, enrollment):
+    def test_reopening_a_forgiven_month_is_recorded(self, manager, enrollment):
         """A write-off being undone is never allowed to be silent."""
         from apps.common.models import AuditLog
 
         services.terminate(actor=manager, container=enrollment)
         enrollment.refresh_from_db()
-        services.resume_monthly_service(
-            actor=manager, enrollment=enrollment, carry_due=False
-        )
+        services.resume_monthly_service(actor=manager, enrollment=enrollment)
 
         entry = AuditLog.objects.filter(
             target_type="MonthlyEnrollment", action=AuditLog.Action.UPDATE
         ).latest("created_at")
         assert entry.changes["reinstatedMonths"]
 
-    def test_an_already_paid_month_is_not_billed_twice_on_resume(
+    def test_an_already_paid_month_is_not_billed_twice_on_reactivation(
         self, manager, branch, enrollment
     ):
         """Reinstating must never reach a month the patient already settled."""
@@ -367,42 +371,11 @@ class TestResume:
         services.terminate(actor=manager, container=enrollment)
         enrollment.refresh_from_db()
 
-        services.resume_monthly_service(
-            actor=manager, enrollment=enrollment, carry_due=False
-        )
+        services.resume_monthly_service(actor=manager, enrollment=enrollment)
 
         paid.refresh_from_db()
         assert paid.status == BillStatus.PAID
         assert paid.outstanding == Decimal("0.00")
-
-    def test_settling_the_due_needs_a_payment_method(self, manager, lapsed):
-        with pytest.raises(services.EnrollmentError) as caught:
-            services.resume_monthly_service(
-                actor=manager, enrollment=lapsed, carry_due=True
-            )
-
-        assert caught.value.code == "method_required"
-
-    def test_a_failed_collection_leaves_the_service_terminated(
-        self, manager, lapsed, monkeypatch
-    ):
-        """
-        Never active with the arrears still unpaid: the whole resume is one
-        transaction, so a collection that blows up takes the reopening with it.
-        """
-        def boom(*args, **kwargs):
-            raise RuntimeError("gateway down")
-
-        monkeypatch.setattr(services, "collect_bill_payment", boom)
-
-        with pytest.raises(RuntimeError):
-            services.resume_monthly_service(
-                actor=manager, enrollment=lapsed, carry_due=True, method="cash"
-            )
-
-        lapsed.refresh_from_db()
-        assert lapsed.status == EnrollmentStatus.TERMINATED
-        assert lapsed.outstanding_total() == Decimal("10000.00")
 
 
 TERMINATED_URL = reverse("enrollments:monthly-enrollment-terminated")
@@ -534,43 +507,51 @@ class TestTerminatedBranchIsolation:
 
 @pytest.mark.money
 class TestResumeEndpoint:
-    def test_resuming_with_the_due_returns_the_receipts_it_took(
+    def test_reactivating_is_refused_while_anything_is_owed(
         self, manager_client, lapsed
     ):
-        response = manager_client.post(
-            resume_url(lapsed), {"carryDue": True, "method": "cash"}
-        )
-        body = response.json()
-
-        assert response.status_code == 200
-        assert body["enrollment"]["status"] == EnrollmentStatus.ACTIVE
-        assert len(body["payments"]) == 2
-        assert all(payment["receiptNumber"] for payment in body["payments"])
-
-    def test_resuming_without_the_due_takes_no_money(self, manager_client, lapsed):
-        body = manager_client.post(resume_url(lapsed), {"carryDue": False}).json()
-
-        assert body["enrollment"]["status"] == EnrollmentStatus.ACTIVE
-        assert body["payments"] == []
-
-    def test_settling_without_a_method_is_refused_with_a_readable_reason(
-        self, manager_client, lapsed
-    ):
-        response = manager_client.post(resume_url(lapsed), {"carryDue": True})
+        response = manager_client.post(resume_url(lapsed), {})
 
         assert response.status_code == 400
-        assert response.json()["code"] == "method_required"
+        body = response.json()
+        assert body["code"] == "outstanding_dues"
+        assert body["total"] == "10000.00"
 
-    def test_a_resumed_service_leaves_the_terminated_list(self, manager_client, lapsed):
-        manager_client.post(resume_url(lapsed), {"carryDue": False})
+    def test_reactivating_succeeds_once_the_due_is_cleared(
+        self, manager_client, lapsed, settle_dues
+    ):
+        settle_dues(lapsed.patient)
+
+        response = manager_client.post(resume_url(lapsed), {})
+
+        assert response.status_code == 200
+        assert response.json()["status"] == EnrollmentStatus.ACTIVE
+
+    def test_a_kept_due_on_an_inactive_service_is_listed_on_due_payments(
+        self, manager_client, lapsed
+    ):
+        """
+        The only route back runs through this screen, so the debt has to be
+        reachable from it even though the service is no longer running.
+        """
+        results = manager_client.get(reverse("duepayments:due-list")).json()["results"]
+
+        assert [row["serviceActive"] for row in results] == [False]
+
+    def test_a_reactivated_service_leaves_the_terminated_list(
+        self, manager_client, lapsed, settle_dues
+    ):
+        settle_dues(lapsed.patient)
+        manager_client.post(resume_url(lapsed), {})
 
         assert manager_client.get(TERMINATED_URL).json()["count"] == 0
 
-    def test_a_resumed_service_is_collectable_again_from_due_payments(
-        self, manager_client, lapsed
+    def test_a_reactivated_service_is_collectable_again_from_due_payments(
+        self, manager_client, lapsed, settle_dues
     ):
-        """The point of resuming: the patient shows up on the Due page again."""
-        manager_client.post(resume_url(lapsed), {"carryDue": False})
+        """The point of reactivating: the patient shows up on the Due page again."""
+        settle_dues(lapsed.patient)
+        manager_client.post(resume_url(lapsed), {})
 
         results = manager_client.get(reverse("duepayments:due-list")).json()["results"]
 
@@ -589,6 +570,6 @@ class TestResumeEndpoint:
         assert body["count"] == 1
         assert body["results"][0]["patientName"] == lapsed.patient.name
 
-    def test_admin_cannot_resume(self, admin_client, lapsed):
+    def test_admin_cannot_reactivate(self, admin_client, lapsed):
         """Restarting a service is a branch-desk action, like collecting."""
-        assert admin_client.post(resume_url(lapsed), {"carryDue": False}).status_code == 403
+        assert admin_client.post(resume_url(lapsed), {}).status_code == 403

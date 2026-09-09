@@ -26,6 +26,7 @@ from apps.enrollments.models import (
     MonthlyEnrollment,
 )
 from apps.enrollments.serializers import (
+    AdvanceOptionsSerializer,
     AdvancePreviewSerializer,
     BookingCreateSerializer,
     CollectAdvanceSerializer,
@@ -36,7 +37,6 @@ from apps.enrollments.serializers import (
     InstallmentPlanSerializer,
     MonthlyEnrollmentCreateSerializer,
     MonthlyEnrollmentSerializer,
-    ResumeMonthlyServiceSerializer,
     StopMonthlyServiceSerializer,
     StopPreviewSerializer,
     TerminatedMonthlyServiceSerializer,
@@ -61,7 +61,10 @@ class _EnrollmentBase(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
 
     # Reads, as opposed to the branch-desk actions below them. Admin can see
     # everything; only a Manager transacts on a branch's behalf.
-    READ_ACTIONS = {"list", "retrieve", "terminated", "stop_preview", "advance_preview"}
+    READ_ACTIONS = {
+        "list", "retrieve", "terminated", "stop_preview", "advance_preview",
+        "advance_options",
+    }
 
     def get_permissions(self):
         if self.action in self.READ_ACTIONS:
@@ -110,9 +113,16 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        enrollment = services.create_monthly_enrollment(
-            actor=request.user, branch=branch, patient=patient, service=service
-        )
+        try:
+            enrollment = services.create_monthly_enrollment(
+                actor=request.user, branch=branch, patient=patient, service=service
+            )
+        except services.EnrollmentError as exc:
+            # Chiefly the outstanding-due gate. Enforced in the service layer,
+            # so calling this endpoint directly with the screen bypassed is
+            # refused on exactly the same terms as the button.
+            return _error(exc)
+
         return Response(
             MonthlyEnrollmentSerializer(enrollment).data, status=status.HTTP_201_CREATED
         )
@@ -232,28 +242,44 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
         parameters=[OpenApiParameter("through", str, description='Month as "YYYY-MM".')],
         responses=AdvancePreviewSerializer,
     )
+    @extend_schema(responses=AdvanceOptionsSerializer)
+    @action(detail=True, methods=["get"], url_path="advance-options")
+    def advance_options(self, request, pk=None):
+        """The future months that may be ticked, and what blocks ticking them."""
+        return Response(services.advance_month_options(self.get_object()))
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                "months", str,
+                description='Comma-separated months as "YYYY-MM,YYYY-MM".',
+            )
+        ],
+        responses=AdvancePreviewSerializer,
+    )
     @action(detail=True, methods=["get"], url_path="advance-preview")
     def advance_preview(self, request, pk=None):
-        """What paying through a month would cost, arrears named separately."""
-        through = request.query_params.get("through", "")
+        """What the ticked months would cost, before anyone commits to it."""
+        raw = request.query_params.get("months", "")
+        months = [part for part in (m.strip() for m in raw.split(",")) if part]
         try:
             return Response(
                 services.preview_monthly_advance(
-                    enrollment=self.get_object(), through_month=through
+                    enrollment=self.get_object(), months=months
                 )
             )
-        except (ValueError, TypeError):
-            raise ValidationError({"through": ['Expected a month as "YYYY-MM".']}) from None
+        except services.EnrollmentError as exc:
+            return _error(exc)
 
     @extend_schema(request=CollectAdvanceSerializer)
-    @action(detail=True, methods=["post"], url_path="pay-through")
-    def pay_through(self, request, pk=None):
+    @action(detail=True, methods=["post"], url_path="pay-advance")
+    def pay_advance(self, request, pk=None):
         """
-        Collect from the oldest unpaid month through the one named.
+        Take payment for the months that were ticked.
 
         Returns one payment per month rather than a single lump: each month
-        keeps its own receipt, which is what makes an advance auditable
-        month by month.
+        keeps its own receipt, which is what makes an advance auditable month
+        by month.
         """
         enrollment = self.get_object()
         serializer = CollectAdvanceSerializer(data=request.data)
@@ -265,7 +291,7 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
                 actor=request.user,
                 branch=enrollment.branch,
                 enrollment=enrollment,
-                through_month=data["throughMonth"],
+                months=data["months"],
                 method=data["method"],
                 idempotency_key=data.get("idempotencyKey") or None,
             )
@@ -326,34 +352,27 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
             ).data
         )
 
-    @extend_schema(request=ResumeMonthlyServiceSerializer)
     @action(detail=True, methods=["post"])
     def resume(self, request, pk=None):
         """
-        Restart a service stopped for an unpaid due, with or without settling
-        the arrears first (`carryDue`).
-        """
-        enrollment = self.get_object()
-        serializer = ResumeMonthlyServiceSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        Reactivate an inactive service.
 
+        Refused while the patient owes anything — the manager clears it on the
+        Due Payments screen first. The refusal carries the months and the
+        total so the screen can say what has to be paid rather than only that
+        something does.
+        """
         try:
-            enrollment, payments = services.resume_monthly_service(
-                actor=request.user,
-                enrollment=enrollment,
-                carry_due=serializer.validated_data["carryDue"],
-                method=serializer.validated_data.get("method", ""),
+            enrollment = services.resume_monthly_service(
+                actor=request.user, enrollment=self.get_object()
             )
         except services.EnrollmentError as exc:
             return _error(exc)
 
         return Response(
-            {
-                "enrollment": MonthlyEnrollmentSerializer(
-                    MonthlyEnrollment.objects.prefetch_related("bills").get(pk=enrollment.pk)
-                ).data,
-                "payments": PaymentSerializer(payments, many=True).data,
-            }
+            MonthlyEnrollmentSerializer(
+                MonthlyEnrollment.objects.prefetch_related("bills").get(pk=enrollment.pk)
+            ).data
         )
 
 
@@ -445,6 +464,13 @@ class InstallmentPlanViewSet(_EnrollmentBase):
 
     @action(detail=True, methods=["post"])
     def terminate(self, request, pk=None):
+        """
+        Close a plan wholesale, waiving whatever is left.
+
+        Kept beside `stop` rather than replaced by it: this is the blunt
+        write-off, and `stop` is the manager's per-item Inactive decision.
+        Only `stop` is on a screen.
+        """
         plan = self.get_object()
         try:
             services.terminate(actor=request.user, container=plan)
@@ -453,6 +479,65 @@ class InstallmentPlanViewSet(_EnrollmentBase):
 
         plan.refresh_from_db()
         return Response(InstallmentPlanSerializer(plan).data)
+
+    @extend_schema(responses=StopPreviewSerializer)
+    @action(detail=True, methods=["get"], url_path="stop-preview")
+    def stop_preview(self, request, pk=None):
+        """What making this plan inactive would mean, before anyone commits."""
+        return Response(services.stoppable_installments(self.get_object()))
+
+    @extend_schema(request=StopMonthlyServiceSerializer)
+    @action(detail=True, methods=["post"])
+    def stop(self, request, pk=None):
+        """
+        Make one installment service inactive, deciding each unpaid part.
+
+        The same dialog and the same rules as a monthly service: every unpaid
+        item decided explicitly, every cancellation carrying a reason.
+        """
+        serializer = StopMonthlyServiceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        decisions = {
+            entry["billId"]: {
+                "action": entry["action"],
+                "reason": entry.get("reason", ""),
+            }
+            for entry in data["decisions"]
+        }
+
+        try:
+            plan = services.stop_installment_plan(
+                actor=request.user,
+                plan=self.get_object(),
+                decisions=decisions,
+                reason=data.get("reason", ""),
+            )
+        except services.EnrollmentError as exc:
+            return _error(exc)
+
+        return Response(
+            InstallmentPlanSerializer(
+                InstallmentPlan.objects.prefetch_related("installments").get(pk=plan.pk)
+            ).data
+        )
+
+    @action(detail=True, methods=["post"])
+    def resume(self, request, pk=None):
+        """Reactivate an inactive plan — refused while anything is owed."""
+        try:
+            plan = services.resume_installment_plan(
+                actor=request.user, plan=self.get_object()
+            )
+        except services.EnrollmentError as exc:
+            return _error(exc)
+
+        return Response(
+            InstallmentPlanSerializer(
+                InstallmentPlan.objects.prefetch_related("installments").get(pk=plan.pk)
+            ).data
+        )
 
 
 class BookingViewSet(_EnrollmentBase):

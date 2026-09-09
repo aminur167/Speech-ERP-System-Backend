@@ -262,3 +262,57 @@ def authenticate():
         return _authenticate(client or APIClient(), user)
 
     return _inner
+
+
+@pytest.fixture
+def open_months():
+    """
+    Extend a monthly enrollment forward, the way the system actually does.
+
+    Bills are no longer created upfront: only the current month exists, and
+    later months arrive when the billing job runs for them. A test that needs
+    several months therefore has to let time pass rather than reaching for a
+    lookahead that no longer exists. Returns the enrollment's bills, oldest
+    first.
+    """
+    from django.utils import timezone
+
+    from apps.enrollments import services as enrollment_services
+
+    def _open(enrollment, count: int):
+        today = timezone.localdate()
+        for offset in range(1, count):
+            enrollment_services.generate_due_bills(
+                up_to=enrollment_services.add_months(today, offset)
+            )
+        enrollment.refresh_from_db()
+        return list(enrollment.bills.order_by("month"))
+
+    return _open
+
+
+@pytest.fixture
+def settle_dues(manager, branch):
+    """
+    Pay off everything a patient currently owes.
+
+    A patient with an unpaid due cannot be enrolled in another service, so any
+    test that needs someone holding two services has to settle the first one.
+    That is the rule itself rather than a workaround: at the desk, the manager
+    collects for the service they just started before starting another.
+    """
+    from apps.enrollments import services as enrollment_services
+
+    def _settle(patient):
+        for enrollment in patient.monthly_enrollments.all():
+            while (bill := enrollment.oldest_unpaid_bill()) is not None:
+                enrollment_services.collect_bill_payment(
+                    actor=manager, branch=branch, bill=bill, method="cash"
+                )
+        for plan in patient.installment_plans.all():
+            while (part := plan.oldest_unpaid_installment()) is not None:
+                enrollment_services.collect_installment_payment(
+                    actor=manager, branch=branch, installment=part, method="cash"
+                )
+
+    return _settle
