@@ -487,7 +487,12 @@ def _apply_bill_action(*, actor, request: RefundRequest) -> None:
     # bill leaves ৳2,000 owing, not ৳5,000 — summing the full amount here is
     # the overstatement bug docs/04 warns about.
     target.amount_paid = max(Decimal("0.00"), target.amount_paid - request.amount)
-    target.status = target.Status.PAID if target.is_settled else target.Status.DUE
+    # Through the payable's own helper: reversing a payment on a month that
+    # has not arrived yet returns it to `upcoming`, not `due`. The literal
+    # this replaces invented a phantom current due out of a refunded advance.
+    target.status = (
+        target.settled_status() if target.is_settled else target.unsettled_status()
+    )
     if not target.is_settled:
         target.paid_at = None
     target.save(update_fields=["amount_paid", "status", "paid_at"])

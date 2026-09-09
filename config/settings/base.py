@@ -243,6 +243,11 @@ EXPENSE_AUTO_APPROVE_THRESHOLD = env.int("EXPENSE_AUTO_APPROVE_THRESHOLD", defau
 # Day of month a monthly bill falls due.
 MONTHLY_BILL_DUE_DAY = env.int("MONTHLY_BILL_DUE_DAY", default=5)
 
+# How far ahead a patient may pay. A cap exists because prepaying locks
+# today's fee for that long, and because a mistyped month should not take a
+# decade of fees in one transaction.
+MAX_ADVANCE_MONTHS = env.int("MAX_ADVANCE_MONTHS", default=12)
+
 # Age below which guardian details are required on patient registration.
 PATIENT_MINOR_AGE = env.int("PATIENT_MINOR_AGE", default=18)
 

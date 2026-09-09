@@ -19,6 +19,7 @@ from decimal import Decimal
 from django.conf import settings
 from django.core.validators import MinValueValidator
 from django.db import models
+from django.utils import timezone
 
 from apps.common.models import TimeStampedModel
 
@@ -37,6 +38,11 @@ class BillStatus(models.TextChoices):
     # from Outstanding Due — the only sanctioned way to close an uncollectable
     # enrollment, since termination is otherwise blocked while dues exist.
     WRITTEN_OFF = "written_off", "Written off"
+    # Paid before the month arrived. **Always fully prepaid** — the advance
+    # flow settles whole months only, so `advance` implies
+    # `amount_paid == amount` and every read site can rely on that. The
+    # invariant is what keeps this status from spawning a dozen partial cases.
+    ADVANCE = "advance", "Paid in advance"
 
 
 class PayableMixin(models.Model):
@@ -102,10 +108,29 @@ class PayableMixin(models.Model):
         reference = on or date.today()
         return reference > self.due_date
 
+    def _advance_arrived(self, *, on: date | None = None) -> bool:
+        """Only a month-shaped payable can be paid ahead; installments can't."""
+        return True
+
+    def settled_status(self) -> str:
+        """What this becomes once it is paid. See MonthlyBill for the twist."""
+        return BillStatus.PAID
+
+    def unsettled_status(self) -> str:
+        """What it returns to if a payment is reversed."""
+        return BillStatus.DUE
+
     def effective_status(self, *, on: date | None = None) -> str:
         """Status with overdue applied, for display and reporting."""
         if self.status in {BillStatus.PAID, BillStatus.WRITTEN_OFF}:
             return self.status
+        if self.status == BillStatus.ADVANCE:
+            # Derived as well as stored, and checked here *before*
+            # `is_settled` below: a prepaid bill is settled, so the next
+            # branch would report it as plain "paid" and the advance would be
+            # invisible everywhere. Deriving it also means the month turning
+            # over reads correctly on the 1st with no job having run.
+            return BillStatus.PAID if self._advance_arrived(on=on) else BillStatus.ADVANCE
         if self.is_settled:
             return BillStatus.PAID
         if self.is_overdue(on=on):
@@ -178,7 +203,9 @@ class MonthlyEnrollment(TimeStampedModel):
         otherwise look collectable.
         """
         return (
-            self.bills.exclude(status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF])
+            self.bills.exclude(
+                status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF, BillStatus.ADVANCE]
+            )
             .filter(amount_paid__lt=models.F("amount"))
             .order_by("month")
         )
@@ -212,6 +239,27 @@ class MonthlyBill(PayableMixin):
             )
         ]
         indexes = [models.Index(fields=["status", "due_date"])]
+
+    def _advance_arrived(self, *, on: date | None = None) -> bool:
+        from apps.enrollments.services import month_key
+
+        return self.month <= month_key(on or timezone.localdate())
+
+    def settled_status(self) -> str:
+        """
+        A month paid before it arrives is an advance, not a payment for now.
+
+        One helper rather than a literal at each write site: the moment two
+        places decide independently what a settled bill becomes, they drift —
+        which is exactly how a refunded December bill ended up marked `due`
+        in October.
+        """
+        return (
+            BillStatus.PAID if self._advance_arrived() else BillStatus.ADVANCE
+        )
+
+    def unsettled_status(self) -> str:
+        return BillStatus.DUE if self._advance_arrived() else BillStatus.UPCOMING
 
     def __str__(self):
         return f"{self.label} — {self.amount}"

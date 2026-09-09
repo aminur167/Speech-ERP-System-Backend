@@ -13,6 +13,7 @@ The rules that matter most here, all confirmed in docs/05:
   * Termination is **blocked** while anything is outstanding.
 """
 
+import hashlib
 from datetime import date, timedelta
 from decimal import ROUND_DOWN, Decimal
 
@@ -324,7 +325,8 @@ def collect_bill_payment(
     # request; don't apply the settlement twice.
     if created:
         bill.amount_paid = bill.amount
-        bill.status = BillStatus.PAID
+        # Not a literal PAID: a month settled before it arrives is an advance.
+        bill.status = bill.settled_status()
         bill.paid_at = timezone.now()
         bill.payment = payment
         bill.save(update_fields=["amount_paid", "status", "paid_at", "payment"])
@@ -335,11 +337,17 @@ def collect_bill_payment(
 
 
 def _promote_next_bill(enrollment: MonthlyEnrollment) -> None:
-    """Make the next upcoming bill payable once the current one clears."""
-    nxt = (
-        enrollment.bills.filter(status=BillStatus.UPCOMING).order_by("month").first()
-    )
-    if nxt is not None:
+    """
+    Make the next payable bill due once the current one clears.
+
+    Reads the oldest *unpaid* bill rather than filtering for UPCOMING: with
+    months payable in advance, the nearest upcoming row may already be
+    prepaid, and filtering by status would step over it to promote a later
+    month — leaving a further-out bill marked due while a nearer one sat
+    settled ahead of it.
+    """
+    nxt = enrollment.oldest_unpaid_bill()
+    if nxt is not None and nxt.status == BillStatus.UPCOMING:
         nxt.status = BillStatus.DUE
         nxt.save(update_fields=["status"])
 
@@ -491,7 +499,7 @@ def collect_installment_payment(
 
 
 @transaction.atomic
-def terminate(*, actor, container, reason: str = "") -> None:
+def terminate(*, actor, container, reason: str = "", waivers: dict | None = None) -> None:
     """
     Stop a service, whatever the patient still owes.
 
@@ -501,24 +509,48 @@ def terminate(*, actor, container, reason: str = "") -> None:
     simply stopped coming, and the row sat in Due Payments forever.
 
     So termination always succeeds now — but the debt is never allowed to
-    quietly evaporate. Anything still unpaid is written off explicitly: the
-    same WRITTEN_OFF status an admin-approved refund write-off produces, which
-    is excluded from Outstanding Due, plus an audit entry naming the exact
-    amount forgiven. The money is accounted for either way; the difference is
-    that closing the plan is now the manager's call rather than a dead end.
-    """
-    outstanding = container.outstanding_total()
+    quietly evaporate. Anything waived is written off explicitly: the same
+    WRITTEN_OFF status an admin-approved refund write-off produces, which is
+    excluded from Outstanding Due, plus an audit entry naming the exact amount
+    forgiven. The money is accounted for either way; the difference is that
+    closing the plan is now the manager's call rather than a dead end.
 
-    if outstanding > 0:
-        unpaid = container.installments if not isinstance(
-            container, MonthlyEnrollment
-        ) else container.bills
-        # `is_settled` rather than status alone: a partially-paid item still
-        # has a balance to forgive, and leaving it DUE would keep the money in
-        # Outstanding Due after the plan is closed.
-        for item in unpaid.exclude(status=BillStatus.WRITTEN_OFF):
-            if item.outstanding <= 0:
-                continue
+    `waivers` is `{bill_id: "why"}` — the per-month decision the Stop Service
+    dialog collects. Each waived month carries **its own written reason**,
+    because the point of recording one is that Admin can see why the amount
+    owed went down; "written off when the service was stopped" answers that
+    question with the fact it was asked about.
+
+    Omitting `waivers` entirely keeps the original behaviour — waive
+    everything, one shared reason — which is what the Due Payments screen's
+    wholesale Terminate still does, and what installment plans always do.
+    """
+    unpaid_manager = (
+        container.bills
+        if isinstance(container, MonthlyEnrollment)
+        else container.installments
+    )
+    # `outstanding > 0` rather than status alone: a partially-paid item still
+    # has a balance to forgive, and leaving it DUE would keep the money in
+    # Outstanding Due after the plan is closed.
+    unpaid = [
+        item
+        for item in unpaid_manager.exclude(status=BillStatus.WRITTEN_OFF)
+        if item.outstanding > 0
+    ]
+
+    if waivers is None:
+        waived = unpaid
+        kept = []
+    else:
+        waived = [item for item in unpaid if item.pk in waivers]
+        kept = [item for item in unpaid if item.pk not in waivers]
+
+    outstanding = sum((item.outstanding for item in waived), Decimal("0.00"))
+    kept_total = sum((item.outstanding for item in kept), Decimal("0.00"))
+
+    if waived:
+        for item in waived:
             item.status = BillStatus.WRITTEN_OFF
             item.save(update_fields=["status"])
 
@@ -528,7 +560,20 @@ def terminate(*, actor, container, reason: str = "") -> None:
             target=container,
             branch=container.branch,
             reason=reason or "Written off when the service was stopped",
-            changes={"writtenOff": str(outstanding)},
+            changes={
+                "writtenOff": str(outstanding),
+                # Month by month, with the manager's own words against each —
+                # a partial write-off has to be at least as legible in the
+                # audit log as a wholesale one.
+                "months": [
+                    {
+                        "label": item.label,
+                        "amount": str(item.outstanding),
+                        "reason": (waivers or {}).get(item.pk, "") or reason,
+                    }
+                    for item in waived
+                ],
+            },
         )
 
     container.status = EnrollmentStatus.TERMINATED
@@ -541,14 +586,283 @@ def terminate(*, actor, container, reason: str = "") -> None:
         fields.append("terminated_kind")
     container.save(update_fields=fields)
 
+    changes = {}
+    if outstanding > 0:
+        changes["writtenOff"] = str(outstanding)
+    if kept_total > 0:
+        # Still owed, and still collectable if the patient comes back — the
+        # figure the Terminated Services screen reports.
+        changes["keptDue"] = str(kept_total)
+        changes["keptMonths"] = [item.label for item in kept]
+
     audit.record(
         actor=actor,
         action=AuditLog.Action.TERMINATE,
         target=container,
         branch=container.branch,
         reason=reason,
-        changes={"writtenOff": str(outstanding)} if outstanding > 0 else None,
+        changes=changes or None,
     )
+
+
+@transaction.atomic
+def stop_monthly_service(*, actor, enrollment, decisions: dict, reason: str = ""):
+    """
+    Stop one monthly service, deciding each unpaid month separately.
+
+    `decisions` is `{bill_id: {"action": "keep"|"waive", "reason": "..."}}`,
+    one entry for every month that has actually fallen due and is still
+    unpaid. Three rules make this safe:
+
+    **Every arrived unpaid month needs an explicit decision.** No silent
+    default — defaulting to keep quietly leaves a debt the manager thought
+    they had forgiven, and defaulting to waive is how thousands of taka get
+    written off by accident.
+
+    **Waiving needs a written reason.** The record exists so Admin can see why
+    the amount owed went down; without a reason it records that it went down
+    and nothing else, which is the part that mattered.
+
+    **Months that never arrived are dropped, not decided.** An enrollment
+    carries a lookahead of future bills nobody has been asked to pay yet;
+    asking the manager to keep-or-waive November in September is asking about
+    money that was never owed. They are deleted, exactly as the nightly
+    unpaid-due job already does, and for the same reason: no payment, no
+    receipt and no audit entry ever pointed at one.
+    """
+    if enrollment.status != EnrollmentStatus.ACTIVE:
+        raise EnrollmentError("This service is not running.", code="not_active")
+
+    current = month_key(timezone.localdate())
+
+    # Never-payable lookahead first, so it is out of the way before anything
+    # is validated against it.
+    enrollment.bills.filter(
+        month__gt=current, status=BillStatus.UPCOMING, amount_paid=Decimal("0.00")
+    ).delete()
+
+    arrived = [bill for bill in enrollment.unpaid_bills() if bill.month <= current]
+    undecided = [bill for bill in arrived if bill.pk not in decisions]
+    if undecided:
+        raise EnrollmentError(
+            "Decide what happens to every unpaid month before stopping.",
+            code="decisions_required",
+            extra={"months": [bill.label for bill in undecided]},
+        )
+
+    unknown = set(decisions) - {bill.pk for bill in arrived}
+    if unknown:
+        raise EnrollmentError(
+            "Some decisions do not belong to this service.",
+            code="unknown_bill",
+            extra={"billIds": sorted(str(pk) for pk in unknown)},
+        )
+
+    waivers = {}
+    for bill in arrived:
+        decision = decisions[bill.pk]
+        if decision.get("action") != "waive":
+            continue
+        why = (decision.get("reason") or "").strip()
+        if not why:
+            raise EnrollmentError(
+                f"Say why {bill.label}'s due is being waived.",
+                code="waive_reason_required",
+                extra={"billId": str(bill.pk), "label": bill.label},
+            )
+        waivers[bill.pk] = why
+
+    terminate(actor=actor, container=enrollment, reason=reason, waivers=waivers)
+    enrollment.refresh_from_db()
+    return enrollment
+
+
+def stoppable_months(enrollment) -> dict:
+    """
+    What the Stop Service dialog has to show before it can ask anything.
+
+    Three groups, because each is a different question: months that are owed
+    and need a decision, months already paid in advance (money the clinic is
+    holding for service it will now not deliver), and the lookahead that will
+    simply be dropped.
+    """
+    current = month_key(timezone.localdate())
+    unpaid = list(enrollment.unpaid_bills())
+
+    owed = [bill for bill in unpaid if bill.month <= current]
+    prepaid = list(
+        enrollment.bills.filter(
+            month__gt=current, amount_paid__gt=Decimal("0.00")
+        ).order_by("month")
+    )
+    dropped = list(
+        enrollment.bills.filter(
+            month__gt=current, status=BillStatus.UPCOMING, amount_paid=Decimal("0.00")
+        ).order_by("month")
+    )
+
+    def row(bill):
+        return {
+            "billId": str(bill.pk),
+            "month": bill.month,
+            "label": bill.label,
+            "amount": bill.outstanding if bill in owed else bill.amount_paid,
+            "status": bill.effective_status(),
+        }
+
+    return {
+        "owed": [row(bill) for bill in owed],
+        "owedTotal": sum((bill.outstanding for bill in owed), Decimal("0.00")),
+        "prepaid": [row(bill) for bill in prepaid],
+        "prepaidTotal": sum((bill.amount_paid for bill in prepaid), Decimal("0.00")),
+        "droppedMonths": [bill.label for bill in dropped],
+    }
+
+
+def _ensure_months_through(enrollment, through_month: str) -> None:
+    """
+    Open bill rows up to `through_month` so they can be paid.
+
+    An enrollment starts with a three-month lookahead, so paying six months
+    ahead needs the missing rows created first. `get_or_create` keyed on
+    (enrollment, month) rather than a bulk insert, because that unique
+    constraint is what actually guarantees no duplicate.
+    """
+    last = enrollment.bills.order_by("-month").first()
+    if last is None:
+        return
+
+    year, month = (int(part) for part in last.month.split("-"))
+    cursor = add_months(date(year, month, 1), 1)
+
+    while month_key(cursor) <= through_month:
+        key = month_key(cursor)
+        MonthlyBill.objects.get_or_create(
+            enrollment=enrollment,
+            month=key,
+            defaults={
+                "label": month_label(cursor),
+                "amount": enrollment.service.fee,
+                "due_date": due_date_for_month(key),
+                "status": BillStatus.UPCOMING,
+            },
+        )
+        cursor = add_months(cursor, 1)
+
+
+def preview_monthly_advance(*, enrollment, through_month: str) -> dict:
+    """
+    What paying through a month would actually cost, before anyone commits.
+
+    Arrears are listed separately from the months ahead. A manager who asks
+    to "pay through December" and is charged for an unpaid September as well
+    has to see that **before** taking the money, not after — it is the same
+    total either way, but only one of the two is a surprise.
+    """
+    _ensure_months_through(enrollment, through_month)
+
+    current = month_key(timezone.localdate())
+    months = [
+        {
+            "month": bill.month,
+            "label": bill.label,
+            "amount": bill.outstanding,
+            "isArrears": bill.month < current,
+        }
+        for bill in enrollment.unpaid_bills()
+        if bill.month <= through_month
+    ]
+
+    return {
+        "months": months,
+        "total": sum((row["amount"] for row in months), Decimal("0.00")),
+        "arrearsTotal": sum(
+            (row["amount"] for row in months if row["isArrears"]), Decimal("0.00")
+        ),
+        "monthsAhead": sum(1 for row in months if not row["isArrears"]),
+    }
+
+
+@transaction.atomic
+def collect_monthly_advance(
+    *, actor, branch, enrollment, through_month: str, method: str,
+    idempotency_key: str | None = None,
+):
+    """
+    Collect every month from the oldest unpaid through `through_month`.
+
+    **A sequential oldest-first loop, never a skip-ahead.** Each iteration
+    re-reads `oldest_unpaid_bill()` and goes through the ordinary
+    `collect_bill_payment`, so `_assert_is_oldest_unpaid` is satisfied at
+    every step and gets no escape hatch — the same shape
+    `resume_monthly_service` already uses.
+
+    That is not a style preference. The nightly job terminates a service on
+    any unpaid bill for a finished month. Under a skip-ahead design a patient
+    who had just handed over three months of cash with September still open
+    would be auto-terminated at month end. Settling arrears first makes that
+    impossible by construction rather than by remembering to special-case it,
+    and it is why the confirmed rule is arrears before advance.
+
+    Each month keeps its own payment and receipt, so revenue stays
+    attributable to the month it belongs to.
+    """
+    if not enrollment.is_active:
+        raise EnrollmentError("This enrollment has been terminated.", code="terminated")
+
+    try:
+        year, month = (int(part) for part in through_month.split("-"))
+        date(year, month, 1)
+    except (ValueError, TypeError):
+        raise EnrollmentError(
+            "Expected a month as YYYY-MM.", code="invalid_month"
+        ) from None
+
+    current = month_key(timezone.localdate())
+    if through_month < current:
+        raise EnrollmentError(
+            "That month has already passed.", code="month_in_past"
+        )
+
+    limit = month_key(add_months(timezone.localdate(), settings.MAX_ADVANCE_MONTHS))
+    if through_month > limit:
+        raise EnrollmentError(
+            f"Payment can be taken at most {settings.MAX_ADVANCE_MONTHS} months ahead.",
+            code="too_far_ahead",
+        )
+
+    _ensure_months_through(enrollment, through_month)
+
+    payments = []
+    # Re-read each time: settling one bill promotes the next, so the list has
+    # to come from the database rather than a snapshot taken up front.
+    while (bill := enrollment.oldest_unpaid_bill()) is not None:
+        if bill.month > through_month:
+            break
+        payment, _ = collect_bill_payment(
+            actor=actor, branch=branch, bill=bill, method=method,
+            idempotency_key=_advance_leg_key(idempotency_key, bill.month),
+        )
+        payments.append(payment)
+
+    enrollment.refresh_from_db()
+    return payments, enrollment
+
+
+def _advance_leg_key(idempotency_key: str | None, month: str) -> str | None:
+    """
+    A deterministic key per month.
+
+    The loop mints one payment per month, so a single client key cannot
+    protect them all — but a key derived from it and the month can, and
+    deterministically, so replaying the whole request returns the original
+    payments instead of charging again. Hashed because `idempotency_key` is
+    capped at 64 characters and the client's own key may already fill it.
+    """
+    if not idempotency_key:
+        return None
+    digest = hashlib.sha1(f"{idempotency_key}:{month}".encode()).hexdigest()
+    return f"adv-{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -575,6 +889,15 @@ def generate_due_bills(*, up_to: date | None = None) -> dict:
     target = (up_to or timezone.localdate()).replace(day=1)
     created_count = 0
     skipped = 0
+
+    # Months paid ahead that have now arrived become ordinary paid months.
+    # One bulk update, idempotent, and catch-up capable like the rest of this
+    # job. `effective_status` derives the same answer, so a missed run is
+    # cosmetic rather than a correctness bug — this keeps the stored column
+    # honest for anything that filters on it directly.
+    settled_advances = MonthlyBill.objects.filter(
+        status=BillStatus.ADVANCE, month__lte=month_key(target)
+    ).update(status=BillStatus.PAID)
 
     enrollments = MonthlyEnrollment.objects.filter(
         status=EnrollmentStatus.ACTIVE
@@ -605,7 +928,11 @@ def generate_due_bills(*, up_to: date | None = None) -> dict:
                 created_count += 1
             cursor = add_months(cursor, 1)
 
-    return {"created": created_count, "enrollments_without_bills": skipped}
+    return {
+        "created": created_count,
+        "enrollments_without_bills": skipped,
+        "advances_settled": settled_advances,
+    }
 
 
 # ---------------------------------------------------------------------------

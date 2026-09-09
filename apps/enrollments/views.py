@@ -26,7 +26,9 @@ from apps.enrollments.models import (
     MonthlyEnrollment,
 )
 from apps.enrollments.serializers import (
+    AdvancePreviewSerializer,
     BookingCreateSerializer,
+    CollectAdvanceSerializer,
     BookingSerializer,
     CancelBookingSerializer,
     CollectPaymentSerializer,
@@ -35,6 +37,8 @@ from apps.enrollments.serializers import (
     MonthlyEnrollmentCreateSerializer,
     MonthlyEnrollmentSerializer,
     ResumeMonthlyServiceSerializer,
+    StopMonthlyServiceSerializer,
+    StopPreviewSerializer,
     TerminatedMonthlyServiceSerializer,
 )
 from apps.patients.models import Patient
@@ -57,7 +61,7 @@ class _EnrollmentBase(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
 
     # Reads, as opposed to the branch-desk actions below them. Admin can see
     # everything; only a Manager transacts on a branch's behalf.
-    READ_ACTIONS = {"list", "retrieve", "terminated"}
+    READ_ACTIONS = {"list", "retrieve", "terminated", "stop_preview", "advance_preview"}
 
     def get_permissions(self):
         if self.action in self.READ_ACTIONS:
@@ -222,6 +226,104 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
 
         return paginator.get_paginated_response(
             TerminatedMonthlyServiceSerializer(page, many=True).data
+        )
+
+    @extend_schema(
+        parameters=[OpenApiParameter("through", str, description='Month as "YYYY-MM".')],
+        responses=AdvancePreviewSerializer,
+    )
+    @action(detail=True, methods=["get"], url_path="advance-preview")
+    def advance_preview(self, request, pk=None):
+        """What paying through a month would cost, arrears named separately."""
+        through = request.query_params.get("through", "")
+        try:
+            return Response(
+                services.preview_monthly_advance(
+                    enrollment=self.get_object(), through_month=through
+                )
+            )
+        except (ValueError, TypeError):
+            raise ValidationError({"through": ['Expected a month as "YYYY-MM".']}) from None
+
+    @extend_schema(request=CollectAdvanceSerializer)
+    @action(detail=True, methods=["post"], url_path="pay-through")
+    def pay_through(self, request, pk=None):
+        """
+        Collect from the oldest unpaid month through the one named.
+
+        Returns one payment per month rather than a single lump: each month
+        keeps its own receipt, which is what makes an advance auditable
+        month by month.
+        """
+        enrollment = self.get_object()
+        serializer = CollectAdvanceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            payments, enrollment = services.collect_monthly_advance(
+                actor=request.user,
+                branch=enrollment.branch,
+                enrollment=enrollment,
+                through_month=data["throughMonth"],
+                method=data["method"],
+                idempotency_key=data.get("idempotencyKey") or None,
+            )
+        except services.EnrollmentError as exc:
+            return _error(exc)
+
+        return Response(
+            {
+                "payments": PaymentSerializer(payments, many=True).data,
+                "enrollment": MonthlyEnrollmentSerializer(
+                    MonthlyEnrollment.objects.prefetch_related("bills").get(pk=enrollment.pk)
+                ).data,
+            }
+        )
+
+    @extend_schema(responses=StopPreviewSerializer)
+    @action(detail=True, methods=["get"], url_path="stop-preview")
+    def stop_preview(self, request, pk=None):
+        """What stopping this service would mean, before anyone commits to it."""
+        return Response(services.stoppable_months(self.get_object()))
+
+    @extend_schema(request=StopMonthlyServiceSerializer)
+    @action(detail=True, methods=["post"])
+    def stop(self, request, pk=None):
+        """
+        Stop one service, deciding each unpaid month separately.
+
+        Distinct from `terminate`, which waives everything in one go and is
+        what the Due Payments screen still uses. Both call the same service
+        function with different arguments, so there is one implementation of
+        what stopping means.
+        """
+        serializer = StopMonthlyServiceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        decisions = {
+            entry["billId"]: {
+                "action": entry["action"],
+                "reason": entry.get("reason", ""),
+            }
+            for entry in data["decisions"]
+        }
+
+        try:
+            enrollment = services.stop_monthly_service(
+                actor=request.user,
+                enrollment=self.get_object(),
+                decisions=decisions,
+                reason=data.get("reason", ""),
+            )
+        except services.EnrollmentError as exc:
+            return _error(exc)
+
+        return Response(
+            MonthlyEnrollmentSerializer(
+                MonthlyEnrollment.objects.prefetch_related("bills").get(pk=enrollment.pk)
+            ).data
         )
 
     @extend_schema(request=ResumeMonthlyServiceSerializer)

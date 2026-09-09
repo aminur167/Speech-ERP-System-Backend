@@ -403,7 +403,12 @@ class TestTermination:
         services.terminate(actor=manager, container=enrollment)
 
         assert not AuditLog.objects.filter(action=AuditLog.Action.WRITE_OFF).exists()
-        assert set(enrollment.bills.values_list("status", flat=True)) == {BillStatus.PAID}
+        # The current month reads `paid`; the two lookahead months were
+        # settled before they arrived, which is what `advance` means.
+        assert set(enrollment.bills.values_list("status", flat=True)) == {
+            BillStatus.PAID,
+            BillStatus.ADVANCE,
+        }
 
     def test_succeeds_once_everything_is_settled(self, manager, branch, enrollment):
         for _ in range(enrollment.bills.count()):

@@ -246,3 +246,63 @@ class ResumeMonthlyServiceSerializer(serializers.Serializer):
     method = serializers.ChoiceField(
         choices=PaymentMethod.choices, required=False, allow_blank=True
     )
+
+
+class StopDecisionSerializer(serializers.Serializer):
+    """
+    One month's fate. A waive carries its own reason — the record exists so
+    Admin can see why the amount owed went down, and a blank one answers that
+    it went down and nothing else.
+    """
+
+    billId = serializers.IntegerField()
+    action = serializers.ChoiceField(choices=["keep", "waive"])
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=255)
+
+
+class StopMonthlyServiceSerializer(serializers.Serializer):
+    decisions = StopDecisionSerializer(many=True)
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=255)
+
+
+class StoppableMonthSerializer(serializers.Serializer):
+    billId = serializers.CharField()
+    month = serializers.CharField()
+    label = serializers.CharField()
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    status = serializers.CharField()
+
+
+class StopPreviewSerializer(serializers.Serializer):
+    """What the dialog must show before it can ask the manager anything."""
+
+    owed = StoppableMonthSerializer(many=True)
+    owedTotal = serializers.DecimalField(max_digits=14, decimal_places=2)
+    # Money already taken for service that will now not be delivered.
+    prepaid = StoppableMonthSerializer(many=True)
+    prepaidTotal = serializers.DecimalField(max_digits=14, decimal_places=2)
+    # Never payable, never paid — dropped rather than decided.
+    droppedMonths = serializers.ListField(child=serializers.CharField())
+
+
+class AdvanceMonthSerializer(serializers.Serializer):
+    month = serializers.CharField()
+    label = serializers.CharField()
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    # Arrears are called out separately: asking to "pay through December"
+    # and being charged for an unpaid September as well must not be a
+    # surprise discovered after the money is taken.
+    isArrears = serializers.BooleanField()
+
+
+class AdvancePreviewSerializer(serializers.Serializer):
+    months = AdvanceMonthSerializer(many=True)
+    total = serializers.DecimalField(max_digits=14, decimal_places=2)
+    arrearsTotal = serializers.DecimalField(max_digits=14, decimal_places=2)
+    monthsAhead = serializers.IntegerField()
+
+
+class CollectAdvanceSerializer(serializers.Serializer):
+    throughMonth = serializers.CharField(max_length=7)
+    method = serializers.ChoiceField(choices=PaymentMethod.choices)
+    idempotencyKey = serializers.CharField(required=False, allow_blank=True, max_length=64)

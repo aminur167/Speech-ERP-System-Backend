@@ -17,6 +17,7 @@ from decimal import Decimal
 
 from django.utils import timezone
 
+from apps.enrollments.services import month_key
 from apps.enrollments.models import (
     BillStatus,
     EnrollmentStatus,
@@ -96,7 +97,9 @@ def collect_due_items(
 
     bills = (
         MonthlyBill.objects.filter(enrollment__status=EnrollmentStatus.ACTIVE)
-        .exclude(status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF])
+        .exclude(
+            status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF, BillStatus.ADVANCE]
+        )
         .select_related(
             "enrollment", "enrollment__patient", "enrollment__service", "enrollment__branch"
         )
@@ -261,6 +264,18 @@ def due_summary(*, branch_id=None, as_of: date | None = None) -> dict:
         # when the enrollment itself was created; mirrors the installment
         # loop's `plan.created_at` check below for the same reason.
         if bill.enrollment.created_at > cutoff:
+            continue
+        # A month paid ahead was never owed on a date before it began. Its
+        # `paid_at` is after the cutoff, so `_was_outstanding_at` would call
+        # it outstanding and charge a past month for a future one; the
+        # enrollment guard above can't catch it because the enrollment is
+        # old, and `_was_outstanding_at` can't because it cannot see a month.
+        #
+        # Narrowed to advances on purpose. An ordinary unpaid future bill
+        # still counts, because the current snapshot counts it too — the next
+        # payable bill is what "outstanding" has always meant here, and
+        # today's reconstruction has to agree with today's snapshot.
+        if bill.status == BillStatus.ADVANCE and bill.month > month_key(as_of):
             continue
         if not _was_outstanding_at(bill, cutoff):
             continue
