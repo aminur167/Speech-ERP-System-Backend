@@ -12,6 +12,10 @@ Present, Absent (no show by close — see `mark_no_show_absentees`), or Early
 Leave (checked out before closing). "On Leave" remains a manual override via
 `mark_attendance` for planned absences. There is no "Late" status — arrival
 time doesn't change the outcome, only departure time does.
+
+Check-in and check-out are both refused before the office opens (see
+`_ensure_office_is_open`) — a clinic that isn't open yet can't have anyone
+genuinely clocking in, so a punch at 2am is bad data, not an early arrival.
 """
 
 from collections import defaultdict
@@ -59,17 +63,45 @@ def create_staff_member(*, actor, branch, data: dict) -> StaffMember:
     return member
 
 
+class AttendanceError(Exception):
+    def __init__(self, message: str, *, code: str = "invalid"):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
 def _status_for_check_out(check_out_at) -> str:
+    # `check_out_at` is a `timezone.now()`-style UTC-aware datetime -- calling
+    # `.time()` on it directly would compare a UTC wall-clock hour against an
+    # Asia/Dhaka office-hours constant. `localtime()` converts first.
     return (
         StaffAttendance.Status.EARLY_LEAVE
-        if check_out_at.time() < time(OFFICE_END_HOUR, 0)
+        if timezone.localtime(check_out_at).time() < time(OFFICE_END_HOUR, 0)
         else StaffAttendance.Status.PRESENT
     )
+
+
+def _ensure_office_is_open(now, *, action: str) -> None:
+    """
+    Check-in and check-out only make sense once the office has actually
+    opened -- a punch at 2am isn't a real attendance event, it's bad data
+    (exactly the kind that used to render as a "Present ... 12:45 AM" row).
+
+    No upper bound: a late arrival after 4pm is still deliberately allowed
+    (it overrides `mark_no_show_absentees`'s auto-absent placeholder), and
+    an early-leave check-out is exactly what this whole status exists for.
+    """
+    if timezone.localtime(now).time() < time(OFFICE_START_HOUR, 0):
+        raise AttendanceError(
+            f"Can't {action} before office hours start at {OFFICE_START_HOUR}:00 AM.",
+            code="before_office_hours",
+        )
 
 
 @transaction.atomic
 def check_in(*, staff: StaffMember) -> StaffAttendance:
     now = timezone.now()
+    _ensure_office_is_open(now, action="check in")
     today = timezone.localdate()
 
     record, _created = StaffAttendance.objects.select_for_update().get_or_create(
@@ -87,6 +119,7 @@ def check_in(*, staff: StaffMember) -> StaffAttendance:
 @transaction.atomic
 def check_out(*, staff: StaffMember) -> StaffAttendance:
     now = timezone.now()
+    _ensure_office_is_open(now, action="check out")
     today = timezone.localdate()
     record, _created = StaffAttendance.objects.select_for_update().get_or_create(
         staff=staff,

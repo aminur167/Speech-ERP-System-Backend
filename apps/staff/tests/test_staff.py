@@ -17,6 +17,27 @@ from apps.staff.models import StaffAttendance, StaffBonus, StaffMember
 pytestmark = pytest.mark.django_db
 
 
+def _at_hour(hour: int) -> datetime:
+    return timezone.make_aware(datetime.combine(date.today(), datetime.min.time()) + timedelta(hours=hour))
+
+
+@pytest.fixture
+def office_hours():
+    """
+    Pins the wall-clock `apps.staff.services` sees to a safe daytime hour
+    (11am), so a check-in/check-out test's result doesn't depend on what
+    time it actually is when the suite happens to run -- otherwise every
+    such test would fail for a third of the day, now that check-in/check-out
+    are refused outside office hours.
+
+    A test that specifically exercises a time boundary (before 4pm vs. at
+    or after it, before 9am vs. at or after it) still wins with its own
+    nested `mock.patch` on the same target for just that call.
+    """
+    with mock.patch("apps.staff.services.timezone.now", return_value=_at_hour(11)):
+        yield
+
+
 @pytest.fixture
 def farhana(staff_member_factory):
     return staff_member_factory(name="Farhana Akter", monthly_salary=Decimal("42000.00"))
@@ -131,7 +152,7 @@ class TestBranchIsolation:
 
 
 class TestAttendance:
-    def test_check_in_is_always_present(self, farhana):
+    def test_check_in_is_always_present(self, office_hours, farhana):
         """Arrival time no longer affects status — only Present, Absent (no-show), and Early Leave are derived."""
         record = services.check_in(staff=farhana)
         assert record.status == StaffAttendance.Status.PRESENT
@@ -152,24 +173,24 @@ class TestAttendance:
         )
         assert services._status_for_check_out(on_time_checkout) == StaffAttendance.Status.PRESENT
 
-    def test_check_in_is_idempotent_per_day(self, farhana):
+    def test_check_in_is_idempotent_per_day(self, office_hours, farhana):
         first = services.check_in(staff=farhana)
         second = services.check_in(staff=farhana)
         assert first.id == second.id
         assert StaffAttendance.objects.filter(staff=farhana).count() == 1
 
-    def test_check_out_requires_no_prior_check_in(self, farhana):
+    def test_check_out_requires_no_prior_check_in(self, office_hours, farhana):
         record = services.check_out(staff=farhana)
         assert record.check_out_at is not None
 
-    def test_check_out_after_check_in_keeps_check_in_time(self, farhana):
+    def test_check_out_after_check_in_keeps_check_in_time(self, office_hours, farhana):
         checked_in = services.check_in(staff=farhana)
         checked_out = services.check_out(staff=farhana)
         assert checked_out.id == checked_in.id
         assert checked_out.check_in_at == checked_in.check_in_at
         assert checked_out.check_out_at is not None
 
-    def test_check_out_before_office_end_sets_early_leave(self, farhana):
+    def test_check_out_before_office_end_sets_early_leave(self, office_hours, farhana):
         services.check_in(staff=farhana)
         with mock.patch(
             "apps.staff.services.timezone.now",
@@ -178,7 +199,7 @@ class TestAttendance:
             record = services.check_out(staff=farhana)
         assert record.status == StaffAttendance.Status.EARLY_LEAVE
 
-    def test_check_out_at_office_end_or_later_stays_present(self, farhana):
+    def test_check_out_at_office_end_or_later_stays_present(self, office_hours, farhana):
         services.check_in(staff=farhana)
         with mock.patch(
             "apps.staff.services.timezone.now",
@@ -187,14 +208,50 @@ class TestAttendance:
             record = services.check_out(staff=farhana)
         assert record.status == StaffAttendance.Status.PRESENT
 
-    def test_mark_on_leave_clears_times(self, farhana):
+    def test_mark_on_leave_clears_times(self, office_hours, farhana):
         services.check_in(staff=farhana)
         record = services.mark_attendance(staff=farhana, status=StaffAttendance.Status.ON_LEAVE)
         assert record.status == StaffAttendance.Status.ON_LEAVE
         assert record.check_in_at is None
         assert record.check_out_at is None
 
-    def test_api_check_in_then_check_out(self, manager_client, farhana):
+    def test_check_in_before_office_hours_is_refused(self, farhana):
+        with mock.patch(
+            "apps.staff.services.timezone.now",
+            return_value=_at_hour(services.OFFICE_START_HOUR - 1),
+        ):
+            with pytest.raises(services.AttendanceError) as exc_info:
+                services.check_in(staff=farhana)
+        assert exc_info.value.code == "before_office_hours"
+        assert not StaffAttendance.objects.filter(staff=farhana).exists()
+
+    def test_check_in_exactly_at_office_start_is_allowed(self, farhana):
+        with mock.patch(
+            "apps.staff.services.timezone.now",
+            return_value=_at_hour(services.OFFICE_START_HOUR),
+        ):
+            record = services.check_in(staff=farhana)
+        assert record.status == StaffAttendance.Status.PRESENT
+
+    def test_check_out_before_office_hours_is_refused(self, farhana):
+        with mock.patch(
+            "apps.staff.services.timezone.now",
+            return_value=_at_hour(services.OFFICE_START_HOUR - 1),
+        ):
+            with pytest.raises(services.AttendanceError) as exc_info:
+                services.check_out(staff=farhana)
+        assert exc_info.value.code == "before_office_hours"
+
+    def test_api_check_in_before_office_hours_returns_400(self, manager_client, farhana):
+        with mock.patch(
+            "apps.staff.services.timezone.now",
+            return_value=_at_hour(services.OFFICE_START_HOUR - 1),
+        ):
+            response = manager_client.post(reverse("staff:staffmember-check-in", args=[farhana.id]))
+        assert response.status_code == 400
+        assert response.json()["code"] == "before_office_hours"
+
+    def test_api_check_in_then_check_out(self, office_hours, manager_client, farhana):
         in_response = manager_client.post(reverse("staff:staffmember-check-in", args=[farhana.id]))
         assert in_response.status_code == 200
         assert in_response.json()["checkOutAt"] is None
@@ -203,7 +260,7 @@ class TestAttendance:
         assert out_response.status_code == 200
         assert out_response.json()["checkOutAt"] is not None
 
-    def test_today_attendance_keyed_by_staff_id(self, manager_client, farhana):
+    def test_today_attendance_keyed_by_staff_id(self, office_hours, manager_client, farhana):
         manager_client.post(reverse("staff:staffmember-check-in", args=[farhana.id]))
         body = manager_client.get(reverse("staff:staffmember-today-attendance")).json()
         assert str(farhana.id) in body
@@ -262,10 +319,6 @@ class TestAttendance:
         assert response.status_code == 400
 
 
-def _at_hour(hour: int):
-    return timezone.make_aware(datetime.combine(date.today(), datetime.min.time()) + timedelta(hours=hour))
-
-
 class TestNoShowAutoAbsent:
     """Office hours are 9am-4pm — anyone still unmarked once 4pm passes is auto-marked absent."""
 
@@ -286,7 +339,7 @@ class TestNoShowAutoAbsent:
         record = StaffAttendance.objects.get(staff=farhana, date=date.today())
         assert record.status == StaffAttendance.Status.ABSENT
 
-    def test_does_not_overwrite_an_existing_record(self, farhana):
+    def test_does_not_overwrite_an_existing_record(self, office_hours, farhana):
         checked_in = services.check_in(staff=farhana)
         with mock.patch(
             "apps.staff.services.timezone.localtime",
@@ -303,7 +356,10 @@ class TestNoShowAutoAbsent:
             return_value=_at_hour(services.OFFICE_END_HOUR + 1),
         ):
             services.mark_no_show_absentees(StaffMember.objects.filter(pk=farhana.id))
-        record = services.check_in(staff=farhana)
+            # Still inside the mock: a manager checking someone in for real,
+            # well after office hours have already opened for the day, must
+            # still be allowed to override the auto-absent placeholder.
+            record = services.check_in(staff=farhana)
         assert record.status == StaffAttendance.Status.PRESENT
         assert record.check_in_at is not None
 
@@ -354,7 +410,9 @@ class TestWeeklyHoliday:
 
     def test_a_friday_check_in_still_gets_ordinary_treatment(self, farhana):
         """The holiday only suppresses the automatic no-show penalty -- someone who does come in on a Friday is just present, same as any other day."""
-        record = services.check_in(staff=farhana)
+        friday_morning = _at_weekday_hour(services.WEEKLY_HOLIDAY_WEEKDAY, services.OFFICE_START_HOUR + 1)
+        with mock.patch("apps.staff.services.timezone.now", return_value=friday_morning):
+            record = services.check_in(staff=farhana)
         assert record.status == StaffAttendance.Status.PRESENT
 
 
@@ -447,7 +505,7 @@ class TestBonuses:
 
 class TestSummary:
     def test_summary_counts_active_staff_and_todays_attendance(
-        self, manager_client, manager, farhana, staff_member_factory
+        self, office_hours, manager_client, manager, farhana, staff_member_factory
     ):
         inactive = staff_member_factory(name="Retired", status=StaffMember.Status.INACTIVE)
         present = staff_member_factory(name="Present Person")
