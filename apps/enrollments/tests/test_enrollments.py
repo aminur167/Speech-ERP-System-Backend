@@ -59,12 +59,18 @@ def enrollment(manager, branch, patient, monthly_service):
 
 
 class TestMonthlyEnrollmentCreation:
-    def test_creates_three_bills(self, enrollment):
-        assert enrollment.bills.count() == 3
+    def test_creates_only_the_current_months_bill(self, enrollment):
+        """
+        No lookahead. A future month nobody has been asked to pay for is not a
+        due, and creating one made "pay October but not November" impossible
+        to express — the month arrives with the billing job, or with an
+        advance payment for it, and no other way.
+        """
+        assert enrollment.bills.count() == 1
 
-    def test_only_the_first_bill_is_due(self, enrollment):
+    def test_the_only_bill_is_due(self, enrollment):
         statuses = list(enrollment.bills.order_by("month").values_list("status", flat=True))
-        assert statuses == [BillStatus.DUE, BillStatus.UPCOMING, BillStatus.UPCOMING]
+        assert statuses == [BillStatus.DUE]
 
     @pytest.mark.money
     def test_bill_amount_equals_the_service_fee_exactly(self, enrollment, monthly_service):
@@ -76,10 +82,10 @@ class TestMonthlyEnrollmentCreation:
             assert bill.due_date.day == 5
             assert f"{bill.due_date.year}-{bill.due_date.month:02d}" == bill.month
 
-    def test_months_are_correct_across_a_year_boundary(
+    def test_the_month_is_the_enrollment_month_not_the_calendar_default(
         self, manager, branch, patient, monthly_service, settings
     ):
-        """A December enrollment must roll into January and February of next year."""
+        """A December enrollment bills December, not whatever today is."""
         from unittest.mock import patch
 
         with patch("apps.enrollments.services.timezone") as mocked:
@@ -90,7 +96,7 @@ class TestMonthlyEnrollmentCreation:
             )
 
         months = list(created.bills.order_by("month").values_list("month", flat=True))
-        assert months == ["2026-12", "2027-01", "2027-02"]
+        assert months == ["2026-12"]
 
     def test_enrollment_uses_the_managers_branch(self, enrollment, manager):
         assert enrollment.branch_id == manager.branch_id
@@ -177,13 +183,23 @@ class TestCollectionIsAtomic:
         assert bill.paid_at is not None
         assert bill.payment_id == payment.id
 
-    def test_paying_promotes_the_next_bill_to_due(self, manager, branch, enrollment):
+    def test_paying_leaves_the_next_month_to_arrive_on_its_own(
+        self, manager, branch, enrollment, open_months
+    ):
+        """
+        Settling this month does not conjure the next one. It arrives when the
+        billing job runs for it, `due` from the start — there is no `upcoming`
+        stage any more, because a month nobody has been billed for no longer
+        exists as a row.
+        """
         services.collect_bill_payment(
             actor=manager, branch=branch, bill=enrollment.oldest_unpaid_bill(), method="cash"
         )
+        assert enrollment.bills.count() == 1
 
+        open_months(enrollment, 2)
         statuses = list(enrollment.bills.order_by("month").values_list("status", flat=True))
-        assert statuses == [BillStatus.PAID, BillStatus.DUE, BillStatus.UPCOMING]
+        assert statuses == [BillStatus.PAID, BillStatus.DUE]
 
     def test_cannot_pay_the_same_bill_twice(self, manager, branch, enrollment):
         bill = enrollment.oldest_unpaid_bill()
@@ -222,14 +238,24 @@ class TestCollectionIsAtomic:
         assert bill.status == BillStatus.PAID
         assert bill.amount_paid == bill.amount
 
-    def test_cannot_collect_on_a_terminated_enrollment(self, manager, branch, enrollment):
+    def test_a_kept_due_on_an_inactive_service_is_still_collectable(
+        self, manager, branch, enrollment
+    ):
+        """
+        Deliberate reversal. Making a service inactive asks the manager to keep
+        or cancel each unpaid month, and a kept month has to stay collectable:
+        clearing it on Due Payments is the only route back to reactivating the
+        service. Refusing payment here would strand that debt forever.
+        """
         bill = enrollment.oldest_unpaid_bill()
         enrollment.status = EnrollmentStatus.TERMINATED
         enrollment.save(update_fields=["status"])
 
-        with pytest.raises(services.EnrollmentError) as exc:
-            services.collect_bill_payment(actor=manager, branch=branch, bill=bill, method="cash")
-        assert exc.value.code == "terminated"
+        payment, bill = services.collect_bill_payment(
+            actor=manager, branch=branch, bill=bill, method="cash"
+        )
+        assert payment is not None
+        assert bill.status == BillStatus.PAID
 
     def test_replayed_idempotency_key_on_an_installment_returns_the_original_payment(
         self, manager, branch, patient, installment_service
@@ -260,8 +286,8 @@ class TestOldestFirst:
     ages forever, and Outstanding Due stops describing anything actionable.
     """
 
-    def test_cannot_pay_a_later_bill_first(self, manager, branch, enrollment):
-        bills = list(enrollment.bills.order_by("month"))
+    def test_cannot_pay_a_later_bill_first(self, manager, branch, enrollment, open_months):
+        bills = open_months(enrollment, 2)
 
         with pytest.raises(services.EnrollmentError) as exc:
             services.collect_bill_payment(
@@ -269,9 +295,11 @@ class TestOldestFirst:
             )
         assert exc.value.code == "not_oldest_unpaid"
 
-    def test_the_error_names_what_must_be_paid_first(self, manager, branch, enrollment):
+    def test_the_error_names_what_must_be_paid_first(
+        self, manager, branch, enrollment, open_months
+    ):
         """The manager is facing a patient and needs to know what to collect."""
-        bills = list(enrollment.bills.order_by("month"))
+        bills = open_months(enrollment, 2)
 
         with pytest.raises(services.EnrollmentError) as exc:
             services.collect_bill_payment(
@@ -289,9 +317,9 @@ class TestOldestFirst:
         assert payment is not None
 
     def test_the_next_becomes_payable_after_the_oldest_clears(
-        self, manager, branch, enrollment
+        self, manager, branch, enrollment, open_months
     ):
-        bills = list(enrollment.bills.order_by("month"))
+        bills = open_months(enrollment, 2)
         services.collect_bill_payment(actor=manager, branch=branch, bill=bills[0], method="cash")
 
         payment, _ = services.collect_bill_payment(
@@ -300,10 +328,10 @@ class TestOldestFirst:
         assert payment is not None
 
     def test_no_payment_row_is_created_by_a_rejected_attempt(
-        self, manager, branch, enrollment
+        self, manager, branch, enrollment, open_months
     ):
+        bills = open_months(enrollment, 3)
         before = Payment.objects.count()
-        bills = list(enrollment.bills.order_by("month"))
 
         with pytest.raises(services.EnrollmentError):
             services.collect_bill_payment(
@@ -370,7 +398,7 @@ class TestTermination:
             action=AuditLog.Action.WRITE_OFF, target_type="MonthlyEnrollment"
         ).first()
         assert entry is not None
-        assert entry.changes["writtenOff"] == "15000.00"  # 3 × 5,000
+        assert entry.changes["writtenOff"] == "5000.00"  # the one open month
 
     def test_a_terminated_plans_balance_leaves_outstanding_due(
         self, manager, branch, enrollment
@@ -403,12 +431,7 @@ class TestTermination:
         services.terminate(actor=manager, container=enrollment)
 
         assert not AuditLog.objects.filter(action=AuditLog.Action.WRITE_OFF).exists()
-        # The current month reads `paid`; the two lookahead months were
-        # settled before they arrived, which is what `advance` means.
-        assert set(enrollment.bills.values_list("status", flat=True)) == {
-            BillStatus.PAID,
-            BillStatus.ADVANCE,
-        }
+        assert set(enrollment.bills.values_list("status", flat=True)) == {BillStatus.PAID}
 
     def test_succeeds_once_everything_is_settled(self, manager, branch, enrollment):
         for _ in range(enrollment.bills.count()):
@@ -442,7 +465,7 @@ class TestTermination:
             )
         services.terminate(actor=manager, container=enrollment)
 
-        assert Payment.objects.filter(branch=branch).count() == 3
+        assert Payment.objects.filter(branch=branch).count() == 1
 
     def test_terminating_twice_is_safe(self, manager, branch, enrollment):
         enrollment.bills.update(status=BillStatus.WRITTEN_OFF)
@@ -462,7 +485,7 @@ class TestMonthlyBillGenerationJob:
         result = services.generate_due_bills(up_to=target)
 
         assert result["created"] == 1
-        assert enrollment.bills.count() == 4
+        assert enrollment.bills.count() == 2
 
     def test_running_twice_creates_no_duplicate(self, enrollment):
         """
@@ -477,7 +500,7 @@ class TestMonthlyBillGenerationJob:
         second = services.generate_due_bills(up_to=target)
 
         assert second["created"] == 0
-        assert enrollment.bills.count() == 4
+        assert enrollment.bills.count() == 2
 
     def test_backfills_months_missed_while_the_server_was_down(self, enrollment):
         last = enrollment.bills.order_by("-month").first()
@@ -587,8 +610,9 @@ class TestPayAndTerminateEndpoints:
         return reverse("enrollments:installment-plan-terminate", args=[plan.id])
 
     def test_pay_bill_endpoint_settles_the_bill_and_advances_the_next(
-        self, manager_client, enrollment
+        self, manager_client, enrollment, open_months
     ):
+        open_months(enrollment, 2)
         bill = enrollment.oldest_unpaid_bill()
 
         response = manager_client.post(
@@ -608,9 +632,9 @@ class TestPayAndTerminateEndpoints:
         assert next_bill.status == BillStatus.DUE
 
     def test_pay_bill_endpoint_rejects_paying_out_of_order(
-        self, manager_client, enrollment
+        self, manager_client, enrollment, open_months
     ):
-        september = enrollment.bills.order_by("month")[1]
+        september = open_months(enrollment, 2)[1]
 
         response = manager_client.post(
             self.pay_bill_url(enrollment, september), {"method": "cash"}, format="json"

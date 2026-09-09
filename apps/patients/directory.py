@@ -30,7 +30,7 @@ from decimal import Decimal
 from django.db.models import F, Max, Q
 
 from apps.enrollments.models import (
-    BillStatus,
+    NON_OUTSTANDING_STATUSES,
     EnrollmentStatus,
     Installment,
     InstallmentPlan,
@@ -162,7 +162,7 @@ def overdue_status_by_patient(ids) -> dict:
             enrollment__status=EnrollmentStatus.ACTIVE,
             due_date__lt=today,
         )
-        .exclude(status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF, BillStatus.ADVANCE])
+        .exclude(status__in=NON_OUTSTANDING_STATUSES)
         .filter(amount_paid__lt=F("amount"))
         .values_list("enrollment__patient_id", "due_date", "amount", "amount_paid")
     )
@@ -174,7 +174,7 @@ def overdue_status_by_patient(ids) -> dict:
             plan__status=EnrollmentStatus.ACTIVE,
             due_date__lt=today,
         )
-        .exclude(status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF, BillStatus.ADVANCE])
+        .exclude(status__in=NON_OUTSTANDING_STATUSES)
         .filter(amount_paid__lt=F("amount"))
         .values_list("plan__patient_id", "due_date", "amount", "amount_paid")
     )

@@ -109,37 +109,13 @@ services:
       - key: POSTGRES_SSLMODE
         value: require
 
-  - type: cron
-    name: speech-erp-terminate-unpaid-monthly
-    runtime: python
-    region: singapore
-    # 00:05 daily, so it sees the month that has just finished. Daily rather
-    # than monthly on purpose: the rule is about a month ending, but a
-    # service that dodged one run has to be caught the next day, not never.
-    schedule: "5 0 * * *"
-    buildCommand: "pip install -r requirements/prod.txt"
-    startCommand: "python manage.py terminate_unpaid_monthly_services"
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.8
-      - key: DJANGO_SETTINGS_MODULE
-        value: config.settings.production
-      - key: DJANGO_SECRET_KEY
-        sync: false
-      - key: DJANGO_ALLOWED_HOSTS
-        sync: false
-      - key: POSTGRES_DB
-        sync: false
-      - key: POSTGRES_USER
-        sync: false
-      - key: POSTGRES_PASSWORD
-        sync: false
-      - key: POSTGRES_HOST
-        sync: false
-      - key: POSTGRES_PORT
-        value: "5432"
-      - key: POSTGRES_SSLMODE
-        value: require
+  # No cron for terminate_unpaid_monthly_services, deliberately.
+  #
+  # Making a service inactive is a manager's decision now, taken month by
+  # month with a written reason for anything cancelled — a nightly job doing
+  # it silently would be the one thing that rule exists to prevent, and the
+  # patient would have no route back that anybody could see. The management
+  # command is kept for the manual catch-up case; nothing schedules it.
 
   # ---------------------------------------------------------------------
   # Scheduled attendance close-out

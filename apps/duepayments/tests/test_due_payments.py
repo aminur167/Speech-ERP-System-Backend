@@ -46,16 +46,20 @@ class TestDueListing:
         assert Decimal(results[0]["amount"]) == Decimal("5000.00")
 
     def test_only_the_oldest_unpaid_appears_per_enrollment(
-        self, manager_client, enrollment
+        self, manager_client, enrollment, open_months
     ):
         """
-        Three bills exist, but only one is payable under oldest-first. Listing
-        the others would offer actions that would be refused.
+        Several months are owed, but only one is payable under oldest-first.
+        Listing the others would offer actions that would be refused.
         """
+        open_months(enrollment, 3)
         assert enrollment.bills.count() == 3
         assert len(manager_client.get(reverse("duepayments:due-list")).json()["results"]) == 1
 
-    def test_paid_enrollment_drops_out(self, manager_client, manager, branch, enrollment):
+    def test_paid_enrollment_drops_out(
+        self, manager_client, manager, branch, enrollment, open_months
+    ):
+        open_months(enrollment, 2)
         enrollment_services.collect_bill_payment(
             actor=manager, branch=branch,
             bill=enrollment.oldest_unpaid_bill(), method="cash",
@@ -64,10 +68,26 @@ class TestDueListing:
         results = manager_client.get(reverse("duepayments:due-list")).json()["results"]
         assert len(results) == 1  # the next month is now payable
 
-    def test_terminated_enrollment_is_excluded(self, manager_client, enrollment):
+    def test_an_inactive_services_kept_due_is_still_listed(
+        self, manager_client, enrollment
+    ):
+        """
+        Deliberate reversal. A month kept when the service was made inactive is
+        still owed, and this screen is the only place it can be cleared — which
+        the patient must do before anything can be reactivated. `serviceActive`
+        is how the row says the service is no longer running.
+        """
         enrollment.status = EnrollmentStatus.TERMINATED
         enrollment.save(update_fields=["status"])
 
+        body = manager_client.get(reverse("duepayments:due-list")).json()
+
+        assert body["count"] == 1
+        assert body["results"][0]["serviceActive"] is False
+
+    def test_a_cancelled_bill_is_excluded(self, manager_client, enrollment):
+        """Cancelled at inactivation: forgiven, so owed by nobody."""
+        enrollment.bills.update(status=BillStatus.CANCELLED)
         assert manager_client.get(reverse("duepayments:due-list")).json()["count"] == 0
 
     def test_written_off_bill_is_excluded(self, manager_client, enrollment):
@@ -318,9 +338,9 @@ class TestMonthlyCycleFilter:
         assert results[0]["month"] == this_month
 
     def test_paying_the_running_month_moves_the_due_to_the_next_one(
-        self, manager_client, manager, branch, enrollment
+        self, manager_client, manager, branch, enrollment, open_months
     ):
-        this_month, next_month = self._months(enrollment)[:2]
+        this_month, next_month = [b.month for b in open_months(enrollment, 2)][:2]
 
         enrollment_services.collect_bill_payment(
             actor=manager, branch=branch,
@@ -339,13 +359,13 @@ class TestMonthlyCycleFilter:
         assert moved["results"][0]["month"] == next_month
 
     def test_someone_who_owes_an_older_month_still_shows_in_this_one(
-        self, manager_client, enrollment
+        self, manager_client, enrollment, open_months
     ):
         """
         The worst thing this filter could do is hide the most overdue patient
         from the month the manager is actually looking at.
         """
-        this_month, next_month = self._months(enrollment)[:2]
+        this_month, next_month = [b.month for b in open_months(enrollment, 2)][:2]
 
         results = manager_client.get(
             reverse("duepayments:due-list"), {"month": next_month}

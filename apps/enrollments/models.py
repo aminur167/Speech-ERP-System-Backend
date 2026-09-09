@@ -38,11 +38,32 @@ class BillStatus(models.TextChoices):
     # from Outstanding Due — the only sanctioned way to close an uncollectable
     # enrollment, since termination is otherwise blocked while dues exist.
     WRITTEN_OFF = "written_off", "Written off"
+    # Cancelled by a manager when they made the service inactive, month by
+    # month, with a written reason. Kept apart from WRITTEN_OFF on purpose:
+    # both mean "nobody owes this any more", but only one of them was a
+    # branch-desk decision, and Admin reviewing why the amount owed went down
+    # needs to be able to tell them apart.
+    CANCELLED = "cancelled", "Cancelled"
     # Paid before the month arrived. **Always fully prepaid** — the advance
     # flow settles whole months only, so `advance` implies
     # `amount_paid == amount` and every read site can rely on that. The
     # invariant is what keeps this status from spawning a dozen partial cases.
     ADVANCE = "advance", "Paid in advance"
+
+
+# Named groups rather than repeated literals. Every one of these lists used to
+# be written out at each read site, which is how `advance` came to be missing
+# from one of them; adding a status now means editing one place.
+
+#: Forgiven — the amount is owed by nobody.
+FORGIVEN_STATUSES = frozenset({BillStatus.WRITTEN_OFF, BillStatus.CANCELLED})
+
+#: Nothing left to collect: settled, or forgiven.
+CLOSED_STATUSES = frozenset({BillStatus.PAID}) | FORGIVEN_STATUSES
+
+#: Everything Outstanding Due must ignore. Advance is money already taken for
+#: a month that has not arrived, so it is neither owed nor collectable now.
+NON_OUTSTANDING_STATUSES = CLOSED_STATUSES | frozenset({BillStatus.ADVANCE})
 
 
 class PayableMixin(models.Model):
@@ -87,8 +108,8 @@ class PayableMixin(models.Model):
 
     @property
     def outstanding(self) -> Decimal:
-        """What's still owed. Written-off amounts are owed by nobody."""
-        if self.status == BillStatus.WRITTEN_OFF:
+        """What's still owed. Forgiven amounts are owed by nobody."""
+        if self.status in FORGIVEN_STATUSES:
             return Decimal("0.00")
         return max(Decimal("0.00"), self.amount - self.amount_paid)
 
@@ -103,7 +124,7 @@ class PayableMixin(models.Model):
         Derived, never stored: a stored flag would go stale the moment a date
         passed without anything writing to the row.
         """
-        if self.status in {BillStatus.PAID, BillStatus.WRITTEN_OFF} or self.is_settled:
+        if self.status in CLOSED_STATUSES or self.is_settled:
             return False
         reference = on or date.today()
         return reference > self.due_date
@@ -122,7 +143,7 @@ class PayableMixin(models.Model):
 
     def effective_status(self, *, on: date | None = None) -> str:
         """Status with overdue applied, for display and reporting."""
-        if self.status in {BillStatus.PAID, BillStatus.WRITTEN_OFF}:
+        if self.status in CLOSED_STATUSES:
             return self.status
         if self.status == BillStatus.ADVANCE:
             # Derived as well as stored, and checked here *before*
@@ -203,9 +224,7 @@ class MonthlyEnrollment(TimeStampedModel):
         otherwise look collectable.
         """
         return (
-            self.bills.exclude(
-                status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF, BillStatus.ADVANCE]
-            )
+            self.bills.exclude(status__in=NON_OUTSTANDING_STATUSES)
             .filter(amount_paid__lt=models.F("amount"))
             .order_by("month")
         )
@@ -307,13 +326,16 @@ class InstallmentPlan(TimeStampedModel):
     def outstanding_total(self) -> Decimal:
         return sum((i.outstanding for i in self.installments.all()), Decimal("0.00"))
 
-    def oldest_unpaid_installment(self):
+    def unpaid_installments(self):
+        """Every installment still owed, in schedule order."""
         return (
-            self.installments.exclude(status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF])
+            self.installments.exclude(status__in=CLOSED_STATUSES)
             .filter(amount_paid__lt=models.F("amount"))
             .order_by("index")
-            .first()
         )
+
+    def oldest_unpaid_installment(self):
+        return self.unpaid_installments().first()
 
 
 class Installment(PayableMixin):

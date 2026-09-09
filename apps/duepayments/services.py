@@ -19,8 +19,10 @@ from django.utils import timezone
 
 from apps.enrollments.services import month_key
 from apps.enrollments.models import (
+    CLOSED_STATUSES,
+    FORGIVEN_STATUSES,
+    NON_OUTSTANDING_STATUSES,
     BillStatus,
-    EnrollmentStatus,
     Installment,
     MonthlyBill,
 )
@@ -39,7 +41,7 @@ def _end_of_day(day: date):
 
 def _was_outstanding_at(payable, cutoff) -> bool:
     """Unpaid as of `cutoff` — either never paid, or paid after it."""
-    if payable.status == BillStatus.WRITTEN_OFF:
+    if payable.status in FORGIVEN_STATUSES:
         return False
     if payable.paid_at is None:
         return True
@@ -95,10 +97,14 @@ def collect_due_items(
     """
     items: list[dict] = []
 
+    # Inactive services are included. Their kept months are still owed, and
+    # the Due Payments screen is the only place they can be cleared — which a
+    # returning patient must do before any service can be reactivated. Each
+    # row carries `serviceActive` so the screen can say which is which.
     bills = (
-        MonthlyBill.objects.filter(enrollment__status=EnrollmentStatus.ACTIVE)
+        MonthlyBill.objects
         .exclude(
-            status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF, BillStatus.ADVANCE]
+            status__in=NON_OUTSTANDING_STATUSES
         )
         .select_related(
             "enrollment", "enrollment__patient", "enrollment__service", "enrollment__branch"
@@ -146,12 +152,13 @@ def collect_due_items(
                 "outstandingTotal": enrollment.outstanding_total(),
                 "dueDate": bill.due_date,
                 "status": bill.effective_status(),
+                "serviceActive": enrollment.is_active,
             }
         )
 
     installments = (
-        Installment.objects.filter(plan__status=EnrollmentStatus.ACTIVE)
-        .exclude(status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF])
+        Installment.objects
+        .exclude(status__in=CLOSED_STATUSES)
         .select_related("plan", "plan__patient", "plan__service", "plan__branch")
         .order_by("plan_id", "index")
     )
@@ -187,6 +194,7 @@ def collect_due_items(
                 "outstandingTotal": plan.outstanding_total(),
                 "dueDate": installment.due_date,
                 "status": installment.effective_status(),
+                "serviceActive": plan.is_active,
                 "installmentIndex": installment.index,
                 "installmentsTotal": total_parts,
                 "installmentsRemaining": total_parts - installment.index,
@@ -198,15 +206,14 @@ def collect_due_items(
 
 def _installment_balance(*, branch_id=None) -> Decimal:
     """
-    Everything still owed on active installment plans, right now.
+    Everything still owed on installment plans, right now.
 
-    Written-off installments are excluded — that's the sanctioned way to close
-    an uncollectable plan, so counting them would make the figure impossible
-    to ever clear.
+    Forgiven installments are excluded — a write-off or a cancellation is the
+    sanctioned way to close an uncollectable plan, so counting them would make
+    the figure impossible to ever clear. Plans made inactive are *not*
+    excluded: whatever the manager chose to keep is still owed.
     """
-    installments = Installment.objects.filter(
-        plan__status=EnrollmentStatus.ACTIVE
-    ).exclude(status__in=[BillStatus.PAID, BillStatus.WRITTEN_OFF])
+    installments = Installment.objects.exclude(status__in=CLOSED_STATUSES)
     if branch_id:
         installments = installments.filter(plan__branch_id=branch_id)
 
@@ -244,8 +251,11 @@ def due_summary(*, branch_id=None, as_of: date | None = None) -> dict:
     cutoff = _end_of_day(as_of)
 
     monthly_total = Decimal("0.00")
+    # Inactive services included, matching `collect_due_items` — a kept month
+    # is owed whether or not the service is still running, and the two have to
+    # agree or today's reconstruction stops matching today's snapshot.
     bills = (
-        MonthlyBill.objects.filter(enrollment__status=EnrollmentStatus.ACTIVE)
+        MonthlyBill.objects
         .select_related("enrollment")
         .order_by("enrollment_id", "month")
     )
@@ -256,13 +266,12 @@ def due_summary(*, branch_id=None, as_of: date | None = None) -> dict:
     for bill in bills:
         if bill.enrollment_id in seen:
             continue
-        # All of an enrollment's bills are created together, upfront
-        # (create_monthly_enrollment bulk_creates months_ahead of them, most
-        # with status "upcoming"), not lazily as each month arrives. So a
-        # bill's due_date being in a future month says nothing about whether
-        # the row existed yet -- it already does. What decides existence is
-        # when the enrollment itself was created; mirrors the installment
-        # loop's `plan.created_at` check below for the same reason.
+        # A bill's due_date says nothing about when the row started existing,
+        # so existence is decided by when the enrollment was created —
+        # mirroring the installment loop's `plan.created_at` check below.
+        # Ordinary months are now raised as they arrive, but months paid ahead
+        # are created early, which is what the advance guard just below is
+        # for.
         if bill.enrollment.created_at > cutoff:
             continue
         # A month paid ahead was never owed on a date before it began. Its
@@ -284,7 +293,7 @@ def due_summary(*, branch_id=None, as_of: date | None = None) -> dict:
 
     installment_total = Decimal("0.00")
     installments = (
-        Installment.objects.filter(plan__status=EnrollmentStatus.ACTIVE)
+        Installment.objects
         .select_related("plan")
         .order_by("plan_id", "index")
     )

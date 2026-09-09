@@ -54,8 +54,11 @@ def installment_service(service_factory):
 
 
 @pytest.fixture
-def enroll_monthly(manager, branch, monthly_service):
+def enroll_monthly(manager, branch, monthly_service, settle_dues):
     def _enroll(patient, service=None, target_branch=None):
+        # Anything already owed is settled first: a patient with an unpaid due
+        # cannot be enrolled in another service.
+        settle_dues(patient)
         return enrollment_services.create_monthly_enrollment(
             actor=manager,
             branch=target_branch or branch,
@@ -67,8 +70,9 @@ def enroll_monthly(manager, branch, monthly_service):
 
 
 @pytest.fixture
-def enroll_installment(manager, branch, installment_service):
+def enroll_installment(manager, branch, installment_service, settle_dues):
     def _enroll(patient, service=None):
+        settle_dues(patient)
         return enrollment_services.create_installment_plan(
             actor=manager,
             branch=branch,
@@ -506,9 +510,15 @@ class TestActiveServices:
             (i["createdAt"] for i in items), reverse=True
         )
 
-    def test_terminated_services_are_excluded(
+    def test_inactive_services_are_listed_and_flagged_not_hidden(
         self, manager_client, patient_factory, enroll_monthly, enroll_installment
     ):
+        """
+        They used to be dropped. The profile now has to offer Reactivate and
+        show what was kept or cancelled, so an inactive service that vanished
+        from this list would be unreachable — which is exactly how the old
+        auto-stopped services became invisible.
+        """
         patient = patient_factory()
         enrollment = enroll_monthly(patient)
         enroll_installment(patient)
@@ -517,8 +527,10 @@ class TestActiveServices:
 
         items = manager_client.get(active_services_url(patient)).json()
 
-        assert len(items) == 1
-        assert items[0]["type"] == "installment"
+        assert len(items) == 2
+        by_type = {item["type"]: item for item in items}
+        assert by_type["monthly"]["isActive"] is False
+        assert by_type["installment"]["isActive"] is True
 
     def test_a_patient_with_none_gets_an_empty_list(
         self, manager_client, patient_factory
@@ -539,7 +551,7 @@ class TestActiveServices:
         item = manager_client.get(active_services_url(patient)).json()[0]
 
         assert item["serviceName"] == "Speech Therapy Monthly"
-        assert len(item["enrollment"]["bills"]) == 3
+        assert len(item["enrollment"]["bills"]) == 1
 
     def test_installment_items_carry_their_installments_and_total(
         self, manager_client, patient_factory, enroll_installment
@@ -673,15 +685,19 @@ class TestOverdueServiceStatus:
         assert row["serviceStatus"] == "active"
 
     def test_overdue_amount_sums_across_enrollments(
-        self, manager_client, patient_factory, enroll_monthly, enroll_installment
+        self, manager_client, patient_factory, enroll_monthly, enroll_installment,
+        open_months,
     ):
         patient = patient_factory()
         enrollment = enroll_monthly(patient)
+        plan = enroll_installment(patient)
+        # Enrolling the second service settled the first month, so let the
+        # next month arrive and leave that one overdue.
+        open_months(enrollment, 2)
         bill = enrollment.oldest_unpaid_bill()
         MonthlyBill.objects.filter(pk=bill.pk).update(
             due_date=timezone.localdate() - timedelta(days=10)
         )
-        plan = enroll_installment(patient)
         installment = plan.oldest_unpaid_installment()
         Installment.objects.filter(pk=installment.pk).update(
             due_date=timezone.localdate() - timedelta(days=3)
