@@ -675,6 +675,24 @@ def terminate(
     kept_total = sum((item.outstanding for item in kept), Decimal("0.00"))
 
     if waived:
+        # Month by month, with the manager's own words against each — a partial
+        # write-off has to be at least as legible in the audit log as a
+        # wholesale one.
+        #
+        # Built **before** the statuses change, because `outstanding` is zero
+        # for a forgiven item by definition. Reading it afterwards recorded
+        # every cancelled month as ৳0.00 — a breakdown that named the months
+        # correctly and said each of them cost nothing, which is worse than no
+        # breakdown at all.
+        breakdown = [
+            {
+                "label": item.label,
+                "amount": str(item.outstanding),
+                "reason": (waivers or {}).get(item.pk, "") or reason,
+            }
+            for item in waived
+        ]
+
         for item in waived:
             item.status = waived_status
             item.save(update_fields=["status"])
@@ -688,17 +706,7 @@ def terminate(
             changes={
                 "writtenOff": str(outstanding),
                 "kind": waived_status,
-                # Month by month, with the manager's own words against each —
-                # a partial write-off has to be at least as legible in the
-                # audit log as a wholesale one.
-                "months": [
-                    {
-                        "label": item.label,
-                        "amount": str(item.outstanding),
-                        "reason": (waivers or {}).get(item.pk, "") or reason,
-                    }
-                    for item in waived
-                ],
+                "months": breakdown,
             },
         )
 

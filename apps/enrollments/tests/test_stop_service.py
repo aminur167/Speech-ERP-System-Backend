@@ -134,6 +134,10 @@ class TestStopping:
         assert Decimal(entry.changes["writtenOff"]) == Decimal("5000.00")
         assert entry.changes["months"][0]["reason"] == "Family could not pay"
         assert entry.changes["months"][0]["label"] == bills[1].label
+        # The per-month figure, not just the total. Read after the status
+        # changed it would be 0.00 for every row — a breakdown naming the
+        # months correctly and saying each cost nothing.
+        assert Decimal(entry.changes["months"][0]["amount"]) == Decimal("5000.00")
 
     def test_the_kept_total_is_recorded_too(self, manager_client, owing_two_months):
         """A partial write-off has to be as legible as a wholesale one."""
