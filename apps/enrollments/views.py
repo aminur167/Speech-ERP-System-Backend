@@ -55,8 +55,12 @@ def _error(exc: services.EnrollmentError, http_status=status.HTTP_400_BAD_REQUES
 class _EnrollmentBase(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
     http_method_names = ["get", "post", "head", "options"]
 
+    # Reads, as opposed to the branch-desk actions below them. Admin can see
+    # everything; only a Manager transacts on a branch's behalf.
+    READ_ACTIONS = {"list", "retrieve", "terminated"}
+
     def get_permissions(self):
-        if self.action in {"list", "retrieve"}:
+        if self.action in self.READ_ACTIONS:
             return [IsAuthenticated()]
         return [IsManager()]
 

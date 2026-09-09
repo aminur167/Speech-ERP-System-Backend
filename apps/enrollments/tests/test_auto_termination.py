@@ -577,3 +577,18 @@ class TestResumeEndpoint:
         assert [row["month"] for row in results] == [
             services.month_key(timezone.localdate())
         ]
+
+    def test_admin_can_read_the_list(self, admin_client, lapsed):
+        """
+        Admin's branch drill-down shows this screen read-only. Listing is a
+        read, so it must not fall under the manager-only rule that guards
+        collecting and terminating.
+        """
+        body = admin_client.get(TERMINATED_URL).json()
+
+        assert body["count"] == 1
+        assert body["results"][0]["patientName"] == lapsed.patient.name
+
+    def test_admin_cannot_resume(self, admin_client, lapsed):
+        """Restarting a service is a branch-desk action, like collecting."""
+        assert admin_client.post(resume_url(lapsed), {"carryDue": False}).status_code == 403
