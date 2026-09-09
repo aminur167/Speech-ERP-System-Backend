@@ -86,6 +86,7 @@ class StaffMemberViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
     @action(detail=False, methods=["get"])
     def summary(self, request):
         queryset = self.get_queryset()
+        services.mark_no_show_absentees(queryset)
         today = timezone.localdate()
         today_records = StaffAttendance.objects.filter(staff__in=queryset, date=today)
 
@@ -114,8 +115,10 @@ class StaffMemberViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
     @action(detail=False, methods=["get"], url_path="today-attendance")
     def today_attendance(self, request):
         """`{staffId: attendanceRecord}` for the requesting scope's roster — missing keys mean not yet marked today."""
+        queryset = self.get_queryset()
+        services.mark_no_show_absentees(queryset)
         today = timezone.localdate()
-        records = StaffAttendance.objects.filter(staff__in=self.get_queryset(), date=today)
+        records = StaffAttendance.objects.filter(staff__in=queryset, date=today)
         return Response(
             {str(record.staff_id): StaffAttendanceSerializer(record).data for record in records}
         )

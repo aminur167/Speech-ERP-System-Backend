@@ -22,10 +22,13 @@ from apps.common.sequences import next_value
 from apps.notifications.inapp import notify, notify_many
 from apps.staff.models import SalaryPayment, StaffAttendance, StaffBonus, StaffMember
 
-# Check-ins at or after this hour are "late" rather than "present" — mirrors
-# the frontend mock's LATE_AFTER_HOUR so behaviour doesn't change when the
-# real endpoint replaces it.
-LATE_AFTER_HOUR = 10
+# Office hours: 9am-4pm. Check-ins at or after the start hour are "late"
+# rather than "present"; anyone still unmarked once the end hour passes is
+# auto-marked absent (see `mark_no_show_absentees`).
+OFFICE_START_HOUR = 9
+OFFICE_END_HOUR = 16
+
+LATE_AFTER_HOUR = OFFICE_START_HOUR
 
 
 @transaction.atomic
@@ -99,6 +102,41 @@ def mark_attendance(*, staff: StaffMember, status: str) -> StaffAttendance:
     record.check_out_at = None
     record.save(update_fields=["status", "check_in_at", "check_out_at"])
     return record
+
+
+def mark_no_show_absentees(staff_queryset) -> None:
+    """
+    Once office hours (4pm) are over, anyone in scope with no attendance row
+    for today gets auto-marked absent — a Manager shouldn't have to remember
+    to close out no-shows by hand.
+
+    A no-op before 4pm. Safe to call on every `today-attendance`/`summary`
+    request: `ignore_conflicts` makes it idempotent against the
+    (staff, date) unique constraint, and a manager checking someone in for
+    real afterwards (e.g. a late arrival) simply overwrites this placeholder
+    row via `check_in`, which always reassigns status regardless of the
+    existing value.
+    """
+    now = timezone.localtime()
+    if now.hour < OFFICE_END_HOUR:
+        return
+
+    today = now.date()
+    staff_list = list(staff_queryset)
+    already_marked = set(
+        StaffAttendance.objects.filter(
+            staff_id__in=[member.id for member in staff_list], date=today
+        ).values_list("staff_id", flat=True)
+    )
+    to_create = [
+        StaffAttendance(
+            staff=member, branch=member.branch, date=today, status=StaffAttendance.Status.ABSENT
+        )
+        for member in staff_list
+        if member.id not in already_marked
+    ]
+    if to_create:
+        StaffAttendance.objects.bulk_create(to_create, ignore_conflicts=True)
 
 
 @transaction.atomic
