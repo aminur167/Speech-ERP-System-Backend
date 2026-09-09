@@ -10,8 +10,8 @@ never to a name the client sends.
 Day-of attendance is deliberately only ever one of three derived states:
 Present, Absent (no show by close — see `mark_no_show_absentees`), or Early
 Leave (checked out before closing). "On Leave" remains a manual override via
-`mark_attendance` for planned absences. Older "late" rows from before this
-model existed are left as recorded, not backfilled.
+`mark_attendance` for planned absences. There is no "Late" status — arrival
+time doesn't change the outcome, only departure time does.
 """
 
 from collections import defaultdict
@@ -215,7 +215,6 @@ def monthly_report(staff_queryset, *, year: int, month: int) -> list[dict]:
                 "bonusTotal": bonus_total,
                 "netPayable": member.monthly_salary + bonus_total,
                 "presentCount": counts.get(StaffAttendance.Status.PRESENT, 0),
-                "lateCount": counts.get(StaffAttendance.Status.LATE, 0),
                 "earlyLeaveCount": counts.get(StaffAttendance.Status.EARLY_LEAVE, 0),
                 "absentCount": counts.get(StaffAttendance.Status.ABSENT, 0),
                 "leaveCount": counts.get(StaffAttendance.Status.ON_LEAVE, 0),

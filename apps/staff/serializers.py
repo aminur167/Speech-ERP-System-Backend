@@ -54,7 +54,7 @@ class StaffAttendanceSerializer(serializers.ModelSerializer):
 
 
 class MarkAttendanceSerializer(serializers.Serializer):
-    """Manual status overrides only — "present"/"late" are always derived server-side from the check-in time."""
+    """Manual status overrides only — "present"/"early_leave" are always derived server-side from the clock."""
 
     status = serializers.ChoiceField(
         choices=[StaffAttendance.Status.ON_LEAVE, StaffAttendance.Status.ABSENT]
@@ -149,7 +149,6 @@ class StaffMonthlyReportRowSerializer(serializers.Serializer):
     bonusTotal = serializers.DecimalField(max_digits=12, decimal_places=2)
     netPayable = serializers.DecimalField(max_digits=12, decimal_places=2)
     presentCount = serializers.IntegerField()
-    lateCount = serializers.IntegerField()
     earlyLeaveCount = serializers.IntegerField()
     absentCount = serializers.IntegerField()
     leaveCount = serializers.IntegerField()

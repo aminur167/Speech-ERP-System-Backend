@@ -265,7 +265,7 @@ class TestNoShowAutoAbsent:
         ):
             services.mark_no_show_absentees(StaffMember.objects.filter(pk=farhana.id))
         record = services.check_in(staff=farhana)
-        assert record.status in (StaffAttendance.Status.PRESENT, StaffAttendance.Status.LATE)
+        assert record.status == StaffAttendance.Status.PRESENT
         assert record.check_in_at is not None
 
     def test_today_attendance_endpoint_reflects_auto_absent(self, manager_client, farhana):
@@ -352,10 +352,6 @@ class TestMonthlyReport:
             status=StaffAttendance.Status.PRESENT,
         )
         StaffAttendance.objects.create(
-            staff=farhana, branch=farhana.branch, date=today.replace(day=2),
-            status=StaffAttendance.Status.LATE,
-        )
-        StaffAttendance.objects.create(
             staff=farhana, branch=farhana.branch, date=today.replace(day=3),
             status=StaffAttendance.Status.ON_LEAVE,
         )
@@ -368,7 +364,6 @@ class TestMonthlyReport:
         rows = services.monthly_report([farhana], year=today.year, month=today.month)
         row = rows[0]
         assert row["presentCount"] == 1
-        assert row["lateCount"] == 1
         assert row["earlyLeaveCount"] == 1
         assert row["leaveCount"] == 1
         assert row["absentCount"] == 0

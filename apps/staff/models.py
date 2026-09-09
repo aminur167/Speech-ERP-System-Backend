@@ -64,7 +64,6 @@ class StaffAttendance(TimeStampedModel):
 
     class Status(models.TextChoices):
         PRESENT = "present", "Present"
-        LATE = "late", "Late"  # retained for pre-existing records; no longer produced
         EARLY_LEAVE = "early_leave", "Early Leave"
         ON_LEAVE = "on_leave", "On Leave"
         ABSENT = "absent", "Absent"
