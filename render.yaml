@@ -140,3 +140,47 @@ services:
         value: "5432"
       - key: POSTGRES_SSLMODE
         value: require
+
+  # ---------------------------------------------------------------------
+  # Scheduled attendance close-out
+  #
+  # Without this, a no-show is only ever marked absent lazily, the next time
+  # someone opens the Staff page after 4pm -- correct eventually, but not
+  # "real-time" if nobody happens to look that day. This closes every
+  # branch out on a timer instead. Low-stakes compared to the billing jobs
+  # above (nothing financial depends on it, and the lazy per-request check
+  # in apps/staff/views.py stays as a fallback), so it's fine to skip on the
+  # free plan -- see docs/DEPLOYMENT.md §11 for the crontab form.
+  # ---------------------------------------------------------------------
+
+  - type: cron
+    name: speech-erp-close-out-attendance
+    runtime: python
+    region: singapore
+    # 10:05 UTC == 16:05 Asia/Dhaka -- shortly after office hours end. Runs
+    # every day; the weekly holiday (Friday) is skipped inside the command
+    # itself (apps/staff/services.py's mark_no_show_absentees), not here.
+    schedule: "5 10 * * *"
+    buildCommand: "pip install -r requirements/prod.txt"
+    startCommand: "python manage.py close_out_daily_attendance"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: DJANGO_SETTINGS_MODULE
+        value: config.settings.production
+      - key: DJANGO_SECRET_KEY
+        sync: false
+      - key: DJANGO_ALLOWED_HOSTS
+        sync: false
+      - key: POSTGRES_DB
+        sync: false
+      - key: POSTGRES_USER
+        sync: false
+      - key: POSTGRES_PASSWORD
+        sync: false
+      - key: POSTGRES_HOST
+        sync: false
+      - key: POSTGRES_PORT
+        value: "5432"
+      - key: POSTGRES_SSLMODE
+        value: require

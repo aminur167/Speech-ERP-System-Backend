@@ -290,7 +290,41 @@ after.
 
 ---
 
-## 11. Scheduled jobs (reminders)
+## 11. Scheduled jobs (attendance)
+
+Low-stakes compared to §10: nothing financial depends on this one, and the
+lazy per-request check in `apps/staff/views.py` (`today-attendance` and
+`summary` both call `mark_no_show_absentees` on the way in) already covers
+it eventually, the next time anyone opens the Staff page. This is what
+makes it "real-time" instead of dependent on that — every branch's no-shows
+get closed out on a fixed schedule, whether or not anyone looks that day.
+
+```bash
+sudo crontab -u speecherp -e
+# add:
+5 10 * * * SPEECH_ERP_ENV_FILE=/etc/speech-erp/backend.env DJANGO_SETTINGS_MODULE=config.settings.production /opt/speech-erp/backend/.venv/bin/python /opt/speech-erp/backend/manage.py close_out_daily_attendance >> /var/log/speech-erp/attendance.log 2>&1
+```
+
+`10:05 UTC == 16:05 Asia/Dhaka` — shortly after office hours (9am-4pm) end.
+Runs every day of the week; the weekly holiday (Friday) is skipped inside
+`mark_no_show_absentees` itself, not by the schedule, so the clinic's
+calendar lives in exactly one place.
+
+Idempotent and safe to run more than once a day or after a missed run: it
+only ever creates a row for a staff member with no attendance record yet
+for today, so a genuine check-in (including a late arrival after this job
+has already run) is never overwritten.
+
+**On Render**, this is `speech-erp-close-out-attendance` in `render.yaml`.
+Render's cron isn't on the free plan, same as §10 — but unlike §10, skipping
+this on a free deploy costs nothing beyond the lazy per-request fallback
+staying the only path, which is a real degradation (stale statuses until
+someone opens the page) but not a silent data-loss risk the way a missed
+billing run is.
+
+---
+
+## 12. Scheduled jobs (reminders)
 
 Status: built, pending final confirmation with the client on whether it
 ships (`apps/notifications`). Both commands no-op safely (log instead of
@@ -310,7 +344,7 @@ being invoked) or be deleted outright.
 
 ---
 
-## 12. Staging
+## 13. Staging
 
 Staging is **the same `config.settings.production` module**, not a forked
 settings file — the whole point of a staging environment is to run what
@@ -324,7 +358,7 @@ staging first, verify, then repeat the same steps against production.
 
 ---
 
-## 13. Release checklist
+## 14. Release checklist
 
 For every deploy after the first:
 
