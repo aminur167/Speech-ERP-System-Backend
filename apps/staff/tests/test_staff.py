@@ -315,6 +315,95 @@ class TestNoShowAutoAbsent:
             body = manager_client.get(reverse("staff:staffmember-today-attendance")).json()
         assert body[str(farhana.id)]["status"] == "absent"
 
+    def test_returns_the_count_of_staff_newly_marked_absent(self, farhana, staff_member_factory):
+        other = staff_member_factory(name="Also Unmarked")
+        with mock.patch(
+            "apps.staff.services.timezone.localtime",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            marked = services.mark_no_show_absentees(
+                StaffMember.objects.filter(pk__in=[farhana.id, other.id])
+            )
+        assert marked == 2
+
+
+def _at_weekday_hour(weekday: int, hour: int):
+    """A tz-aware datetime on a fixed reference date matching `weekday` (Monday=0..Sunday=6), at `hour`:00 -- independent of whatever day the suite actually runs on, so a Friday-specific test can't itself land on a real Friday's edge cases (or vice versa)."""
+    reference_monday = date(2024, 1, 1)
+    target = reference_monday + timedelta(days=(weekday - reference_monday.weekday()) % 7)
+    return timezone.make_aware(datetime.combine(target, datetime.min.time()) + timedelta(hours=hour))
+
+
+class TestWeeklyHoliday:
+    """Friday is the clinic's weekly holiday -- no no-show is auto-marked absent that day."""
+
+    def test_no_effect_on_friday_after_office_end(self, farhana):
+        friday = _at_weekday_hour(services.WEEKLY_HOLIDAY_WEEKDAY, services.OFFICE_END_HOUR + 1)
+        with mock.patch("apps.staff.services.timezone.localtime", return_value=friday):
+            marked = services.mark_no_show_absentees(StaffMember.objects.filter(pk=farhana.id))
+        assert marked == 0
+        assert not StaffAttendance.objects.filter(staff=farhana, date=friday.date()).exists()
+
+    def test_still_marks_absent_on_an_ordinary_working_day(self, farhana):
+        """Saturday is an ordinary working day in this schedule -- only Friday is special-cased."""
+        saturday = _at_weekday_hour(5, services.OFFICE_END_HOUR + 1)
+        with mock.patch("apps.staff.services.timezone.localtime", return_value=saturday):
+            services.mark_no_show_absentees(StaffMember.objects.filter(pk=farhana.id))
+        record = StaffAttendance.objects.get(staff=farhana, date=saturday.date())
+        assert record.status == StaffAttendance.Status.ABSENT
+
+    def test_a_friday_check_in_still_gets_ordinary_treatment(self, farhana):
+        """The holiday only suppresses the automatic no-show penalty -- someone who does come in on a Friday is just present, same as any other day."""
+        record = services.check_in(staff=farhana)
+        assert record.status == StaffAttendance.Status.PRESENT
+
+
+class TestCloseOutDailyAttendanceCommand:
+    """The `close_out_daily_attendance` management command is the scheduled counterpart to the lazy per-request check — same underlying function, run on a timer instead of on page load."""
+
+    def test_marks_absent_after_office_end(self, farhana):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        with mock.patch(
+            "apps.staff.services.timezone.localtime",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            out = StringIO()
+            call_command("close_out_daily_attendance", stdout=out)
+
+        record = StaffAttendance.objects.get(staff=farhana, date=date.today())
+        assert record.status == StaffAttendance.Status.ABSENT
+        assert "Marked 1 staff member" in out.getvalue()
+
+    def test_no_op_before_office_end(self, farhana):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        with mock.patch(
+            "apps.staff.services.timezone.localtime",
+            return_value=_at_hour(services.OFFICE_END_HOUR - 1),
+        ):
+            out = StringIO()
+            call_command("close_out_daily_attendance", stdout=out)
+
+        assert not StaffAttendance.objects.filter(staff=farhana).exists()
+        assert "Nothing to close out" in out.getvalue()
+
+    def test_ignores_inactive_staff(self, farhana):
+        farhana.status = StaffMember.Status.INACTIVE
+        farhana.save(update_fields=["status"])
+        with mock.patch(
+            "apps.staff.services.timezone.localtime",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            from django.core.management import call_command
+
+            call_command("close_out_daily_attendance")
+        assert not StaffAttendance.objects.filter(staff=farhana).exists()
+
 
 @pytest.mark.money
 class TestBonuses:

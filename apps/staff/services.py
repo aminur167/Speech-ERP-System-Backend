@@ -34,6 +34,13 @@ from apps.staff.models import SalaryPayment, StaffAttendance, StaffBonus, StaffM
 OFFICE_START_HOUR = 9
 OFFICE_END_HOUR = 16
 
+# The clinic's weekly holiday. `date.weekday()` is Monday=0 .. Sunday=6, so
+# Friday is 4. No-show auto-marking skips this day entirely (see
+# `mark_no_show_absentees`) -- nobody is penalised for not showing up on a
+# day nobody is expected to. A staff member who does come in on a Friday
+# still gets ordinary present/early-leave treatment from check-in/check-out.
+WEEKLY_HOLIDAY_WEEKDAY = 4
+
 
 @transaction.atomic
 def create_staff_member(*, actor, branch, data: dict) -> StaffMember:
@@ -110,22 +117,28 @@ def mark_attendance(*, staff: StaffMember, status: str) -> StaffAttendance:
     return record
 
 
-def mark_no_show_absentees(staff_queryset) -> None:
+def mark_no_show_absentees(staff_queryset) -> int:
     """
     Once office hours (4pm) are over, anyone in scope with no attendance row
     for today gets auto-marked absent — a Manager shouldn't have to remember
     to close out no-shows by hand.
 
-    A no-op before 4pm. Safe to call on every `today-attendance`/`summary`
-    request: `ignore_conflicts` makes it idempotent against the
+    A no-op before 4pm, and a no-op entirely on the weekly holiday (Friday):
+    a company that isn't open that day can't have a no-show. Safe to call
+    repeatedly -- from a request handler (`today-attendance`/`summary`) and
+    from the daily `close_out_daily_attendance` cron job alike, which is what
+    makes this "real-time" rather than dependent on someone opening the
+    Staff page after 4pm: `ignore_conflicts` makes it idempotent against the
     (staff, date) unique constraint, and a manager checking someone in for
     real afterwards (e.g. a late arrival) simply overwrites this placeholder
     row via `check_in`, which always reassigns status regardless of the
     existing value.
+
+    Returns how many staff members were newly marked absent.
     """
     now = timezone.localtime()
-    if now.hour < OFFICE_END_HOUR:
-        return
+    if now.hour < OFFICE_END_HOUR or now.weekday() == WEEKLY_HOLIDAY_WEEKDAY:
+        return 0
 
     today = now.date()
     staff_list = list(staff_queryset)
@@ -143,6 +156,7 @@ def mark_no_show_absentees(staff_queryset) -> None:
     ]
     if to_create:
         StaffAttendance.objects.bulk_create(to_create, ignore_conflicts=True)
+    return len(to_create)
 
 
 @transaction.atomic
