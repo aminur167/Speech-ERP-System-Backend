@@ -149,13 +149,23 @@ class StaffMemberViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="check-in", permission_classes=[IsManager])
     def check_in(self, request, pk=None):
         member = self.get_object()
-        record = services.check_in(staff=member)
+        try:
+            record = services.check_in(staff=member)
+        except services.AttendanceError as exc:
+            return Response(
+                {"detail": exc.message, "code": exc.code}, status=status.HTTP_400_BAD_REQUEST
+            )
         return Response(StaffAttendanceSerializer(record).data)
 
     @action(detail=True, methods=["post"], url_path="check-out", permission_classes=[IsManager])
     def check_out(self, request, pk=None):
         member = self.get_object()
-        record = services.check_out(staff=member)
+        try:
+            record = services.check_out(staff=member)
+        except services.AttendanceError as exc:
+            return Response(
+                {"detail": exc.message, "code": exc.code}, status=status.HTTP_400_BAD_REQUEST
+            )
         return Response(StaffAttendanceSerializer(record).data)
 
     @action(
