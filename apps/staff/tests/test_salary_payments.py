@@ -230,6 +230,22 @@ class TestSalaryPaymentBranchIsolation:
         assert response.status_code == 404
 
 
+class TestSalaryPaymentListing:
+    def test_list_carries_the_staff_photo(self, admin_client, manager, farhana, current_month):
+        farhana.photo_url = "data:image/png;base64,iVBORw0KGgo="
+        farhana.save(update_fields=["photo_url"])
+        services.request_salary_payment(actor=manager, staff=farhana, month=current_month)
+
+        results = admin_client.get(reverse("staff:salarypayment-list")).json()["results"]
+        assert results[0]["staffPhotoUrl"] == "data:image/png;base64,iVBORw0KGgo="
+
+    def test_staff_without_a_photo_lists_blank(self, admin_client, manager, farhana, current_month):
+        services.request_salary_payment(actor=manager, staff=farhana, month=current_month)
+
+        results = admin_client.get(reverse("staff:salarypayment-list")).json()["results"]
+        assert results[0]["staffPhotoUrl"] == ""
+
+
 class TestBranchSummary:
     def test_splits_approved_from_paid(self, admin_client, manager, admin_user, farhana, current_month):
         payment = services.request_salary_payment(actor=manager, staff=farhana, month=current_month)

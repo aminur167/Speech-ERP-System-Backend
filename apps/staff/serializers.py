@@ -104,6 +104,9 @@ class SalaryPaymentSerializer(serializers.ModelSerializer):
     staffId = serializers.CharField(source="staff_id", read_only=True)
     staffName = serializers.CharField(source="staff.name", read_only=True)
     staffCode = serializers.CharField(source="staff.staff_code", read_only=True)
+    # Admin's approval queue shows who is being paid at a glance -- the same
+    # avatar the branch roster renders.
+    staffPhotoUrl = serializers.CharField(source="staff.photo_url", read_only=True)
     branchId = serializers.CharField(source="branch_id", read_only=True)
     branchName = serializers.CharField(source="branch.name", read_only=True)
     requestedBy = serializers.CharField(source="requested_by.name", read_only=True, default="")
@@ -119,7 +122,7 @@ class SalaryPaymentSerializer(serializers.ModelSerializer):
     class Meta:
         model = SalaryPayment
         fields = [
-            "id", "staffId", "staffName", "staffCode", "branchId", "branchName",
+            "id", "staffId", "staffName", "staffCode", "staffPhotoUrl", "branchId", "branchName",
             "month", "amount", "status", "requestedBy", "reviewNote", "reviewedBy",
             "reviewedAt", "paymentMethod", "paidAt", "expenseId", "expenseCode", "createdAt",
         ]
