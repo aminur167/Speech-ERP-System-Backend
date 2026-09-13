@@ -14,6 +14,7 @@ class StaffMemberSerializer(serializers.ModelSerializer):
     monthlySalary = serializers.DecimalField(
         source="monthly_salary", max_digits=12, decimal_places=2
     )
+    photoUrl = serializers.CharField(source="photo_url", read_only=True, allow_blank=True)
     branchId = serializers.CharField(source="branch_id", read_only=True)
     createdAt = serializers.DateTimeField(source="created_at", read_only=True)
 
@@ -21,9 +22,16 @@ class StaffMemberSerializer(serializers.ModelSerializer):
         model = StaffMember
         fields = [
             "id", "staffCode", "name", "designation", "phone", "email",
-            "joinedAt", "monthlySalary", "status", "branchId", "createdAt",
+            "joinedAt", "monthlySalary", "photoUrl", "status", "branchId", "createdAt",
         ]
         read_only_fields = ["id", "staffCode", "branchId", "createdAt"]
+
+
+# A data URL big enough to hold the frontend's 512KB-capped image once
+# base64-inflates it (~4/3), plus headroom -- rejecting past this is defence
+# in depth against a client that skips the picker's own size check, not the
+# primary guard.
+MAX_PHOTO_URL_LENGTH = 800_000
 
 
 class StaffMemberWriteSerializer(serializers.ModelSerializer):
@@ -33,12 +41,18 @@ class StaffMemberWriteSerializer(serializers.ModelSerializer):
         model = StaffMember
         fields = [
             "name", "designation", "phone", "email", "joined_at",
-            "monthly_salary", "status",
+            "monthly_salary", "photo_url", "status",
         ]
         extra_kwargs = {
             "email": {"required": False, "allow_blank": True},
+            "photo_url": {"required": False, "allow_blank": True},
             "status": {"required": False},
         }
+
+    def validate_photo_url(self, value):
+        if value and len(value) > MAX_PHOTO_URL_LENGTH:
+            raise serializers.ValidationError("Photo is too large.")
+        return value
 
 
 class StaffAttendanceSerializer(serializers.ModelSerializer):

@@ -37,6 +37,12 @@ class StaffMember(TimeStampedModel, SoftDeleteModel):
         max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal("0.00"))]
     )
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE)
+    # A data URL the client produces client-side (resize + compress, capped at
+    # 512KB before encoding) rather than a hosted file -- there's no real
+    # object storage wired up yet, same tradeoff Material.image_url made.
+    # TextField, not URLField: a data URL is neither shaped like a URL nor
+    # bounded by URLField's short default max_length.
+    photo_url = models.TextField(blank=True)
 
     branch = models.ForeignKey(
         "branches.Branch", on_delete=models.PROTECT, related_name="staff_members"

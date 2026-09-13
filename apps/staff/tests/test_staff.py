@@ -88,6 +88,37 @@ class TestRosterCrud:
         assert response.status_code == 200
         assert response.json()["monthlySalary"] == "45000.00"
 
+    def test_manager_can_set_a_profile_photo(self, manager_client, farhana):
+        data_url = "data:image/png;base64,iVBORw0KGgo="
+        response = manager_client.patch(
+            reverse("staff:staffmember-detail", args=[farhana.id]),
+            {"photo_url": data_url},
+            format="json",
+        )
+        assert response.status_code == 200
+        assert response.json()["photoUrl"] == data_url
+
+    def test_manager_can_remove_a_profile_photo(self, manager_client, farhana):
+        farhana.photo_url = "data:image/png;base64,iVBORw0KGgo="
+        farhana.save(update_fields=["photo_url"])
+
+        response = manager_client.patch(
+            reverse("staff:staffmember-detail", args=[farhana.id]),
+            {"photo_url": ""},
+            format="json",
+        )
+        assert response.status_code == 200
+        assert response.json()["photoUrl"] == ""
+
+    def test_oversized_photo_is_rejected(self, manager_client, farhana):
+        oversized = "data:image/png;base64," + ("a" * 800_001)
+        response = manager_client.patch(
+            reverse("staff:staffmember-detail", args=[farhana.id]),
+            {"photo_url": oversized},
+            format="json",
+        )
+        assert response.status_code == 400
+
     def test_update_requires_full_write_serializer_fields_or_partial(self, manager_client, farhana):
         """PUT without partial should still work when every field is supplied."""
         response = manager_client.put(
