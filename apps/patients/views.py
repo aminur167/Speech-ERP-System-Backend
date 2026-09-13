@@ -44,6 +44,9 @@ from apps.patients.serializers import (
     PatientWriteSerializer,
 )
 from apps.reporting.services import patient_directory_summary
+from apps.common import audit
+from apps.common.models import AuditLog
+from apps.enrollments.models import EnrollmentStatus
 
 
 class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
@@ -236,9 +239,58 @@ class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         return self.update(request, *args, partial=True, **kwargs)
 
     def destroy(self, request, *args, **kwargs):
-        """Soft delete — patient history is never removed."""
+        """
+        Soft delete — patient history is never removed.
+
+        Refused while the patient still has a running service or owes
+        anything. Hiding a patient whose monthly service is active would leave
+        billing running against someone nobody can find, and a debt on a
+        hidden patient can never be collected. The refusal says what to do
+        first, so the menu can show it instead of a dead end.
+        """
         patient = self.get_object()
+
+        active = (
+            patient.monthly_enrollments.filter(status=EnrollmentStatus.ACTIVE).count()
+            + patient.installment_plans.filter(status=EnrollmentStatus.ACTIVE).count()
+        )
+        if active:
+            plural = active != 1
+            return Response(
+                {
+                    "detail": (
+                        f"This patient still has {active} active "
+                        f"service{'s' if plural else ''}. Make {'them' if plural else 'it'} "
+                        "inactive before deleting the patient."
+                    ),
+                    "code": "has_active_services",
+                    "activeServiceCount": active,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        owed = enrollment_services.patient_outstanding_dues(patient)["total"]
+        if owed > 0:
+            return Response(
+                {
+                    "detail": (
+                        f"This patient still owes ৳{owed:,.2f}. Clear the due payments "
+                        "before deleting the patient."
+                    ),
+                    "code": "outstanding_dues",
+                    "total": str(owed),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         patient.delete()
+        audit.record(
+            actor=request.user,
+            action=AuditLog.Action.SOFT_DELETE,
+            target=patient,
+            branch=patient.branch,
+            changes={"code": patient.patient_code},
+        )
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     # -- attendance --------------------------------------------------------
