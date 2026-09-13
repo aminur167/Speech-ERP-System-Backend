@@ -334,3 +334,7 @@ LOGGING = {
         },
     },
 }
+
+# How long an Admin-approved package change stays usable by the Manager who
+# asked for it before it lapses unused (apps/services).
+PACKAGE_ACTION_GRANT_HOURS = env.int("PACKAGE_ACTION_GRANT_HOURS", default=72)

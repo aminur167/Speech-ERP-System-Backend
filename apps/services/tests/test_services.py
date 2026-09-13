@@ -20,7 +20,6 @@ pytestmark = pytest.mark.django_db
 def service_payload(**overrides):
     payload = {
         "name": "Monthly 1:1 Individual Plan",
-        "code": "PKG-M1-01",
         "category": "monthly",
         "fee": "12600.00",
         "is_online": False,
@@ -51,7 +50,7 @@ class TestServiceCrud:
         )
 
         assert response.status_code == 201
-        assert response.json()["code"] == "PKG-M1-01"
+        assert response.json()["code"] == "MON-001"
         assert response.json()["branchId"] == str(branch.id)
 
     def test_admin_create_requires_a_branch(self, admin_client):
@@ -63,36 +62,13 @@ class TestServiceCrud:
         response = admin_client.post(
             reverse("services:service-list"),
             {
-                "name": "Bare", "code": "BARE-01", "category": "daily", "fee": "500.00",
+                "name": "Bare", "category": "daily", "fee": "500.00",
                 "branch": branch.id,
             },
         )
 
         assert response.status_code == 201
         assert response.json()["originalFee"] is None
-
-    def test_duplicate_code_rejected_in_the_same_branch(self, admin_client, service):
-        response = admin_client.post(
-            reverse("services:service-list"),
-            service_payload(code=service.code, branch=service.branch_id),
-        )
-        assert response.status_code == 400
-        assert "code" in response.json()
-
-    def test_same_code_allowed_in_a_different_branch(self, admin_client, service, other_branch):
-        """`code` is unique per branch, not globally -- two branches may each run their own."""
-        response = admin_client.post(
-            reverse("services:service-list"),
-            service_payload(code=service.code, branch=other_branch.id),
-        )
-        assert response.status_code == 201
-
-    def test_code_is_uppercased(self, admin_client, branch):
-        response = admin_client.post(
-            reverse("services:service-list"),
-            service_payload(code="pkg-lower-01", branch=branch.id),
-        )
-        assert response.json()["code"] == "PKG-LOWER-01"
 
     @pytest.mark.money
     def test_fee_round_trips_exactly(self, admin_client, branch):
@@ -102,7 +78,7 @@ class TestServiceCrud:
         )
 
         assert response.json()["fee"] == "12600.50"
-        assert Service.objects.get(code="PKG-M1-01").fee == Decimal("12600.50")
+        assert Service.objects.get(pk=response.json()["id"]).fee == Decimal("12600.50")
 
     @pytest.mark.parametrize("bad_fee", ["0", "0.00", "-100.00"])
     def test_non_positive_fee_rejected(self, admin_client, bad_fee, branch):
@@ -161,6 +137,88 @@ class TestServicePermissions:
 
     def test_anonymous_denied(self, api_client):
         assert api_client.get(reverse("services:service-list")).status_code == 401
+
+
+class TestIssuedCodes:
+    """The system issues every package code; nobody types one."""
+
+    def test_codes_run_in_sequence_per_category(self, admin_client, branch):
+        url = reverse("services:service-list")
+        first = admin_client.post(url, service_payload(branch=branch.id)).json()
+        second = admin_client.post(url, service_payload(name="Second", branch=branch.id)).json()
+        daily = admin_client.post(url, service_payload(category="daily", branch=branch.id)).json()
+
+        assert [first["code"], second["code"], daily["code"]] == ["MON-001", "MON-002", "DAY-001"]
+
+    def test_each_branch_counts_its_own(self, admin_client, branch, other_branch):
+        """`code` is unique per branch, not globally -- two branches may each run their own."""
+        url = reverse("services:service-list")
+        admin_client.post(url, service_payload(branch=branch.id))
+
+        response = admin_client.post(url, service_payload(branch=other_branch.id))
+
+        assert response.json()["code"] == "MON-001"
+
+    def test_a_manager_proposal_gets_a_code_too(self, manager_client):
+        response = manager_client.post(reverse("services:service-list"), service_payload())
+
+        assert response.status_code == 201
+        assert response.json()["code"] == "MON-001"
+
+    def test_a_typed_code_is_ignored(self, admin_client, branch):
+        response = admin_client.post(
+            reverse("services:service-list"),
+            service_payload(code="my-own-code", branch=branch.id),
+        )
+        assert response.json()["code"] == "MON-001"
+
+    def test_a_deleted_packages_code_is_never_reissued(self, admin_client, branch):
+        url = reverse("services:service-list")
+        first = admin_client.post(url, service_payload(branch=branch.id)).json()
+        admin_client.delete(reverse("services:service-detail", args=[first["id"]]))
+
+        response = admin_client.post(url, service_payload(branch=branch.id))
+
+        assert response.json()["code"] == "MON-002"
+
+    def test_older_hand_typed_codes_do_not_disturb_the_sequence(self, admin_client, service):
+        """`service` is MON-INDIV, typed before codes were issued."""
+        response = admin_client.post(
+            reverse("services:service-list"), service_payload(branch=service.branch_id)
+        )
+        assert response.json()["code"] == "MON-001"
+
+    def test_a_code_taken_meanwhile_moves_on_to_the_next(self, admin_client, branch, monkeypatch):
+        """Two creates at once can pick the same number; the second must not fail."""
+        from apps.services import services as workflows
+
+        Service.objects.create(
+            branch=branch, name="Raced", code="MON-001", category="monthly", fee=Decimal("1.00")
+        )
+        real = workflows.next_service_code
+        calls = []
+
+        def stale_then_real(**kwargs):
+            calls.append(kwargs)
+            return "MON-001" if len(calls) == 1 else real(**kwargs)
+
+        monkeypatch.setattr(workflows, "next_service_code", stale_then_real)
+
+        response = admin_client.post(
+            reverse("services:service-list"), service_payload(branch=branch.id)
+        )
+
+        assert response.status_code == 201
+        assert response.json()["code"] == "MON-002"
+
+    def test_the_code_cannot_be_edited(self, admin_client, service):
+        response = admin_client.patch(
+            reverse("services:service-detail", args=[service.id]), {"code": "CHANGED"}
+        )
+
+        assert response.status_code == 200
+        service.refresh_from_db()
+        assert service.code == "MON-INDIV"
 
 
 class TestCategoryFiltering:
@@ -225,7 +283,7 @@ class TestNoRegistrationFee:
         )
 
         assert response.status_code == 201
-        assert not hasattr(Service.objects.get(code="PKG-M1-01"), "registration_fee")
+        assert not hasattr(Service.objects.get(pk=response.json()["id"]), "registration_fee")
         assert "registrationFee" not in response.json()
 
 
@@ -365,13 +423,30 @@ class TestDeactivateVersusDelete:
         assert response.json()["count"] == 1
         assert response.json()["results"][0]["isActive"] is False
 
-    def test_manager_cannot_see_inactive_even_with_the_flag(
+    def test_manager_sees_their_inactive_packages_only_with_the_flag(
         self, admin_client, manager_client, service
     ):
-        """Inactive visibility is Admin-only; the flag must not be a bypass."""
+        """
+        A Manager needs a retired package in view to ask Admin for it back, so
+        the flag shows it — while enrollment pickers, which never pass the
+        flag, stay free of it.
+        """
         admin_client.post(reverse("services:service-deactivate", args=[service.id]))
 
-        response = manager_client.get(
+        plain = manager_client.get(reverse("services:service-list"))
+        flagged = manager_client.get(
+            reverse("services:service-list"), {"includeInactive": "true"}
+        )
+
+        assert plain.json()["count"] == 0
+        assert flagged.json()["count"] == 1
+
+    def test_the_flag_does_not_reach_another_branch(
+        self, admin_client, other_manager_client, service
+    ):
+        admin_client.post(reverse("services:service-deactivate", args=[service.id]))
+
+        response = other_manager_client.get(
             reverse("services:service-list"), {"includeInactive": "true"}
         )
         assert response.json()["count"] == 0

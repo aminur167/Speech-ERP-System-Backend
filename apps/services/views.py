@@ -7,8 +7,10 @@ creates for their own branch. Admin sees every branch and may narrow with
 here and not by the frontend's `canManage` flag alone.
 """
 
+from django.db import transaction
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -18,11 +20,14 @@ from apps.branches.models import Branch
 from apps.common import audit
 from apps.common.mixins import BranchScopedQuerySetMixin
 from apps.common.models import AuditLog
-from apps.common.permissions import IsAdmin
+from apps.common.permissions import IsAdmin, IsManager
 from apps.notifications.inapp import notify_admins, notify_many
 from apps.services import services
-from apps.services.models import Service
+from apps.services.models import PackageActionRequest, Service
 from apps.services.serializers import (
+    PackageActionRequestCreateSerializer,
+    PackageActionRequestSerializer,
+    PackageActionReviewSerializer,
     ServiceReviewSerializer,
     ServiceSerializer,
     ServiceWriteSerializer,
@@ -54,6 +59,14 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         # (de)activate) stays Admin-only, unchanged.
         if self.action == "create":
             return [IsAuthenticated()]
+        # A Manager may edit, delete or (de)activate their own branch's live
+        # packages -- but only by spending an Admin-approved request, checked
+        # inside each action (`_use_approval`), never by role alone. Admin acts
+        # directly. Reviewing proposals and the pending badge stay Admin-only.
+        if self.action in {"update", "partial_update", "destroy", "deactivate", "activate"}:
+            return [IsAuthenticated()]
+        if self.action == "request_action":
+            return [IsManager()]
         return [IsAdmin()]
 
     def get_serializer_class(self):
@@ -87,9 +100,11 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         if self.action != "list":
             return queryset
 
+        # Both roles may opt in: a Manager needs to see their own branch's
+        # retired packages to request reactivation. Enrollment pickers never
+        # pass this, so a retired package still cannot be enrolled into.
         include_inactive = (
             self.request.query_params.get("includeInactive", "").lower() == "true"
-            and self.request.user.is_admin
         )
         if not include_inactive:
             queryset = queryset.filter(is_active=True)
@@ -117,8 +132,7 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         return queryset
 
     def create(self, request, *args, **kwargs):
-        # Resolved before validation, not after, so validate_code can check
-        # the (branch, code) uniqueness constraint against the right branch.
+        # Resolved before saving: the package's code is issued per branch.
         if request.user.is_admin:
             branch_id = self.get_effective_branch_id()
             branch = get_object_or_404(Branch, pk=branch_id)
@@ -133,11 +147,15 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         # pickers (get_queryset above) until Admin reviews it. Admin creates
         # directly for a branch they name explicitly (there's no "their own
         # branch" to default to) and it's live immediately, no self-approval.
+        # The code is issued here, never taken from the request.
         if request.user.is_admin:
-            service = serializer.save(branch=branch)
+            service = services.save_with_next_code(serializer=serializer, branch=branch)
         else:
-            service = serializer.save(
-                branch=branch, review_status=Service.ReviewStatus.PENDING, proposed_by=request.user
+            service = services.save_with_next_code(
+                serializer=serializer,
+                branch=branch,
+                review_status=Service.ReviewStatus.PENDING,
+                proposed_by=request.user,
             )
             branch_name = branch.name if branch else "A branch"
             notify_admins(
@@ -167,18 +185,36 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
             context={"branch": service.branch},
         )
         serializer.is_valid(raise_exception=True)
-        service = serializer.save()
+
+        # Validated before the approval is touched: a form error must never
+        # spend a Manager's one-time permission.
+        try:
+            with transaction.atomic():
+                grant = self._use_approval(service, PackageActionRequest.Action.EDIT)
+                service = serializer.save()
+        except services.ApprovalRequired as exc:
+            return self._approval_required(exc)
 
         after = {"name": service.name, "fee": str(service.fee), "code": service.code}
         changes = audit.diff(before, after)
-        if changes:
+        if changes or grant is not None:
             audit.record(
                 actor=request.user,
                 action=AuditLog.Action.UPDATE,
                 target=service,
-                changes=changes,
+                reason=self._approval_reason(grant),
+                changes=changes or None,
             )
-            self._notify_branch_of_edit(actor=request.user, service=service, changes=changes)
+        if changes:
+            if request.user.is_admin:
+                self._notify_branch_of_edit(actor=request.user, service=service, changes=changes)
+            else:
+                notify_admins(
+                    title="Package edited by branch",
+                    message=f'{service.branch.name} edited "{service.name}" using your approval.',
+                    link="/admin/package-requests",
+                    exclude=request.user,
+                )
         return Response(ServiceSerializer(service).data)
 
     @staticmethod
@@ -238,14 +274,72 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        service.delete()  # soft
+        # After the enrollment check: a refused delete must not spend the
+        # Manager's approval.
+        try:
+            with transaction.atomic():
+                grant = self._use_approval(service, PackageActionRequest.Action.DELETE)
+                service.delete()  # soft
+        except services.ApprovalRequired as exc:
+            return self._approval_required(exc)
+
         audit.record(
             actor=request.user,
             action=AuditLog.Action.SOFT_DELETE,
             target=service,
+            reason=self._approval_reason(grant),
             changes={"code": service.code},
         )
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # -- Manager changes need an approved request -----------------------------
+
+    def _use_approval(self, service, action):
+        """
+        Spend the Manager's approval for this action, or refuse.
+
+        Admin acts directly and needs none. Call inside the transaction that
+        performs the change, so a failed change keeps the approval intact.
+        """
+        if self.request.user.is_admin:
+            return None
+        return services.consume_grant(actor=self.request.user, service=service, action=action)
+
+    @staticmethod
+    def _approval_reason(grant, default: str = "") -> str:
+        """Audit reason that carries the Manager's own words when approval was used."""
+        if grant is None:
+            return default
+        prefix = f"{default} — " if default else ""
+        return f"{prefix}approved request: {grant.reason}"
+
+    @staticmethod
+    def _approval_required(exc):
+        return Response(
+            {"detail": exc.message, "code": exc.code}, status=status.HTTP_403_FORBIDDEN
+        )
+
+    @action(detail=True, methods=["post"], url_path="request-action")
+    def request_action(self, request, pk=None):
+        """
+        A Manager asks Admin for permission to edit, delete, deactivate or
+        activate this package, giving a reason.
+        """
+        service = self.get_object()
+        serializer = PackageActionRequestCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            created = services.request_package_action(
+                actor=request.user,
+                service=service,
+                action=serializer.validated_data["action"],
+                reason=serializer.validated_data["reason"],
+            )
+        except services.ServiceError as exc:
+            return Response(
+                {"detail": exc.message, "code": exc.code}, status=status.HTTP_400_BAD_REQUEST
+            )
+        return Response(PackageActionRequestSerializer(created).data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["post"])
     def review(self, request, pk=None):
@@ -281,14 +375,19 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         plans keep billing, which is the entire point of the distinction.
         """
         service = self.get_object()
-        service.is_active = False
-        service.save(update_fields=["is_active"])
+        try:
+            with transaction.atomic():
+                grant = self._use_approval(service, PackageActionRequest.Action.DEACTIVATE)
+                service.is_active = False
+                service.save(update_fields=["is_active"])
+        except services.ApprovalRequired as exc:
+            return self._approval_required(exc)
 
         audit.record(
             actor=request.user,
             action=AuditLog.Action.UPDATE,
             target=service,
-            reason="Deactivated (retired from sale)",
+            reason=self._approval_reason(grant, "Deactivated (retired from sale)"),
             changes={"is_active": {"from": True, "to": False}},
         )
         return Response(ServiceSerializer(service).data)
@@ -296,14 +395,19 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def activate(self, request, pk=None):
         service = self.get_object()
-        service.is_active = True
-        service.save(update_fields=["is_active"])
+        try:
+            with transaction.atomic():
+                grant = self._use_approval(service, PackageActionRequest.Action.ACTIVATE)
+                service.is_active = True
+                service.save(update_fields=["is_active"])
+        except services.ApprovalRequired as exc:
+            return self._approval_required(exc)
 
         audit.record(
             actor=request.user,
             action=AuditLog.Action.UPDATE,
             target=service,
-            reason="Reactivated",
+            reason=self._approval_reason(grant, "Reactivated"),
             changes={"is_active": {"from": False, "to": True}},
         )
         return Response(ServiceSerializer(service).data)
@@ -337,3 +441,83 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
             counts[str(service_id)] = counts.get(str(service_id), 0) + n
 
         return Response(counts)
+
+
+class PackageActionRequestViewSet(BranchScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet):
+    """
+    /api/services/action-requests/ — Managers asking to change a package.
+
+    A Manager sees their own branch's requests, so the catalog can show what is
+    waiting and what is approved; Admin sees every branch and decides.
+    """
+
+    queryset = PackageActionRequest.objects.select_related(
+        "service", "branch", "requested_by", "reviewed_by"
+    )
+    serializer_class = PackageActionRequestSerializer
+
+    def get_permissions(self):
+        if self.action in {"approve", "reject", "pending_count"}:
+            return [IsAdmin()]
+        return [IsAuthenticated()]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        params = self.request.query_params
+        now = timezone.now()
+
+        wanted = params.get("status", "")
+        if wanted == "expired":
+            queryset = queryset.filter(
+                status=PackageActionRequest.Status.APPROVED, expires_at__lte=now
+            )
+        elif wanted == "approved":
+            queryset = queryset.filter(
+                status=PackageActionRequest.Status.APPROVED, expires_at__gt=now
+            )
+        elif wanted:
+            queryset = queryset.filter(status=wanted)
+
+        # Still in play: waiting for Admin, or approved and not yet spent.
+        if params.get("open", "").lower() == "true":
+            queryset = queryset.filter(
+                Q(status=PackageActionRequest.Status.PENDING)
+                | Q(status=PackageActionRequest.Status.APPROVED, expires_at__gt=now)
+            )
+
+        if params.get("service"):
+            queryset = queryset.filter(service_id=params["service"])
+        return queryset
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        return self._review(request, approve=True)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        return self._review(request, approve=False)
+
+    def _review(self, request, *, approve: bool):
+        target = self.get_object()
+        serializer = PackageActionReviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            target = services.review_package_action(
+                actor=request.user,
+                request=target,
+                approve=approve,
+                review_note=serializer.validated_data.get("reviewNote", ""),
+            )
+        except services.ServiceError as exc:
+            return Response(
+                {"detail": exc.message, "code": exc.code}, status=status.HTTP_400_BAD_REQUEST
+            )
+        return Response(PackageActionRequestSerializer(target).data)
+
+    @action(detail=False, methods=["get"], url_path="pending-count")
+    def pending_count(self, request):
+        """Admin-only — powers the sidebar badge on Package Requests."""
+        count = PackageActionRequest.objects.filter(
+            status=PackageActionRequest.Status.PENDING
+        ).count()
+        return Response({"count": count})
