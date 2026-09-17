@@ -174,6 +174,12 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         # Brute-force protection on login (docs/01-auth-and-branches.md).
         "login": "10/min",
+        # The public website's own booking form -- unauthenticated and
+        # writes a Patient + Booking, so it's the obvious spam/abuse target
+        # among the public/ endpoints. The read-only ones (branch and
+        # service listings, slot availability) carry no such risk and are
+        # left unthrottled.
+        "public_booking": "5/min",
     },
     "TEST_REQUEST_DEFAULT_FORMAT": "json",
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
@@ -269,6 +275,11 @@ BOOKING_ADVANCE_RATIO = env.float("BOOKING_ADVANCE_RATIO", default=0.5)
 # the picker already constrains it in the UI.
 BOOKING_WINDOW_START_HOUR = env.int("BOOKING_WINDOW_START_HOUR", default=10)
 BOOKING_WINDOW_END_HOUR = env.int("BOOKING_WINDOW_END_HOUR", default=18)
+
+# Spacing between the slots the public website's availability endpoint
+# offers, in minutes. Doesn't limit what a direct API call can pass (any
+# "HH:MM" in the window is still accepted), only what the picker is shown.
+BOOKING_SLOT_MINUTES = env.int("BOOKING_SLOT_MINUTES", default=30)
 
 # --------------------------------------------------------------------------
 # Cloudinary (material images — docs/06-materials.md)

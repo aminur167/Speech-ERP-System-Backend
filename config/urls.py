@@ -31,6 +31,10 @@ urlpatterns = [
         name="swagger-ui",
     ),
     path("api/auth/", include("apps.accounts.urls")),
+    # Unauthenticated — the clinic's own public website, not a staff account.
+    # Kept as its own prefix so "everything reachable with no token" stays
+    # one grep away rather than scattered AllowAny overrides.
+    path("api/public/", include("apps.enrollments.public_urls")),
     path("api/branches/", include("apps.branches.urls")),
     path("api/patients/", include("apps.patients.urls")),
     path("api/services/", include("apps.services.urls")),

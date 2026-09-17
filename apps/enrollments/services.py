@@ -38,6 +38,9 @@ from apps.enrollments.models import (
     MonthlyEnrollment,
     due_date_for_month,
 )
+from apps.notifications.inapp import notify
+from apps.patients import services as patient_services
+from apps.patients.models import Patient
 from apps.payments import services as payment_services
 from apps.payments.models import Payment, PaymentCategory
 
@@ -1368,6 +1371,144 @@ def cancel_booking(*, actor, booking: Booking, reason: str = "") -> Booking:
         reason=reason,
     )
     return booking
+
+
+# ---------------------------------------------------------------------------
+# Public (unauthenticated) online booking -- the clinic's own website, not a
+# staff account. See docs on `create_public_booking` for how this differs
+# from the in-clinic `create_booking` above.
+# ---------------------------------------------------------------------------
+
+
+def _find_or_create_public_patient(*, branch, patient_data: dict) -> Patient:
+    """
+    A repeat visitor typing the same phone number should land on their
+    existing file, not fork a new one every time they book online -- unlike
+    the front-desk register flow (`patients.services.create_patient`), which
+    trusts a receptionist to know whether this really is a new person.
+    """
+    phone = patient_data.get("phone", "")
+    existing = (
+        Patient.objects.filter(branch=branch, phone=phone).order_by("-created_at").first()
+    )
+    if existing is not None:
+        return existing
+
+    # `create_patient` takes these two as separate kwargs, not as fields
+    # inside `data` (it spreads `data` straight into `Patient.objects.create`,
+    # which would collide with its own `idempotency_key`/`client_created_at`
+    # arguments) -- pulled out here rather than asking every caller to know that.
+    data = dict(patient_data)
+    idempotency_key = data.pop("idempotency_key", None)
+    client_created_at = data.pop("client_created_at", None)
+    return patient_services.create_patient(
+        actor=None,
+        branch=branch,
+        data=data,
+        idempotency_key=idempotency_key,
+        client_created_at=client_created_at,
+    )
+
+
+@transaction.atomic
+def create_public_booking(
+    *, branch, service, patient_data: dict, booking_date: date, booking_time: str,
+) -> tuple[Booking, Patient]:
+    """
+    A website visitor books their own appointment -- no staff account, and
+    (unlike `create_booking`) no payment taken up front. The advance is
+    collected in person at the clinic, so it's computed here only as
+    information for the front desk: `Booking.payment` stays null until that
+    actually happens, the same way a Manager would later record it.
+
+    One booking per branch+date+time slot: nothing in this schema assigns a
+    booking to a particular therapist or room, so two visitors can't be
+    allowed to pick the same slot online the way two different staff members
+    might deliberately double-book a shared walk-in slot in person.
+    """
+    _validate_booking_slot(booking_date, booking_time)
+
+    if Booking.objects.filter(
+        branch=branch, date=booking_date, time=booking_time, status=Booking.Status.CONFIRMED,
+    ).exists():
+        raise EnrollmentError("That time slot has just been booked. Please pick another.", code="slot_taken")
+
+    patient = _find_or_create_public_patient(branch=branch, patient_data=patient_data)
+
+    year = timezone.localdate().year
+    value = next_value(f"booking:{branch.code}", year)
+    code = f"BKG-{branch.short_code}-{year}-{str(value).zfill(5)}"
+
+    advance_amount = (
+        service.fee * Decimal(str(settings.BOOKING_ADVANCE_RATIO))
+    ).quantize(Decimal("0.01"))
+
+    booking = Booking.objects.create(
+        booking_code=code,
+        patient=patient,
+        service=service,
+        branch=branch,
+        date=booking_date,
+        time=booking_time,
+        advance_amount=advance_amount,
+    )
+
+    audit.record(
+        actor=None,
+        action=AuditLog.Action.CREATE,
+        target=booking,
+        branch=branch,
+        changes={
+            "booking_code": code,
+            "advance": str(advance_amount),
+            "source": "public_website",
+        },
+    )
+
+    if branch.manager_id:
+        notify(
+            recipient=branch.manager,
+            title="New online booking",
+            message=(
+                f"{patient.name} booked {service.name} for {booking_date} at "
+                f"{booking_time} through the website."
+            ),
+            link="/manager/appointments",
+        )
+
+    return booking, patient
+
+
+def public_booking_availability(*, branch, target_date: date) -> list[dict]:
+    """
+    Every bookable time in the clinic's booking window for one day, each
+    flagged with whether it's still open -- what the website's picker reads
+    to grey out a slot instead of letting a visitor pick one only to have
+    `create_public_booking` reject it a moment later.
+
+    Branch-wide, not per-service, for the same reason `create_public_booking`
+    treats a slot as one booking at a time: there's no therapist or room on
+    this schema for two different services to occupy the same minute
+    independently of each other.
+    """
+    taken = set(
+        Booking.objects.filter(
+            branch=branch, date=target_date, status=Booking.Status.CONFIRMED,
+        ).values_list("time", flat=True)
+    )
+
+    start = settings.BOOKING_WINDOW_START_HOUR * 60
+    end = settings.BOOKING_WINDOW_END_HOUR * 60
+    step = settings.BOOKING_SLOT_MINUTES
+
+    slots = []
+    minutes = start
+    while minutes <= end:
+        hour, minute = divmod(minutes, 60)
+        time_str = f"{hour:02d}:{minute:02d}"
+        slots.append({"time": time_str, "available": time_str not in taken})
+        minutes += step
+    return slots
 
 
 # ---------------------------------------------------------------------------
