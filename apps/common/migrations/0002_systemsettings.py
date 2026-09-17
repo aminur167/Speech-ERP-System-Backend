@@ -7,7 +7,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('common', '0002_alter_auditlog_created_at'),
+        ('common', '0001_initial'),
     ]
 
     operations = [
