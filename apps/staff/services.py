@@ -192,6 +192,34 @@ def mark_no_show_absentees(staff_queryset) -> int:
     return len(to_create)
 
 
+def auto_check_out_stragglers(staff_queryset) -> int:
+    """
+    Once office hours (4pm) are over, anyone still checked in without a
+    check-out gets auto-checked-out — a Manager shouldn't have to remember to
+    check someone out by hand just because they forgot to tap the button on
+    their way out.
+
+    A no-op before 4pm. Unlike `mark_no_show_absentees`, this doesn't skip the
+    weekly holiday: someone who did check in on a Friday still needs closing
+    out. Status stays PRESENT (not EARLY_LEAVE) because `_status_for_check_out`
+    at or after 4pm always resolves to PRESENT anyway — same rule a real
+    check-out at this hour would get.
+
+    Returns how many attendance rows were auto-checked-out.
+    """
+    now = timezone.localtime()
+    if now.hour < OFFICE_END_HOUR:
+        return 0
+
+    today = now.date()
+    return StaffAttendance.objects.filter(
+        staff__in=staff_queryset,
+        date=today,
+        check_in_at__isnull=False,
+        check_out_at__isnull=True,
+    ).update(check_out_at=timezone.now(), status=StaffAttendance.Status.PRESENT)
+
+
 @transaction.atomic
 def add_bonus(*, actor, staff: StaffMember, amount, reason: str) -> StaffBonus:
     bonus = StaffBonus.objects.create(
