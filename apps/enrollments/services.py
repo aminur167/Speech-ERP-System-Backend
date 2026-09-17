@@ -1373,6 +1373,40 @@ def cancel_booking(*, actor, booking: Booking, reason: str = "") -> Booking:
     return booking
 
 
+@transaction.atomic
+def collect_booking_advance(*, actor, booking: Booking, method: str) -> tuple[Booking, Payment]:
+    """
+    A Manager collects, in person, the advance a website booking left
+    unpaid (see `create_public_booking`). A staff-created booking already
+    has its payment from the moment it's made, so this only ever applies to
+    one that came in through the public website.
+    """
+    if booking.payment_id is not None:
+        raise EnrollmentError("This booking's advance has already been collected.", code="already_paid")
+
+    payment, _ = payment_services.create_payment(
+        actor=actor,
+        branch=booking.branch,
+        patient=booking.patient,
+        amount=booking.advance_amount,
+        method=method,
+        category=PaymentCategory.ONLINE,
+        description=f"{booking.service.name} — advance for {booking.date}",
+    )
+
+    booking.payment = payment
+    booking.save(update_fields=["payment"])
+
+    audit.record(
+        actor=actor,
+        action=AuditLog.Action.UPDATE,
+        target=booking,
+        branch=booking.branch,
+        changes={"payment": {"from": None, "to": payment.id}},
+    )
+    return booking, payment
+
+
 # ---------------------------------------------------------------------------
 # Public (unauthenticated) online booking -- the clinic's own website, not a
 # staff account. See docs on `create_public_booking` for how this differs
