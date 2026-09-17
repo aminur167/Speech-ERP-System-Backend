@@ -21,6 +21,7 @@ from apps.payments.models import Payment, PaymentStatus
 from apps.payments.serializers import PaymentSerializer
 from apps.reporting import services
 from apps.reporting.serializers import (
+    BranchActivityRowSerializer,
     BranchSummarySerializer,
     CollectionForDateSerializer,
     DailyLedgerRowSerializer,
@@ -339,6 +340,45 @@ class BranchDailyLedgerView(_ReportView):
 
         return Response(
             services.daily_ledger(
+                branch_id=_branch_id_for(request),
+                date_from=date_from,
+                date_to=date_to,
+            )
+        )
+
+
+class BranchActivityView(_ReportView):
+    """
+    GET /api/transactions/branch-summary/activity/
+
+    The Summary page's merged Activity feed: every invoice, expense and
+    refund in the range, newest first, in one list — so a manager isn't
+    flipping between three separate tabs to see everything that happened.
+    Deliberately not paginated, same reasoning as the daily ledger above.
+    """
+
+    @extend_schema(
+        tags=["reporting"],
+        parameters=[
+            _BRANCH_PARAM,
+            OpenApiParameter("dateFrom", str, description="ISO date. Defaults to the 1st of the current month."),
+            OpenApiParameter("dateTo", str, description="ISO date. Defaults to today."),
+        ],
+        responses=BranchActivityRowSerializer(many=True),
+    )
+    def get(self, request):
+        today = timezone.localdate()
+        date_to = _parse_date(request.query_params.get("dateTo")) or today
+        date_from = _parse_date(request.query_params.get("dateFrom")) or date_to.replace(day=1)
+
+        if date_from > date_to:
+            return Response(
+                {"detail": "dateFrom cannot be after dateTo.", "code": "invalid_range"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(
+            services.branch_activity(
                 branch_id=_branch_id_for(request),
                 date_from=date_from,
                 date_to=date_to,

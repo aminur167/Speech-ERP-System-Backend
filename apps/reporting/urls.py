@@ -20,4 +20,9 @@ urlpatterns = [
         views.BranchDailyLedgerView.as_view(),
         name="branch-summary-daily",
     ),
+    path(
+        "branch-summary/activity/",
+        views.BranchActivityView.as_view(),
+        name="branch-summary-activity",
+    ),
 ]
