@@ -316,6 +316,10 @@ class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
 
         Paginated, unlike the staff roster which deliberately loads whole: a
         branch has a handful of staff but can have hundreds of patients.
+
+        The sheet is built for `date`, roster included: a patient appears on a
+        past day only if their service was running that day, so asking for
+        two months ago no longer returns people who enrolled last week.
         """
         kind = request.query_params.get("kind") or PatientAttendance.ServiceKind.MONTHLY
         if kind not in PatientAttendance.ServiceKind.values:
@@ -324,7 +328,9 @@ class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         on = _parse_date(request.query_params.get("date")) or timezone.localdate()
         branch_id = self._attendance_branch_id()
 
-        roster_ids = attendance_services.roster_patient_ids(kind=kind, branch_id=branch_id)
+        roster_ids = attendance_services.roster_patient_ids(
+            kind=kind, on=on, branch_id=branch_id
+        )
         queryset = self.get_queryset().filter(id__in=roster_ids).order_by("name")
 
         search = request.query_params.get("search", "").strip()
@@ -368,18 +374,40 @@ class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
     @extend_schema(request=MarkAttendanceSerializer, responses=PatientAttendanceSerializer)
     @action(detail=True, methods=["post"], url_path="attendance")
     def mark_attendance(self, request, pk=None):
-        """Mark one patient for one day — an upsert, so pressing twice is safe."""
+        """
+        Mark one patient for one day — an upsert, so pressing twice is safe.
+
+        Re-marking is the point, not a tolerated accident: absent is the
+        default, present is a correction, and a manager who marks the wrong
+        person has to be able to put it back. The upsert is what makes the
+        toggle in the UI honest instead of appending a contradictory row.
+
+        The day is checked against the patient's own enrollment window, so a
+        mark cannot be written for a day their service was not running — the
+        same rule the roster reads by, enforced where the request comes in
+        rather than left to the screen that sends it.
+        """
         patient = self.get_object()
         serializer = MarkAttendanceSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+
+        day = data.get("date") or timezone.localdate()
+        if day > timezone.localdate():
+            raise ValidationError({"date": ["Attendance cannot be marked ahead of time."]})
+        if not attendance_services.covers(
+            patient=patient, kind=data["serviceKind"], on=day
+        ):
+            raise ValidationError(
+                {"date": ["This patient had no running service of that kind that day."]}
+            )
 
         record = attendance_services.mark(
             actor=request.user,
             patient=patient,
             kind=data["serviceKind"],
             status=data["status"],
-            on=data.get("date"),
+            on=day,
             note=data.get("note", ""),
             expected_return_on=data.get("expectedReturnOn"),
         )

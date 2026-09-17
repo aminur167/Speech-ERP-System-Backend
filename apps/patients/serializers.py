@@ -248,6 +248,10 @@ class AttendanceRosterRowSerializer(serializers.Serializer):
     # marked once, and the row says which two that mark covers.
     serviceNames = serializers.ListField(child=serializers.CharField())
     record = PatientAttendanceSerializer(allow_null=True)
+    # What the row *is* — absent unless somebody marked otherwise. `record`
+    # stays alongside it because null there still means "nobody has touched
+    # this row", which is a different question and its own filter.
+    status = serializers.ChoiceField(choices=PatientAttendance.Status.choices)
     lastPresentOn = serializers.DateField(allow_null=True)
     daysSinceLastVisit = serializers.IntegerField()
     excusedUntil = serializers.DateField(allow_null=True)
