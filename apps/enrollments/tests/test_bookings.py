@@ -529,3 +529,111 @@ class TestBookingCancellation:
         )
 
         assert Payment.objects.get(pk=payment_id).status == "paid"
+
+
+def _unpaid_booking(*, branch, service, patient):
+    """A booking the way `create_public_booking` leaves one — no Payment yet."""
+    from apps.common.sequences import next_value
+
+    year = timezone.localdate().year
+    value = next_value(f"booking:{branch.code}", year)
+    return Booking.objects.create(
+        booking_code=f"BKG-{branch.short_code}-{year}-{str(value).zfill(5)}",
+        patient=patient, service=service, branch=branch,
+        date=timezone.localdate() + timedelta(days=3), time="14:00",
+        advance_amount=Decimal("2000.00"),
+    )
+
+
+class TestBookingAdvancePaidField:
+    def test_a_staff_made_booking_is_already_paid(self, manager_client, patient, online_service):
+        create_response = manager_client.post(
+            LIST_URL, payload(patient, online_service), format="json"
+        )
+        assert create_response.json()["booking"]["advancePaid"] is True
+
+    def test_a_website_booking_with_no_payment_is_not_paid(
+        self, manager_client, patient, online_service, branch
+    ):
+        booking = _unpaid_booking(branch=branch, service=online_service, patient=patient)
+
+        response = manager_client.get(reverse("enrollments:booking-detail", args=[booking.id]))
+
+        assert response.json()["advancePaid"] is False
+
+
+class TestCollectBookingAdvance:
+    def test_manager_can_collect_an_unpaid_advance(
+        self, manager_client, patient, online_service, branch
+    ):
+        booking = _unpaid_booking(branch=branch, service=online_service, patient=patient)
+
+        response = manager_client.post(
+            reverse("enrollments:booking-collect-advance", args=[booking.id]),
+            {"method": "cash"},
+            format="json",
+        )
+
+        assert response.status_code == 200
+        assert response.json()["booking"]["advancePaid"] is True
+        assert Decimal(response.json()["payment"]["amount"]) == Decimal("2000.00")
+
+    def test_the_payment_is_categorised_online(
+        self, manager_client, patient, online_service, branch
+    ):
+        from apps.payments.models import Payment, PaymentCategory
+
+        booking = _unpaid_booking(branch=branch, service=online_service, patient=patient)
+
+        response = manager_client.post(
+            reverse("enrollments:booking-collect-advance", args=[booking.id]),
+            {"method": "bkash"},
+            format="json",
+        )
+
+        payment = Payment.objects.get(pk=response.json()["payment"]["id"])
+        assert payment.category == PaymentCategory.ONLINE
+
+    def test_collecting_an_already_paid_advance_is_rejected(
+        self, manager_client, patient, online_service
+    ):
+        create_response = manager_client.post(
+            LIST_URL, payload(patient, online_service), format="json"
+        )
+        booking_id = create_response.json()["booking"]["id"]
+
+        response = manager_client.post(
+            reverse("enrollments:booking-collect-advance", args=[booking_id]),
+            {"method": "cash"},
+            format="json",
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "already_paid"
+
+    def test_admin_cannot_collect_an_advance(
+        self, admin_client, patient, online_service, branch
+    ):
+        booking = _unpaid_booking(branch=branch, service=online_service, patient=patient)
+
+        response = admin_client.post(
+            reverse("enrollments:booking-collect-advance", args=[booking.id]),
+            {"method": "cash"},
+            format="json",
+        )
+
+        assert response.status_code == 403
+
+    def test_manager_cannot_collect_for_another_branchs_booking(
+        self, manager_client, other_branch, online_service, patient_factory
+    ):
+        foreign_patient = patient_factory(branch=other_branch)
+        booking = _unpaid_booking(branch=other_branch, service=online_service, patient=foreign_patient)
+
+        response = manager_client.post(
+            reverse("enrollments:booking-collect-advance", args=[booking.id]),
+            {"method": "cash"},
+            format="json",
+        )
+
+        assert response.status_code == 404

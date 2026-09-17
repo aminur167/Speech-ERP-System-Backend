@@ -30,6 +30,7 @@ from apps.enrollments.serializers import (
     AdvancePreviewSerializer,
     BookingCreateSerializer,
     CollectAdvanceSerializer,
+    CollectBookingAdvanceSerializer,
     BookingSerializer,
     CancelBookingSerializer,
     CollectPaymentSerializer,
@@ -628,3 +629,21 @@ class BookingViewSet(_EnrollmentBase):
             return _error(exc)
 
         return Response(BookingSerializer(booking).data)
+
+    @action(detail=True, methods=["post"], url_path="collect-advance")
+    def collect_advance(self, request, pk=None):
+        """A website booking arrives with no payment (see `create_public_booking`) — this is how a Manager records collecting it in person."""
+        booking = self.get_object()
+        serializer = CollectBookingAdvanceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            booking, payment = services.collect_booking_advance(
+                actor=request.user, booking=booking, method=serializer.validated_data["method"],
+            )
+        except services.EnrollmentError as exc:
+            return _error(exc)
+
+        return Response(
+            {"booking": BookingSerializer(booking).data, "payment": PaymentSerializer(payment).data}
+        )

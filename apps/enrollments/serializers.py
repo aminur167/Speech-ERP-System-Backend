@@ -143,6 +143,7 @@ class BookingSerializer(serializers.ModelSerializer):
     bookingCode = serializers.CharField(source="booking_code", read_only=True)
     patientId = serializers.CharField(source="patient_id", read_only=True)
     patientName = serializers.CharField(source="patient.name", read_only=True)
+    patientPhone = serializers.CharField(source="patient.phone", read_only=True)
     serviceId = serializers.CharField(source="service_id", read_only=True)
     serviceName = serializers.CharField(source="service.name", read_only=True)
     branchId = serializers.CharField(source="branch_id", read_only=True)
@@ -150,14 +151,26 @@ class BookingSerializer(serializers.ModelSerializer):
     advanceAmount = serializers.DecimalField(
         source="advance_amount", max_digits=12, decimal_places=2, read_only=True
     )
+    # A staff-made booking (`create_booking`) always has its payment attached
+    # from the moment it's created; only a website booking
+    # (`create_public_booking`) can ever be confirmed with none yet.
+    advancePaid = serializers.SerializerMethodField()
 
     class Meta:
         model = Booking
         fields = [
-            "id", "bookingCode", "patientId", "patientName", "serviceId", "serviceName",
-            "branchId", "branchName", "date", "time", "advanceAmount", "status",
+            "id", "bookingCode", "patientId", "patientName", "patientPhone", "serviceId",
+            "serviceName", "branchId", "branchName", "date", "time", "advanceAmount",
+            "advancePaid", "status",
         ]
         read_only_fields = fields
+
+    def get_advancePaid(self, obj) -> bool:
+        return obj.payment_id is not None
+
+
+class CollectBookingAdvanceSerializer(serializers.Serializer):
+    method = serializers.ChoiceField(choices=PaymentMethod.choices)
 
 
 class BookingCreateSerializer(serializers.Serializer):
