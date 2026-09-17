@@ -31,17 +31,23 @@ from django.db.models import Count, Q, Sum
 from django.db.models.functions import TruncDate
 from django.utils import timezone
 
+from apps.common.models import AuditLog
 from apps.dailyclosing.models import DailyClosing
 from apps.duepayments.services import due_summary
+from apps.enrollments.models import InstallmentPlan, MonthlyEnrollment
 from apps.expenses.models import Expense
 from apps.patients.models import Patient
 from apps.payments.models import Payment, PaymentStatus, RefundRequest
+from apps.staff.models import SalaryPayment
 
 # One row's `type` in `branch_activity` — also the value the frontend keys its
 # badge colour and icon off of, so renaming one of these is a two-repo change.
 ACTIVITY_TYPE_INVOICE = "invoice"
 ACTIVITY_TYPE_EXPENSE = "expense"
 ACTIVITY_TYPE_REFUND = "refund"
+ACTIVITY_TYPE_PATIENT = "patient"
+ACTIVITY_TYPE_ENROLLMENT = "enrollment"
+ACTIVITY_TYPE_SALARY = "salary"
 
 # Approved and pending are real spending; rejected is not the clinic's cost.
 # Must stay identical to the rule in the expenses module, or the two screens
@@ -474,21 +480,27 @@ def daily_ledger(*, branch_id=None, date_from: date, date_to: date) -> list[dict
 
 def branch_activity(*, branch_id=None, date_from: date, date_to: date) -> list[dict]:
     """
-    Every invoice, expense and refund in one reverse-chronological feed —
-    what a manager scans instead of flipping between the Invoices, Expenses
-    and Refunds tabs to see "everything that happened" in a range.
+    Every invoice, expense, refund, new patient, service enrollment and
+    salary-payment decision in one reverse-chronological feed — what a
+    manager scans to see "everything that happened" in a range, money-moving
+    or not, instead of flipping between half a dozen separate screens.
 
-    Same accounting rules as the rest of this module: an invoice is dated by
-    when it was collected, an expense by when it was logged, and a refund by
-    when it was **approved** — a still-pending refund request has no
-    `reviewed_at` yet, so it doesn't appear here until it's decided, matching
-    every other period-attribution rule in this file.
+    The money events (invoice/expense/refund) follow the same accounting
+    rules as the rest of this module: an invoice is dated by when it was
+    collected, an expense by when it was logged, a refund by when it was
+    **approved** (a still-pending request has no `reviewed_at` yet, so it
+    doesn't appear until it's decided). The non-money events (patient,
+    enrollment, salary) are read from AuditLog — they carry no `direction`
+    that could ever be "in" or "out", since registering a patient or
+    requesting a salary payment doesn't move any money by itself (a salary
+    request that's later *disbursed* shows up separately as its own expense
+    row, the moment the money actually leaves).
 
     Fetches the whole range and sorts in Python rather than in the database:
-    three differently-shaped querysets can't be UNIONed by date across
-    Payment/Expense/RefundRequest without raw SQL, and the ranges this feeds
-    (a day, a month) are small enough that this is the plain-Django code
-    without a performance cost.
+    these differently-shaped querysets can't be UNIONed by date across
+    several tables without raw SQL, and the ranges this feeds (a day, a
+    month) are small enough that this is the plain-Django code without a
+    performance cost.
     """
     in_range = {"created_at__date__gte": date_from, "created_at__date__lte": date_to}
 
@@ -548,6 +560,106 @@ def branch_activity(*, branch_id=None, date_from: date, date_to: date) -> list[d
                 "amount": refund.amount,
                 "direction": "out",
                 "status": refund.status,
+            }
+        )
+
+    audit_in_range = AuditLog.objects.filter(**in_range)
+    if branch_id:
+        audit_in_range = audit_in_range.filter(branch_id=branch_id)
+
+    patient_registrations = audit_in_range.filter(
+        action=AuditLog.Action.CREATE, target_type="Patient"
+    )
+    for entry in patient_registrations:
+        name = entry.changes.get("name", "")
+        rows.append(
+            {
+                "id": f"patient-{entry.id}",
+                "type": ACTIVITY_TYPE_PATIENT,
+                "occurredAt": entry.created_at,
+                "reference": entry.changes.get("patient_code", ""),
+                "description": f"New patient registered — {name}" if name else "New patient registered",
+                "person": name,
+                "performedBy": entry.actor.name if entry.actor else entry.actor_email,
+                "amount": Decimal("0.00"),
+                "direction": "neutral",
+                "status": "registered",
+            }
+        )
+
+    enrollment_logs = list(
+        audit_in_range.filter(
+            action=AuditLog.Action.CREATE,
+            target_type__in=["MonthlyEnrollment", "InstallmentPlan"],
+        ).select_related("actor")
+    )
+    monthly_by_id = {
+        str(row.id): row
+        for row in MonthlyEnrollment.objects.filter(
+            id__in=[e.target_id for e in enrollment_logs if e.target_type == "MonthlyEnrollment"]
+        ).select_related("patient")
+    }
+    installment_by_id = {
+        str(row.id): row
+        for row in InstallmentPlan.objects.filter(
+            id__in=[e.target_id for e in enrollment_logs if e.target_type == "InstallmentPlan"]
+        ).select_related("patient")
+    }
+    for entry in enrollment_logs:
+        enrollment = (
+            monthly_by_id if entry.target_type == "MonthlyEnrollment" else installment_by_id
+        ).get(entry.target_id)
+        patient_name = enrollment.patient.name if enrollment else ""
+        service_name = entry.changes.get("service", "")
+        description = f"Enrolled in {service_name}" if service_name else "New service enrollment"
+        rows.append(
+            {
+                "id": f"enrollment-{entry.id}",
+                "type": ACTIVITY_TYPE_ENROLLMENT,
+                "occurredAt": entry.created_at,
+                "reference": entry.target_id,
+                "description": f"{description} — {patient_name}" if patient_name else description,
+                "person": patient_name,
+                "performedBy": entry.actor.name if entry.actor else entry.actor_email,
+                "amount": Decimal("0.00"),
+                "direction": "neutral",
+                "status": "enrolled",
+            }
+        )
+
+    salary_action_label = {
+        AuditLog.Action.CREATE: "requested",
+        AuditLog.Action.APPROVE: "approved",
+        AuditLog.Action.REJECT: "rejected",
+    }
+    salary_logs = list(
+        audit_in_range.filter(
+            action__in=list(salary_action_label), target_type="SalaryPayment"
+        ).select_related("actor")
+    )
+    salary_by_id = {
+        str(row.id): row
+        for row in SalaryPayment.objects.filter(
+            id__in=[e.target_id for e in salary_logs]
+        ).select_related("staff")
+    }
+    for entry in salary_logs:
+        payment = salary_by_id.get(entry.target_id)
+        staff_name = payment.staff.name if payment else entry.changes.get("staff", "")
+        verb = salary_action_label[entry.action]
+        description = f"Salary payment {verb}" + (f" — {staff_name}" if staff_name else "")
+        rows.append(
+            {
+                "id": f"salary-{entry.id}",
+                "type": ACTIVITY_TYPE_SALARY,
+                "occurredAt": entry.created_at,
+                "reference": entry.target_id,
+                "description": description,
+                "person": staff_name,
+                "performedBy": entry.actor.name if entry.actor else entry.actor_email,
+                "amount": payment.amount if payment else Decimal("0.00"),
+                "direction": "neutral",
+                "status": verb,
             }
         )
 
