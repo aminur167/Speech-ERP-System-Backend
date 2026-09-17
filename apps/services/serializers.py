@@ -10,7 +10,7 @@ from decimal import Decimal
 
 from rest_framework import serializers
 
-from apps.services.models import Service
+from apps.services.models import PackageActionRequest, Service
 
 
 class ServiceSerializer(serializers.ModelSerializer):
@@ -47,12 +47,16 @@ class ServiceWriteSerializer(serializers.ModelSerializer):
     Note the absent `registration_fee`: because ModelSerializer only binds
     declared fields, posting one is silently ignored rather than stored — which
     is the desired behaviour while the frontend still sends it.
+
+    `code` is absent for the same reason: the system issues it on create
+    (services.next_service_code) and it never changes afterwards, so a code
+    sent by a client — on create or edit — is ignored.
     """
 
     class Meta:
         model = Service
         fields = [
-            "name", "code", "category", "fee", "is_online", "description",
+            "name", "category", "fee", "is_online", "description",
             "original_fee", "duration_label", "sessions_label", "expiry_label",
         ]
         extra_kwargs = {
@@ -63,18 +67,6 @@ class ServiceWriteSerializer(serializers.ModelSerializer):
             "expiry_label": {"required": False, "allow_blank": True},
             "is_online": {"required": False},
         }
-
-    def validate_code(self, value):
-        value = value.strip().upper()
-        branch = self.context.get("branch") or (self.instance.branch if self.instance else None)
-        existing = Service.all_objects.filter(code=value, branch=branch)
-        if self.instance is not None:
-            existing = existing.exclude(pk=self.instance.pk)
-        if existing.exists():
-            raise serializers.ValidationError(
-                "This branch already has a package with this code."
-            )
-        return value
 
     def validate_fee(self, value):
         if value <= Decimal("0"):
@@ -92,3 +84,44 @@ class ServiceReviewSerializer(serializers.Serializer):
 
     approve = serializers.BooleanField()
     reviewNote = serializers.CharField(required=False, allow_blank=True)
+
+
+class PackageActionRequestSerializer(serializers.ModelSerializer):
+    serviceId = serializers.CharField(source="service_id", read_only=True)
+    serviceName = serializers.CharField(source="service.name", read_only=True)
+    serviceCode = serializers.CharField(source="service.code", read_only=True)
+    serviceIsActive = serializers.BooleanField(source="service.is_active", read_only=True)
+    branchId = serializers.CharField(source="branch_id", read_only=True)
+    branchName = serializers.CharField(source="branch.name", read_only=True)
+    # `expired` is derived, so it is reported rather than stored.
+    status = serializers.CharField(source="effective_status", read_only=True)
+    requestedById = serializers.SerializerMethodField()
+    requestedBy = serializers.CharField(source="requested_by.name", read_only=True, default="")
+    requestedAt = serializers.DateTimeField(source="created_at", read_only=True)
+    reviewedBy = serializers.CharField(source="reviewed_by.name", read_only=True, default="")
+    reviewedAt = serializers.DateTimeField(source="reviewed_at", read_only=True)
+    reviewNote = serializers.CharField(source="review_note", read_only=True)
+    expiresAt = serializers.DateTimeField(source="expires_at", read_only=True)
+    usedAt = serializers.DateTimeField(source="used_at", read_only=True)
+
+    class Meta:
+        model = PackageActionRequest
+        fields = [
+            "id", "serviceId", "serviceName", "serviceCode", "serviceIsActive",
+            "branchId", "branchName", "action", "reason", "status",
+            "requestedById", "requestedBy", "requestedAt",
+            "reviewedBy", "reviewedAt", "reviewNote", "expiresAt", "usedAt",
+        ]
+        read_only_fields = fields
+
+    def get_requestedById(self, obj) -> str:
+        return str(obj.requested_by_id) if obj.requested_by_id else ""
+
+
+class PackageActionRequestCreateSerializer(serializers.Serializer):
+    action = serializers.ChoiceField(choices=PackageActionRequest.Action.choices)
+    reason = serializers.CharField(max_length=1000)
+
+
+class PackageActionReviewSerializer(serializers.Serializer):
+    reviewNote = serializers.CharField(required=False, allow_blank=True, max_length=1000)

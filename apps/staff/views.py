@@ -30,6 +30,8 @@ from apps.staff.serializers import (
     StaffMonthlyReportRowSerializer,
     StaffSummarySerializer,
 )
+from apps.common import audit
+from apps.common.models import AuditLog
 
 
 def _parse_month_param(request) -> tuple[int, int]:
@@ -95,7 +97,45 @@ class StaffMemberViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         """Soft delete — attendance and bonus history must stay resolvable."""
         member = self.get_object()
         member.delete()
+        audit.record(
+            actor=request.user,
+            action=AuditLog.Action.SOFT_DELETE,
+            target=member,
+            branch=member.branch,
+            changes={"name": member.name},
+        )
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["post"])
+    def deactivate(self, request, pk=None):
+        """
+        Mark a staff member inactive — they left, or are on long leave.
+
+        Distinct from deleting: an inactive member drops out of payroll and
+        the daily attendance count but keeps their history, and can be
+        brought back.
+        """
+        return self._set_status(request, StaffMember.Status.INACTIVE, "Staff member deactivated")
+
+    @action(detail=True, methods=["post"])
+    def activate(self, request, pk=None):
+        return self._set_status(request, StaffMember.Status.ACTIVE, "Staff member reactivated")
+
+    def _set_status(self, request, new_status, reason):
+        member = self.get_object()
+        previous = member.status
+        if previous != new_status:
+            member.status = new_status
+            member.save(update_fields=["status", "updated_at"])
+            audit.record(
+                actor=request.user,
+                action=AuditLog.Action.UPDATE,
+                target=member,
+                branch=member.branch,
+                reason=reason,
+                changes={"status": {"from": previous, "to": new_status}},
+            )
+        return Response(StaffMemberSerializer(member).data)
 
     @action(detail=False, methods=["get"])
     def summary(self, request):

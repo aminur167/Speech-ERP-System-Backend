@@ -20,6 +20,7 @@ from decimal import Decimal
 
 from django.core.validators import MinValueValidator
 from django.db import models
+from django.utils import timezone
 
 from apps.common.models import SoftDeleteModel, TimeStampedModel
 
@@ -118,3 +119,91 @@ class Service(TimeStampedModel, SoftDeleteModel):
         monthly = self.monthly_enrollments.filter(status="active").count()
         installment = self.installment_plans.filter(status="active").count()
         return monthly + installment
+
+
+class PackageActionRequest(TimeStampedModel):
+    """
+    A Manager asking Admin for permission to change one of their branch's
+    packages: edit it, delete it, or switch it off or on.
+
+    Separation of duties, the same as refunds. The catalog is what every
+    enrollment bills against, so a branch does not change it on its own
+    authority. The request records *why*, Admin records the decision, and an
+    approval is a **one-time permission for that one action on that one
+    package** — used up the moment the Manager performs it, and void if it
+    lapses unused. It is not a blanket unlock for the branch.
+    """
+
+    class Action(models.TextChoices):
+        EDIT = "edit", "Edit"
+        DELETE = "delete", "Delete"
+        DEACTIVATE = "deactivate", "Deactivate"
+        ACTIVATE = "activate", "Activate"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+        # The Manager performed the approved action; the permission is spent.
+        USED = "used", "Used"
+
+    service = models.ForeignKey(
+        Service, on_delete=models.PROTECT, related_name="action_requests"
+    )
+    branch = models.ForeignKey(
+        "branches.Branch", on_delete=models.PROTECT, related_name="package_action_requests"
+    )
+    action = models.CharField(max_length=16, choices=Action.choices)
+    reason = models.TextField()
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.PENDING, db_index=True
+    )
+
+    requested_by = models.ForeignKey(
+        "accounts.User", null=True, on_delete=models.SET_NULL,
+        related_name="package_action_requests",
+    )
+    reviewed_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="reviewed_package_actions",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    review_note = models.TextField(blank=True)
+
+    # Set on approval. An approval nobody used should not stay a live key to
+    # the catalog forever.
+    expires_at = models.DateTimeField(null=True, blank=True)
+    used_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status", "-created_at"]),
+            models.Index(fields=["branch", "status"]),
+            models.Index(fields=["service", "action", "status"]),
+        ]
+        constraints = [
+            # Two Managers — or one double-click — cannot open the same
+            # question twice while Admin is still deciding it.
+            models.UniqueConstraint(
+                fields=["service", "action"],
+                condition=models.Q(status="pending"),
+                name="one_pending_request_per_package_action",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.get_action_display()} {self.service_id} ({self.status})"
+
+    @property
+    def is_expired(self) -> bool:
+        return (
+            self.status == self.Status.APPROVED
+            and self.expires_at is not None
+            and self.expires_at <= timezone.now()
+        )
+
+    @property
+    def effective_status(self) -> str:
+        """`expired` is derived rather than stored, so it is never stale."""
+        return "expired" if self.is_expired else self.status

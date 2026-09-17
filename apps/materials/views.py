@@ -23,6 +23,8 @@ from apps.materials.serializers import (
 )
 from apps.patients.models import Patient
 from apps.payments.serializers import PaymentSerializer
+from apps.common import audit
+from apps.common.models import AuditLog
 
 
 def _error(exc: services.MaterialError, http_status=status.HTTP_400_BAD_REQUEST):
@@ -78,6 +80,13 @@ class MaterialViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         """
         material = self.get_object()
         material.delete()
+        audit.record(
+            actor=request.user,
+            action=AuditLog.Action.SOFT_DELETE,
+            target=material,
+            branch=material.branch,
+            changes={"code": material.code},
+        )
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=False, methods=["get"])
