@@ -39,6 +39,7 @@ from django.db import transaction
 from django.db.models import Max, Min, Q
 from django.utils import timezone
 
+from apps.common.models import SystemSettings
 from apps.enrollments.models import EnrollmentStatus, InstallmentPlan, MonthlyEnrollment
 from apps.patients.models import Patient, PatientAttendance
 
@@ -282,7 +283,7 @@ def build_roster(*, patients, kind: str, on: date, branch_id=None) -> list[dict]
     excused_until = open_informed_absences(ids, kind=kind, on=on)
     started = _service_started_by_patient(ids, kind=kind, on=on)
 
-    alert_after = settings.PATIENT_ABSENCE_ALERT_DAYS
+    alert_after = SystemSettings.get_solo().stopped_coming_after_days
 
     rows = []
     for patient in patients:

@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from apps.common.models import AuditLog
+from apps.common.models import AuditLog, SystemSettings
 
 
 class AuditLogSerializer(serializers.ModelSerializer):
@@ -24,3 +24,16 @@ class AuditLogSerializer(serializers.ModelSerializer):
             "branchId", "branchName", "reason", "changes", "createdAt",
         ]
         read_only_fields = fields
+
+
+class SystemSettingsSerializer(serializers.ModelSerializer):
+    """Any authenticated user may read this (it explains why a patient's
+    attendance row is flagged); only an Admin may change it — see IsAdminOrReadOnly."""
+
+    stoppedComingAfterDays = serializers.IntegerField(
+        source="stopped_coming_after_days", min_value=1, max_value=365
+    )
+
+    class Meta:
+        model = SystemSettings
+        fields = ["stoppedComingAfterDays"]

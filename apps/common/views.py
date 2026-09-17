@@ -16,9 +16,9 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.common.models import AuditLog
-from apps.common.permissions import IsAdmin
-from apps.common.serializers import AuditLogSerializer
+from apps.common.models import AuditLog, SystemSettings
+from apps.common.permissions import IsAdmin, IsAdminOrReadOnly
+from apps.common.serializers import AuditLogSerializer, SystemSettingsSerializer
 
 
 class HealthCheckSerializer(serializers.Serializer):
@@ -50,3 +50,28 @@ class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAdmin]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["action", "target_type", "branch"]
+
+
+class SystemSettingsView(APIView):
+    """
+    Clinic-wide settings, currently the one knob: how many days without a
+    visit before a patient is flagged as having stopped coming
+    (apps/patients/attendance.py). A Manager can read it — it's the number
+    their own attendance sheet's alerts are measured against — but only an
+    Admin may change a value that applies across every branch.
+    """
+
+    permission_classes = [IsAdminOrReadOnly]
+    serializer_class = SystemSettingsSerializer
+
+    @extend_schema(tags=["common"], responses=SystemSettingsSerializer)
+    def get(self, request):
+        return Response(SystemSettingsSerializer(SystemSettings.get_solo()).data)
+
+    @extend_schema(tags=["common"], request=SystemSettingsSerializer, responses=SystemSettingsSerializer)
+    def patch(self, request):
+        instance = SystemSettings.get_solo()
+        serializer = SystemSettingsSerializer(instance, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
