@@ -547,3 +547,220 @@ class TestRosterCounts:
         assert {row["patientId"] for row in first["results"]}.isdisjoint(
             {row["patientId"] for row in second["results"]}
         )
+
+
+class TestTheSheetBelongsToItsOwnDate:
+    """
+    A back-dated sheet has to answer as of that day.
+
+    The bug this class exists to keep dead: the roster was assembled from
+    `status=ACTIVE`, which is a question about *now*. Filtering to a day two
+    months back therefore returned patients who had only enrolled last week —
+    people listed on days that predate them — along with visits and absence
+    notices that had not happened yet.
+    """
+
+    def backdate(self, enrollment, *, days):
+        from apps.enrollments.models import MonthlyEnrollment
+
+        MonthlyEnrollment.objects.filter(pk=enrollment.pk).update(
+            created_at=timezone.now() - timedelta(days=days)
+        )
+
+    def enrollment_of(self, patient):
+        from apps.enrollments.models import MonthlyEnrollment
+
+        return MonthlyEnrollment.objects.get(patient=patient)
+
+    def sheet_on(self, client, day):
+        return client.get(
+            ROSTER_URL, {"kind": "monthly", "date": day.isoformat()}
+        ).json()
+
+    def test_a_patient_is_absent_from_days_before_they_enrolled(
+        self, manager_client, monthly_patient
+    ):
+        """
+        The complaint that started this: enrolled a month ago, yet showing up
+        on a sheet from two months back.
+        """
+        self.backdate(self.enrollment_of(monthly_patient), days=30)
+        today = timezone.localdate()
+
+        assert self.sheet_on(manager_client, today - timedelta(days=60))["count"] == 0
+        assert self.sheet_on(manager_client, today - timedelta(days=20))["count"] == 1
+
+    def test_the_first_day_on_the_sheet_is_the_day_they_enrolled(
+        self, manager_client, monthly_patient
+    ):
+        """
+        Inclusive at the bottom: a service that starts today is attendable
+        today, not from tomorrow.
+        """
+        self.backdate(self.enrollment_of(monthly_patient), days=10)
+        started = timezone.localdate() - timedelta(days=10)
+
+        assert self.sheet_on(manager_client, started)["count"] == 1
+        assert self.sheet_on(manager_client, started - timedelta(days=1))["count"] == 0
+
+    def test_a_stopped_service_stays_on_the_days_it_was_running(
+        self, manager_client, manager, monthly_patient
+    ):
+        """
+        Termination is not retroactive. The patient leaves today's sheet, but
+        last month's sheet is a record of what happened and must not change
+        because of a decision taken afterwards.
+        """
+        enrollment = self.enrollment_of(monthly_patient)
+        self.backdate(enrollment, days=30)
+        enrollment_services.terminate(actor=manager, container=enrollment)
+        today = timezone.localdate()
+
+        assert self.sheet_on(manager_client, today)["count"] == 0
+        assert self.sheet_on(manager_client, today - timedelta(days=15))["count"] == 1
+        assert self.sheet_on(manager_client, today - timedelta(days=40))["count"] == 0
+
+    def test_a_service_stopped_today_is_off_todays_sheet_only(
+        self, manager_client, manager, monthly_patient
+    ):
+        """
+        The window is half-open: the day it goes inactive is the first day off
+        the sheet.
+        """
+        enrollment = self.enrollment_of(monthly_patient)
+        self.backdate(enrollment, days=5)
+        enrollment_services.terminate(actor=manager, container=enrollment)
+        today = timezone.localdate()
+
+        assert self.sheet_on(manager_client, today)["count"] == 0
+        assert self.sheet_on(manager_client, today - timedelta(days=1))["count"] == 1
+
+    def test_a_past_sheet_does_not_report_a_visit_from_after_it(
+        self, manager_client, manager, monthly_patient
+    ):
+        """
+        Last seen on the 1st cannot be the 10th. Reporting it that way also
+        silences the gap clock on exactly the days it was meant to ring.
+        """
+        self.backdate(self.enrollment_of(monthly_patient), days=30)
+        today = timezone.localdate()
+        attendance_services.mark(
+            actor=manager, patient=monthly_patient, kind=Kind.MONTHLY,
+            status=Status.PRESENT, on=today,
+        )
+
+        row = self.sheet_on(manager_client, today - timedelta(days=10))["results"][0]
+
+        assert row["lastPresentOn"] is None
+
+    def test_a_notice_given_later_does_not_excuse_an_earlier_day(
+        self, manager_client, manager, monthly_patient
+    ):
+        """A back-dated sheet is answered with what the clinic knew that day."""
+        self.backdate(self.enrollment_of(monthly_patient), days=60)
+        today = timezone.localdate()
+        attendance_services.mark(
+            actor=manager, patient=monthly_patient, kind=Kind.MONTHLY,
+            status=Status.INFORMED_ABSENCE, on=today,
+            expected_return_on=today + timedelta(days=30),
+        )
+
+        earlier = self.sheet_on(manager_client, today - timedelta(days=10))["results"][0]
+        now = self.sheet_on(manager_client, today)["results"][0]
+
+        assert earlier["excusedUntil"] is None
+        assert now["excusedUntil"] is not None
+
+    def test_a_service_that_had_not_started_cannot_be_marked(
+        self, manager_client, monthly_patient
+    ):
+        """
+        The roster no longer offers the row, and the write refuses it too: the
+        screen is not the last line of defence for a rule the data has to keep.
+        """
+        response = manager_client.post(
+            mark_url(monthly_patient),
+            {
+                "serviceKind": "monthly",
+                "status": "present",
+                "date": (timezone.localdate() - timedelta(days=30)).isoformat(),
+            },
+        )
+
+        assert response.status_code == 400
+        assert not PatientAttendance.objects.filter(patient=monthly_patient).exists()
+
+    def test_attendance_cannot_be_marked_ahead_of_time(
+        self, manager_client, monthly_patient
+    ):
+        response = manager_client.post(
+            mark_url(monthly_patient),
+            {
+                "serviceKind": "monthly",
+                "status": "present",
+                "date": (timezone.localdate() + timedelta(days=1)).isoformat(),
+            },
+        )
+
+        assert response.status_code == 400
+
+
+class TestAbsentByDefault:
+    """
+    Absent is the resting state; present is the assertion.
+
+    The manager marks who walked in, and everyone left over did not come. That
+    is the row's `status`, not a blank cell the reader has to interpret — and
+    it has to stay reversible, because the person most likely to need
+    correcting is the one marked present by mistake.
+    """
+
+    def row_for(self, client, patient):
+        rows = client.get(ROSTER_URL, {"kind": "monthly"}).json()["results"]
+        return next(row for row in rows if row["patientId"] == str(patient.id))
+
+    def test_an_untouched_row_reads_absent(self, manager_client, monthly_patient):
+        row = self.row_for(manager_client, monthly_patient)
+
+        assert row["status"] == "absent"
+        # Still distinguishable from a deliberate absent mark, which is the
+        # question the not-yet-marked filter asks.
+        assert row["record"] is None
+
+    def test_marking_present_changes_the_status(self, manager_client, monthly_patient):
+        manager_client.post(
+            mark_url(monthly_patient), {"serviceKind": "monthly", "status": "present"}
+        )
+
+        assert self.row_for(manager_client, monthly_patient)["status"] == "present"
+
+    def test_present_can_be_toggled_back_to_absent(
+        self, manager_client, monthly_patient
+    ):
+        """
+        One row holding the last answer, not a present row and a contradicting
+        absent one.
+        """
+        for status_value in ("present", "absent"):
+            manager_client.post(
+                mark_url(monthly_patient),
+                {"serviceKind": "monthly", "status": status_value},
+            )
+
+        row = self.row_for(manager_client, monthly_patient)
+
+        assert row["status"] == "absent"
+        assert row["record"]["status"] == "absent"
+        assert PatientAttendance.objects.filter(patient=monthly_patient).count() == 1
+
+    def test_an_informed_absence_is_not_folded_into_a_plain_absence(
+        self, manager_client, monthly_patient
+    ):
+        manager_client.post(
+            mark_url(monthly_patient),
+            {"serviceKind": "monthly", "status": "informed_absence"},
+        )
+
+        row = self.row_for(manager_client, monthly_patient)
+
+        assert row["status"] == "informed_absence"
