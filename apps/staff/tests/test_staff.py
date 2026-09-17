@@ -414,6 +414,84 @@ class TestNoShowAutoAbsent:
         assert marked == 2
 
 
+class TestAutoCheckOutStragglers:
+    """Anyone still checked in with no check-out gets auto-checked-out once office hours (4pm) end."""
+
+    def test_no_effect_before_office_end(self, office_hours, farhana):
+        services.check_in(staff=farhana)
+        with mock.patch(
+            "apps.staff.services.timezone.localtime",
+            return_value=_at_hour(services.OFFICE_END_HOUR - 1),
+        ):
+            checked_out = services.auto_check_out_stragglers(StaffMember.objects.filter(pk=farhana.id))
+        assert checked_out == 0
+        record = StaffAttendance.objects.get(staff=farhana, date=date.today())
+        assert record.check_out_at is None
+
+    def test_checks_out_after_office_end(self, office_hours, farhana):
+        services.check_in(staff=farhana)
+        with mock.patch(
+            "apps.staff.services.timezone.localtime",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            checked_out = services.auto_check_out_stragglers(StaffMember.objects.filter(pk=farhana.id))
+        assert checked_out == 1
+        record = StaffAttendance.objects.get(staff=farhana, date=date.today())
+        assert record.check_out_at is not None
+        assert record.status == StaffAttendance.Status.PRESENT
+
+    def test_does_not_touch_someone_who_already_checked_out(self, office_hours, farhana):
+        services.check_in(staff=farhana)
+        with mock.patch(
+            "apps.staff.services.timezone.now", return_value=_at_hour(services.OFFICE_START_HOUR + 1)
+        ):
+            services.check_out(staff=farhana)
+        original_check_out_at = StaffAttendance.objects.get(staff=farhana, date=date.today()).check_out_at
+
+        with mock.patch(
+            "apps.staff.services.timezone.localtime",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            checked_out = services.auto_check_out_stragglers(StaffMember.objects.filter(pk=farhana.id))
+        assert checked_out == 0
+        record = StaffAttendance.objects.get(staff=farhana, date=date.today())
+        assert record.check_out_at == original_check_out_at
+        assert record.status == StaffAttendance.Status.EARLY_LEAVE
+
+    def test_does_not_create_a_record_for_a_no_show(self, farhana):
+        """A no-show has no check-in at all -- that's `mark_no_show_absentees`'s job, not this one's."""
+        with mock.patch(
+            "apps.staff.services.timezone.localtime",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            checked_out = services.auto_check_out_stragglers(StaffMember.objects.filter(pk=farhana.id))
+        assert checked_out == 0
+        assert not StaffAttendance.objects.filter(staff=farhana, date=date.today()).exists()
+
+    def test_today_attendance_endpoint_reflects_the_auto_checkout(self, manager_client, office_hours, farhana):
+        services.check_in(staff=farhana)
+        with mock.patch(
+            "apps.staff.services.timezone.localtime",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            body = manager_client.get(reverse("staff:staffmember-today-attendance")).json()
+        assert body[str(farhana.id)]["status"] == "present"
+        assert body[str(farhana.id)]["checkOutAt"] is not None
+
+    def test_returns_the_count_of_staff_auto_checked_out(self, office_hours, farhana, staff_member_factory):
+        other = staff_member_factory(name="Also Forgot To Check Out")
+        services.check_in(staff=farhana)
+        services.check_in(staff=other)
+        with mock.patch(
+            "apps.staff.services.timezone.localtime",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            checked_out = services.auto_check_out_stragglers(
+                StaffMember.objects.filter(pk__in=[farhana.id, other.id])
+            )
+        assert checked_out == 2
+
+
 def _at_weekday_hour(weekday: int, hour: int):
     """A tz-aware datetime on a fixed reference date matching `weekday` (Monday=0..Sunday=6), at `hour`:00 -- independent of whatever day the suite actually runs on, so a Friday-specific test can't itself land on a real Friday's edge cases (or vice versa)."""
     reference_monday = date(2024, 1, 1)
@@ -480,6 +558,24 @@ class TestCloseOutDailyAttendanceCommand:
 
         assert not StaffAttendance.objects.filter(staff=farhana).exists()
         assert "Nothing to close out" in out.getvalue()
+
+    def test_auto_checks_out_a_straggler_after_office_end(self, office_hours, farhana):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        services.check_in(staff=farhana)
+        with mock.patch(
+            "apps.staff.services.timezone.localtime",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            out = StringIO()
+            call_command("close_out_daily_attendance", stdout=out)
+
+        record = StaffAttendance.objects.get(staff=farhana, date=date.today())
+        assert record.check_out_at is not None
+        assert record.status == StaffAttendance.Status.PRESENT
+        assert "auto-checked-out 1 staff member" in out.getvalue()
 
     def test_ignores_inactive_staff(self, farhana):
         farhana.status = StaffMember.Status.INACTIVE
