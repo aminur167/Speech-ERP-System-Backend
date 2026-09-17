@@ -203,3 +203,37 @@ class AuditLog(models.Model):
 
     def __str__(self):
         return f"{self.action} {self.target_type}#{self.target_id} by {self.actor_email or 'system'}"
+
+
+def _default_stopped_coming_after_days() -> int:
+    # A callable, not `settings.PATIENT_ABSENCE_ALERT_DAYS` evaluated inline —
+    # a plain expression here is baked in once, at import time, and would
+    # ignore an env var that differs per environment or a test overriding
+    # `settings` at runtime.
+    return settings.PATIENT_ABSENCE_ALERT_DAYS
+
+
+class SystemSettings(models.Model):
+    """
+    Clinic-wide configuration an Admin can change from the Settings page
+    instead of an environment variable and a redeploy.
+
+    A single row rather than one per branch: today's one setting (the
+    attendance gap that flags a patient as having stopped coming) has always
+    been one global number (`PATIENT_ABSENCE_ALERT_DAYS`), not a per-branch
+    decision, and `get_solo()` keeps it that way. `stopped_coming_after_days`
+    defaults to that same setting so installing this row changes nothing
+    until an Admin actually edits it.
+    """
+
+    stopped_coming_after_days = models.PositiveIntegerField(
+        default=_default_stopped_coming_after_days
+    )
+
+    @classmethod
+    def get_solo(cls) -> "SystemSettings":
+        obj, _created = cls.objects.get_or_create(pk=1)
+        return obj
+
+    def __str__(self):
+        return f"System settings (stopped coming after {self.stopped_coming_after_days}d)"
