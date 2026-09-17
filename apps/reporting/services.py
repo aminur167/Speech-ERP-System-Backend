@@ -37,6 +37,12 @@ from apps.expenses.models import Expense
 from apps.patients.models import Patient
 from apps.payments.models import Payment, PaymentStatus, RefundRequest
 
+# One row's `type` in `branch_activity` — also the value the frontend keys its
+# badge colour and icon off of, so renaming one of these is a two-repo change.
+ACTIVITY_TYPE_INVOICE = "invoice"
+ACTIVITY_TYPE_EXPENSE = "expense"
+ACTIVITY_TYPE_REFUND = "refund"
+
 # Approved and pending are real spending; rejected is not the clinic's cost.
 # Must stay identical to the rule in the expenses module, or the two screens
 # stop reconciling.
@@ -464,3 +470,86 @@ def daily_ledger(*, branch_id=None, date_from: date, date_to: date) -> list[dict
 
     # Newest first: a ledger is read from what just happened backwards.
     return [rows[day] for day in sorted(rows, reverse=True)]
+
+
+def branch_activity(*, branch_id=None, date_from: date, date_to: date) -> list[dict]:
+    """
+    Every invoice, expense and refund in one reverse-chronological feed —
+    what a manager scans instead of flipping between the Invoices, Expenses
+    and Refunds tabs to see "everything that happened" in a range.
+
+    Same accounting rules as the rest of this module: an invoice is dated by
+    when it was collected, an expense by when it was logged, and a refund by
+    when it was **approved** — a still-pending refund request has no
+    `reviewed_at` yet, so it doesn't appear here until it's decided, matching
+    every other period-attribution rule in this file.
+
+    Fetches the whole range and sorts in Python rather than in the database:
+    three differently-shaped querysets can't be UNIONed by date across
+    Payment/Expense/RefundRequest without raw SQL, and the ranges this feeds
+    (a day, a month) are small enough that this is the plain-Django code
+    without a performance cost.
+    """
+    in_range = {"created_at__date__gte": date_from, "created_at__date__lte": date_to}
+
+    payments = (
+        _revenue_queryset(branch_id).filter(**in_range).select_related("patient", "collected_by")
+    )
+
+    expenses = Expense.objects.filter(**in_range).select_related("submitted_by")
+    if branch_id:
+        expenses = expenses.filter(branch_id=branch_id)
+
+    refunds = _refund_queryset(branch_id).filter(
+        reviewed_at__date__gte=date_from, reviewed_at__date__lte=date_to
+    ).select_related("payment__patient", "reviewed_by")
+
+    rows = []
+    for payment in payments:
+        rows.append(
+            {
+                "id": f"invoice-{payment.id}",
+                "type": ACTIVITY_TYPE_INVOICE,
+                "occurredAt": payment.created_at,
+                "reference": payment.receipt_number,
+                "description": payment.description or payment.get_category_display(),
+                "person": payment.patient.name,
+                "performedBy": payment.collected_by.name if payment.collected_by else "",
+                "amount": payment.amount,
+                "direction": "in",
+                "status": payment.status,
+            }
+        )
+    for expense in expenses:
+        rows.append(
+            {
+                "id": f"expense-{expense.id}",
+                "type": ACTIVITY_TYPE_EXPENSE,
+                "occurredAt": expense.created_at,
+                "reference": expense.expense_code,
+                "description": expense.description,
+                "person": expense.paid_to,
+                "performedBy": expense.submitted_by.name if expense.submitted_by else "",
+                "amount": expense.amount,
+                "direction": "out",
+                "status": expense.status,
+            }
+        )
+    for refund in refunds:
+        rows.append(
+            {
+                "id": f"refund-{refund.id}",
+                "type": ACTIVITY_TYPE_REFUND,
+                "occurredAt": refund.reviewed_at,
+                "reference": refund.payment.receipt_number,
+                "description": refund.reason,
+                "person": refund.payment.patient.name,
+                "performedBy": refund.reviewed_by.name if refund.reviewed_by else "",
+                "amount": refund.amount,
+                "direction": "out",
+                "status": refund.status,
+            }
+        )
+
+    rows.sort(key=lambda row: row["occurredAt"], reverse=True)
+    return rows

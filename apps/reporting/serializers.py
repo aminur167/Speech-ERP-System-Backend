@@ -91,6 +91,21 @@ class BranchSummarySerializer(serializers.Serializer):
     byCategory = RevenueByCategoryRowSerializer(many=True)
 
 
+class BranchActivityRowSerializer(serializers.Serializer):
+    """One invoice, expense or refund in the Summary page's merged Activity feed."""
+
+    id = serializers.CharField()
+    type = serializers.ChoiceField(choices=["invoice", "expense", "refund"])
+    occurredAt = serializers.DateTimeField()
+    reference = serializers.CharField()
+    description = serializers.CharField(allow_blank=True)
+    person = serializers.CharField(allow_blank=True)
+    performedBy = serializers.CharField(allow_blank=True)
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    direction = serializers.ChoiceField(choices=["in", "out"])
+    status = serializers.CharField()
+
+
 class DailyLedgerRowSerializer(serializers.Serializer):
     """One day of the branch ledger — the Summary page's opening table."""
 

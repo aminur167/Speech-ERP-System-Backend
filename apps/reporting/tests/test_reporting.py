@@ -958,6 +958,7 @@ class TestBranchSummary:
 
 
 DAILY_LEDGER_URL = reverse("reporting:branch-summary-daily")
+BRANCH_ACTIVITY_URL = reverse("reporting:branch-summary-activity")
 
 
 @pytest.mark.money
@@ -1111,6 +1112,125 @@ class TestDailyLedgerBranchIsolation:
 
         assert Decimal(combined[0]["collected"]) == Decimal("10999.00")
         assert Decimal(narrowed[0]["collected"]) == Decimal("1000.00")
+
+
+class TestBranchActivity:
+    """The Summary page's merged feed — every invoice, expense and refund, newest first, in one list."""
+
+    def test_an_invoice_and_an_expense_both_appear_newest_first(
+        self, manager_client, manager, branch, pay
+    ):
+        from apps.expenses.models import Expense
+
+        pay("1000.00", when=local_midnight(date(2026, 5, 2)))
+        expense = expense_services.create_expense(
+            actor=manager, branch=branch,
+            data={
+                "category": "supplies", "amount": Decimal("300.00"),
+                "description": "Printer paper", "paid_to": "Shop", "payment_method": "cash",
+            },
+        )
+        Expense.objects.filter(pk=expense.pk).update(created_at=local_midnight(date(2026, 5, 5)))
+
+        rows = manager_client.get(
+            BRANCH_ACTIVITY_URL, {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"}
+        ).json()
+
+        assert [row["type"] for row in rows] == ["expense", "invoice"]
+        assert rows[0]["direction"] == "out"
+        assert rows[1]["direction"] == "in"
+
+    def test_a_refund_appears_on_its_approval_day_not_the_payment_day(
+        self, manager_client, manager, admin_user, pay
+    ):
+        payment = pay("5000.00", when=local_midnight(date(2026, 5, 10)))
+        refund_fully(
+            payment, requester=manager, approver=admin_user,
+            approved_at=local_midnight(date(2026, 5, 20)),
+        )
+
+        rows = manager_client.get(
+            BRANCH_ACTIVITY_URL, {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"}
+        ).json()
+
+        refund_rows = [row for row in rows if row["type"] == "refund"]
+        assert len(refund_rows) == 1
+        assert refund_rows[0]["reference"] == payment.receipt_number
+        assert Decimal(refund_rows[0]["amount"]) == Decimal("5000.00")
+        assert refund_rows[0]["direction"] == "out"
+
+    def test_a_pending_refund_request_does_not_appear_yet(self, manager_client, manager, pay):
+        """Only an approved refund is a dated event — a pending request hasn't happened yet."""
+        payment = pay("1000.00")
+        payment_services.request_refund(
+            actor=manager, payment=payment, amount=payment.amount, reason="Testing"
+        )
+
+        today = timezone.localdate().isoformat()
+        rows = manager_client.get(
+            BRANCH_ACTIVITY_URL, {"dateFrom": today, "dateTo": today}
+        ).json()
+
+        assert not any(row["type"] == "refund" for row in rows)
+
+    def test_a_void_does_not_appear(self, manager_client, manager, pay):
+        payment = pay("400.00")
+        payment_services.void_payment(actor=manager, payment=payment, reason="duplicate")
+
+        today = timezone.localdate().isoformat()
+        rows = manager_client.get(
+            BRANCH_ACTIVITY_URL, {"dateFrom": today, "dateTo": today}
+        ).json()
+
+        assert rows == []
+
+    def test_a_reversed_range_is_rejected(self, manager_client):
+        response = manager_client.get(
+            BRANCH_ACTIVITY_URL, {"dateFrom": "2026-06-30", "dateTo": "2026-06-01"}
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "invalid_range"
+
+
+@pytest.mark.isolation
+class TestBranchActivityBranchIsolation:
+    def test_a_manager_sees_only_their_own_branch(
+        self, manager_client, other_branch, other_manager, pay
+    ):
+        pay("1000.00", when=local_midnight(date(2026, 5, 2)))
+        pay(
+            "9999.00", actor=other_manager, target_branch=other_branch,
+            when=local_midnight(date(2026, 5, 2)),
+        )
+
+        rows = manager_client.get(
+            BRANCH_ACTIVITY_URL, {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"}
+        ).json()
+
+        assert len(rows) == 1
+        assert Decimal(rows[0]["amount"]) == Decimal("1000.00")
+
+    def test_admin_can_narrow_to_one_branch(
+        self, admin_client, branch, other_branch, other_manager, pay
+    ):
+        pay("1000.00", when=local_midnight(date(2026, 5, 2)))
+        pay(
+            "9999.00", actor=other_manager, target_branch=other_branch,
+            when=local_midnight(date(2026, 5, 2)),
+        )
+
+        combined = admin_client.get(
+            BRANCH_ACTIVITY_URL, {"dateFrom": "2026-05-01", "dateTo": "2026-05-31"}
+        ).json()
+        narrowed = admin_client.get(
+            BRANCH_ACTIVITY_URL,
+            {"dateFrom": "2026-05-01", "dateTo": "2026-05-31", "branch": str(branch.id)},
+        ).json()
+
+        assert len(combined) == 2
+        assert len(narrowed) == 1
+        assert Decimal(narrowed[0]["amount"]) == Decimal("1000.00")
 
 
 class TestListDateRanges:
