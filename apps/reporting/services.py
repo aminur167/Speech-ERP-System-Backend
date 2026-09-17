@@ -87,6 +87,7 @@ def transactions_summary(*, branch_id=None, as_of: date | None = None) -> dict:
             reviewed_at__year=reference.year, reviewed_at__month=reference.month
         )
     )
+    total_refunds = _sum(refunds)
 
     by_method = [
         {"method": row["method"], "amount": row["amount"]}
@@ -95,6 +96,7 @@ def transactions_summary(*, branch_id=None, as_of: date | None = None) -> dict:
 
     return {
         "totalCollected": _sum(revenue),
+        "totalRefunded": total_refunds,
         "transactionCount": revenue.count(),
         "todayCollected": day_total,
         "monthCollected": month_total,
