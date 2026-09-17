@@ -89,6 +89,15 @@ def transactions_summary(*, branch_id=None, as_of: date | None = None) -> dict:
     )
     total_refunds = _sum(refunds)
 
+    # Every approved/pending expense, salaries included: a salary payment
+    # becomes an Expense (category SALARIES) the moment it's disbursed
+    # (apps/staff/services.py::disburse_salary_payment), so this one query
+    # already covers both without a separate salary total to keep in sync.
+    expenses = Expense.objects.filter(status__in=COUNTED_EXPENSE_STATUSES)
+    if branch_id:
+        expenses = expenses.filter(branch_id=branch_id)
+    total_expenses = _sum(expenses)
+
     by_method = [
         {"method": row["method"], "amount": row["amount"]}
         for row in revenue.values("method").annotate(amount=Sum("amount")).order_by("-amount")
@@ -97,6 +106,7 @@ def transactions_summary(*, branch_id=None, as_of: date | None = None) -> dict:
     return {
         "totalCollected": _sum(revenue),
         "totalRefunded": total_refunds,
+        "totalExpenses": total_expenses,
         "transactionCount": revenue.count(),
         "todayCollected": day_total,
         "monthCollected": month_total,
