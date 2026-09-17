@@ -18,6 +18,7 @@ class ByMethodRowSerializer(serializers.Serializer):
 
 class TransactionsSummarySerializer(serializers.Serializer):
     totalCollected = serializers.DecimalField(max_digits=14, decimal_places=2)
+    totalRefunded = serializers.DecimalField(max_digits=14, decimal_places=2)
     transactionCount = serializers.IntegerField()
     todayCollected = serializers.DecimalField(max_digits=14, decimal_places=2)
     monthCollected = serializers.DecimalField(max_digits=14, decimal_places=2)
