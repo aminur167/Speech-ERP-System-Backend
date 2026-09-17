@@ -25,9 +25,12 @@ import pytest
 from django.urls import reverse
 from django.utils import timezone
 
+from apps.enrollments import services as enrollment_services
 from apps.expenses import services as expense_services
+from apps.patients import services as patient_services
 from apps.payments import services as payment_services
 from apps.payments.models import Payment, PaymentCategory, PaymentStatus, RefundRequest
+from apps.staff import services as staff_services
 
 pytestmark = pytest.mark.django_db
 
@@ -1191,6 +1194,99 @@ class TestBranchActivity:
 
         assert response.status_code == 400
         assert response.json()["code"] == "invalid_range"
+
+    def test_a_new_patient_registration_appears(self, manager_client, manager, branch):
+        patient_services.create_patient(
+            actor=manager,
+            branch=branch,
+            data={
+                "name": "Nusrat Jahan",
+                "phone": "01711000099",
+                "date_of_birth": date(1998, 3, 4),
+                "gender": "female",
+                "address": "Dhaka",
+            },
+        )
+
+        today = timezone.localdate().isoformat()
+        rows = manager_client.get(BRANCH_ACTIVITY_URL, {"dateFrom": today, "dateTo": today}).json()
+
+        patient_rows = [row for row in rows if row["type"] == "patient"]
+        assert len(patient_rows) == 1
+        assert patient_rows[0]["person"] == "Nusrat Jahan"
+        assert patient_rows[0]["direction"] == "neutral"
+        assert Decimal(patient_rows[0]["amount"]) == Decimal("0.00")
+
+    def test_a_new_monthly_enrollment_appears(
+        self, manager_client, manager, branch, patient_factory, service_factory
+    ):
+        patient = patient_factory(name="Rakib Hasan")
+        service = service_factory(name="Speech Therapy — Monthly")
+        enrollment_services.create_monthly_enrollment(
+            actor=manager, branch=branch, patient=patient, service=service,
+        )
+
+        today = timezone.localdate().isoformat()
+        rows = manager_client.get(BRANCH_ACTIVITY_URL, {"dateFrom": today, "dateTo": today}).json()
+
+        enrollment_rows = [row for row in rows if row["type"] == "enrollment"]
+        assert len(enrollment_rows) == 1
+        assert enrollment_rows[0]["person"] == "Rakib Hasan"
+        assert "Speech Therapy — Monthly" in enrollment_rows[0]["description"]
+        assert enrollment_rows[0]["direction"] == "neutral"
+
+    def test_a_new_installment_plan_appears(
+        self, manager_client, manager, branch, patient_factory, service_factory
+    ):
+        patient = patient_factory(name="Farzana Yasmin")
+        service = service_factory(name="Occupational Therapy")
+        enrollment_services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient, service=service,
+            number_of_installments=3,
+        )
+
+        today = timezone.localdate().isoformat()
+        rows = manager_client.get(BRANCH_ACTIVITY_URL, {"dateFrom": today, "dateTo": today}).json()
+
+        enrollment_rows = [row for row in rows if row["type"] == "enrollment"]
+        assert len(enrollment_rows) == 1
+        assert enrollment_rows[0]["person"] == "Farzana Yasmin"
+
+    def test_a_salary_request_then_approval_both_appear(
+        self, manager_client, manager, admin_user, staff_member_factory
+    ):
+        staff = staff_member_factory(name="Tanjina Akter")
+        payment = staff_services.request_salary_payment(
+            actor=manager, staff=staff, month=timezone.localdate().strftime("%Y-%m"),
+        )
+        staff_services.review_salary_payment(actor=admin_user, payment=payment, approve=True)
+
+        today = timezone.localdate().isoformat()
+        rows = manager_client.get(BRANCH_ACTIVITY_URL, {"dateFrom": today, "dateTo": today}).json()
+
+        salary_rows = {row["status"]: row for row in rows if row["type"] == "salary"}
+        assert set(salary_rows) == {"requested", "approved"}
+        assert salary_rows["requested"]["person"] == "Tanjina Akter"
+        assert salary_rows["approved"]["person"] == "Tanjina Akter"
+        assert salary_rows["requested"]["direction"] == "neutral"
+
+    def test_a_rejected_salary_request_appears(
+        self, manager_client, manager, admin_user, staff_member_factory
+    ):
+        staff = staff_member_factory(name="Imran Kabir")
+        payment = staff_services.request_salary_payment(
+            actor=manager, staff=staff, month=timezone.localdate().strftime("%Y-%m"),
+        )
+        staff_services.review_salary_payment(
+            actor=admin_user, payment=payment, approve=False, review_note="Wrong month",
+        )
+
+        today = timezone.localdate().isoformat()
+        rows = manager_client.get(BRANCH_ACTIVITY_URL, {"dateFrom": today, "dateTo": today}).json()
+
+        rejected = [row for row in rows if row["type"] == "salary" and row["status"] == "rejected"]
+        assert len(rejected) == 1
+        assert rejected[0]["person"] == "Imran Kabir"
 
 
 @pytest.mark.isolation

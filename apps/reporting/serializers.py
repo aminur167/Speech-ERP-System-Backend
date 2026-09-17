@@ -92,17 +92,21 @@ class BranchSummarySerializer(serializers.Serializer):
 
 
 class BranchActivityRowSerializer(serializers.Serializer):
-    """One invoice, expense or refund in the Summary page's merged Activity feed."""
+    """One event in the Summary page's merged Activity feed — a money-moving
+    record (invoice/expense/refund) or a non-money one (a new patient, a
+    service enrollment, a salary-payment decision)."""
 
     id = serializers.CharField()
-    type = serializers.ChoiceField(choices=["invoice", "expense", "refund"])
+    type = serializers.ChoiceField(
+        choices=["invoice", "expense", "refund", "patient", "enrollment", "salary"]
+    )
     occurredAt = serializers.DateTimeField()
-    reference = serializers.CharField()
+    reference = serializers.CharField(allow_blank=True)
     description = serializers.CharField(allow_blank=True)
     person = serializers.CharField(allow_blank=True)
     performedBy = serializers.CharField(allow_blank=True)
     amount = serializers.DecimalField(max_digits=14, decimal_places=2)
-    direction = serializers.ChoiceField(choices=["in", "out"])
+    direction = serializers.ChoiceField(choices=["in", "out", "neutral"])
     status = serializers.CharField()
 
 
