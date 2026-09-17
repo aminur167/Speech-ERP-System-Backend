@@ -12,6 +12,7 @@ from apps.enrollments.models import (
     MonthlyBill,
     MonthlyEnrollment,
 )
+from apps.patients.serializers import PatientWriteSerializer
 from apps.payments.models import PaymentMethod
 
 
@@ -176,6 +177,67 @@ class BookingCreateSerializer(serializers.Serializer):
 
 class CancelBookingSerializer(serializers.Serializer):
     reason = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+# ---------------------------------------------------------------------------
+# Public (unauthenticated) online booking -- the clinic's own website.
+# ---------------------------------------------------------------------------
+
+
+class PublicBranchSerializer(serializers.Serializer):
+    """The branch picker on the booking page — deliberately minimal, no manager or internal codes."""
+
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+    address = serializers.CharField()
+    phone = serializers.CharField()
+
+
+class PublicServiceSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+    fee = serializers.DecimalField(max_digits=12, decimal_places=2)
+    description = serializers.CharField(allow_blank=True)
+    durationLabel = serializers.CharField(source="duration_label", allow_blank=True)
+
+
+class PublicAvailabilitySlotSerializer(serializers.Serializer):
+    time = serializers.CharField()
+    available = serializers.BooleanField()
+
+
+class PublicBookingCreateSerializer(serializers.Serializer):
+    """
+    The website's own booking form.
+
+    No `patient` id like the in-clinic `BookingCreateSerializer` takes — a
+    website visitor isn't in the system yet, so their details travel with
+    the booking itself, and `create_public_booking` finds or creates the
+    Patient from them. Reuses `PatientWriteSerializer` rather than a
+    hand-picked field list, so a public booking is held to exactly the same
+    "who is this person" requirements (required fields, the under-18
+    guardian rule) as a patient registered at the front desk.
+    """
+
+    branch = serializers.IntegerField()
+    service = serializers.IntegerField()
+    date = serializers.DateField()
+    time = serializers.CharField(max_length=16)
+    patient = PatientWriteSerializer()
+
+
+class PublicBookingSerializer(serializers.Serializer):
+    """What the website shows back after a successful booking."""
+
+    bookingCode = serializers.CharField()
+    patientName = serializers.CharField()
+    patientCode = serializers.CharField()
+    serviceName = serializers.CharField()
+    branchName = serializers.CharField()
+    date = serializers.DateField()
+    time = serializers.CharField()
+    advanceAmount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    status = serializers.CharField()
 
 
 class TerminatedMonthlyServiceSerializer(serializers.ModelSerializer):

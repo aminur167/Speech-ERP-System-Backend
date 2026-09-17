@@ -16,11 +16,11 @@ ALLOWED_HOSTS = ["testserver", "localhost"]
 # needlessly slow, and password *strength* isn't what these tests verify.
 PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
 
-# Throttling would make repeated login tests flaky; the throttle itself is
-# tested explicitly by re-enabling it in that one test.
+# Throttling would make repeated login/booking tests flaky; each throttle is
+# tested explicitly by re-enabling it in its own test.
 REST_FRAMEWORK = {  # noqa: F405
     **REST_FRAMEWORK,  # noqa: F405
-    "DEFAULT_THROTTLE_RATES": {"login": None},
+    "DEFAULT_THROTTLE_RATES": {"login": None, "public_booking": None},
 }
 
 # Keep test output readable — only warnings and above.
