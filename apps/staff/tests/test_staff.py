@@ -282,6 +282,44 @@ class TestAttendance:
                 services.check_out(staff=farhana)
         assert exc_info.value.code == "before_office_hours"
 
+    def test_check_in_after_office_end_is_refused(self, farhana):
+        """No late-arrival override -- check-in closes for the day once the office does."""
+        with mock.patch(
+            "apps.staff.services.timezone.now",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            with pytest.raises(services.AttendanceError) as exc_info:
+                services.check_in(staff=farhana)
+        assert exc_info.value.code == "after_office_hours"
+        assert not StaffAttendance.objects.filter(staff=farhana).exists()
+
+    def test_check_in_exactly_at_office_end_is_refused(self, farhana):
+        with mock.patch(
+            "apps.staff.services.timezone.now",
+            return_value=_at_hour(services.OFFICE_END_HOUR),
+        ):
+            with pytest.raises(services.AttendanceError) as exc_info:
+                services.check_in(staff=farhana)
+        assert exc_info.value.code == "after_office_hours"
+
+    def test_check_in_just_before_office_end_is_allowed(self, farhana):
+        with mock.patch(
+            "apps.staff.services.timezone.now",
+            return_value=_at_hour(services.OFFICE_END_HOUR - 1),
+        ):
+            record = services.check_in(staff=farhana)
+        assert record.status == StaffAttendance.Status.PRESENT
+
+    def test_check_out_after_office_end_is_still_allowed(self, office_hours, farhana):
+        """Unlike check-in, check-out has no upper bound -- leaving at or after 4pm is an ordinary on-time day."""
+        services.check_in(staff=farhana)
+        with mock.patch(
+            "apps.staff.services.timezone.now",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            record = services.check_out(staff=farhana)
+        assert record.status == StaffAttendance.Status.PRESENT
+
     def test_api_check_in_before_office_hours_returns_400(self, manager_client, farhana):
         with mock.patch(
             "apps.staff.services.timezone.now",
@@ -290,6 +328,15 @@ class TestAttendance:
             response = manager_client.post(reverse("staff:staffmember-check-in", args=[farhana.id]))
         assert response.status_code == 400
         assert response.json()["code"] == "before_office_hours"
+
+    def test_api_check_in_after_office_hours_returns_400(self, manager_client, farhana):
+        with mock.patch(
+            "apps.staff.services.timezone.now",
+            return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+        ):
+            response = manager_client.post(reverse("staff:staffmember-check-in", args=[farhana.id]))
+        assert response.status_code == 400
+        assert response.json()["code"] == "after_office_hours"
 
     def test_api_check_in_then_check_out(self, office_hours, manager_client, farhana):
         in_response = manager_client.post(reverse("staff:staffmember-check-in", args=[farhana.id]))
@@ -390,18 +437,22 @@ class TestNoShowAutoAbsent:
         assert records.count() == 1
         assert records.first().status == checked_in.status
 
-    def test_manual_check_in_after_auto_absent_overrides_it(self, farhana):
+    def test_manual_check_in_cannot_override_auto_absent(self, farhana):
+        """Once the office has closed for the day, auto-absent is final -- there is no late-arrival override."""
         with mock.patch(
             "apps.staff.services.timezone.localtime",
             return_value=_at_hour(services.OFFICE_END_HOUR + 1),
         ):
             services.mark_no_show_absentees(StaffMember.objects.filter(pk=farhana.id))
-            # Still inside the mock: a manager checking someone in for real,
-            # well after office hours have already opened for the day, must
-            # still be allowed to override the auto-absent placeholder.
-            record = services.check_in(staff=farhana)
-        assert record.status == StaffAttendance.Status.PRESENT
-        assert record.check_in_at is not None
+            with mock.patch(
+                "apps.staff.services.timezone.now",
+                return_value=_at_hour(services.OFFICE_END_HOUR + 1),
+            ):
+                with pytest.raises(services.AttendanceError) as exc_info:
+                    services.check_in(staff=farhana)
+        assert exc_info.value.code == "after_office_hours"
+        record = StaffAttendance.objects.get(staff=farhana, date=TEST_DAY)
+        assert record.status == StaffAttendance.Status.ABSENT
 
     def test_today_attendance_endpoint_reflects_auto_absent(self, manager_client, farhana):
         with mock.patch(
