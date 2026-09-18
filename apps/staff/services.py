@@ -16,6 +16,10 @@ time doesn't change the outcome, only departure time does.
 Check-in and check-out are both refused before the office opens (see
 `_ensure_office_is_open`) — a clinic that isn't open yet can't have anyone
 genuinely clocking in, so a punch at 2am is bad data, not an early arrival.
+Check-in additionally closes once the office does (see
+`_ensure_check_in_window_is_open`) — there is no late-arrival override, so an
+auto-marked absent is final for the day. Check-out has no such upper bound:
+an end-of-day check-out at or after closing is exactly what "on time" means.
 """
 
 from collections import defaultdict
@@ -87,9 +91,10 @@ def _ensure_office_is_open(now, *, action: str) -> None:
     opened -- a punch at 2am isn't a real attendance event, it's bad data
     (exactly the kind that used to render as a "Present ... 12:45 AM" row).
 
-    No upper bound: a late arrival after 4pm is still deliberately allowed
-    (it overrides `mark_no_show_absentees`'s auto-absent placeholder), and
-    an early-leave check-out is exactly what this whole status exists for.
+    No upper bound here: an end-of-day check-out at or after 4pm is exactly
+    what "on time" looks like (see `_status_for_check_out`), and stragglers
+    are auto-checked-out well past closing too. Check-in has its own,
+    stricter upper bound -- see `_ensure_check_in_window_is_open`.
     """
     if timezone.localtime(now).time() < time(OFFICE_START_HOUR, 0):
         raise AttendanceError(
@@ -98,10 +103,28 @@ def _ensure_office_is_open(now, *, action: str) -> None:
         )
 
 
+def _ensure_check_in_window_is_open(now) -> None:
+    """
+    Check-in closes at both ends of the day: before the office opens (shared
+    with check-out, see `_ensure_office_is_open`), and once it closes at 4pm.
+
+    There is no late-arrival override -- once `mark_no_show_absentees` has
+    (or would have) auto-marked someone absent for the day, that's final. A
+    punch at 8pm was never a real attendance event; it was a manager trying
+    to paper over a no-show after the fact.
+    """
+    _ensure_office_is_open(now, action="check in")
+    if timezone.localtime(now).time() >= time(OFFICE_END_HOUR, 0):
+        raise AttendanceError(
+            f"Can't check in after office hours end at {OFFICE_END_HOUR}:00.",
+            code="after_office_hours",
+        )
+
+
 @transaction.atomic
 def check_in(*, staff: StaffMember) -> StaffAttendance:
     now = timezone.now()
-    _ensure_office_is_open(now, action="check in")
+    _ensure_check_in_window_is_open(now)
     today = timezone.localdate()
 
     record, _created = StaffAttendance.objects.select_for_update().get_or_create(
@@ -162,10 +185,9 @@ def mark_no_show_absentees(staff_queryset) -> int:
     from the daily `close_out_daily_attendance` cron job alike, which is what
     makes this "real-time" rather than dependent on someone opening the
     Staff page after 4pm: `ignore_conflicts` makes it idempotent against the
-    (staff, date) unique constraint, and a manager checking someone in for
-    real afterwards (e.g. a late arrival) simply overwrites this placeholder
-    row via `check_in`, which always reassigns status regardless of the
-    existing value.
+    (staff, date) unique constraint. This is final -- `check_in` refuses to
+    run once the office has closed (see `_ensure_check_in_window_is_open`),
+    so there is no way to overwrite this placeholder row after the fact.
 
     Returns how many staff members were newly marked absent.
     """
