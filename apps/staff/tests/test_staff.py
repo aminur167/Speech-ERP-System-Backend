@@ -17,8 +17,17 @@ from apps.staff.models import StaffAttendance, StaffBonus, StaffMember
 pytestmark = pytest.mark.django_db
 
 
+# A fixed, non-holiday reference date for hour-only tests. Using the real
+# `date.today()` here made every no-show/auto-checkout test flaky specifically
+# on the clinic's actual weekly holiday (Friday, `services.WEEKLY_HOLIDAY_WEEKDAY`),
+# since `mark_no_show_absentees`/`auto_check_out_stragglers` correctly no-op
+# that day -- the suite would then fail once a week regardless of the code
+# under test. January 2, 2024 is a Tuesday.
+TEST_DAY = date(2024, 1, 2)
+
+
 def _at_hour(hour: int) -> datetime:
-    return timezone.make_aware(datetime.combine(date.today(), datetime.min.time()) + timedelta(hours=hour))
+    return timezone.make_aware(datetime.combine(TEST_DAY, datetime.min.time()) + timedelta(hours=hour))
 
 
 @pytest.fixture
@@ -359,7 +368,7 @@ class TestNoShowAutoAbsent:
             return_value=_at_hour(services.OFFICE_END_HOUR - 1),
         ):
             services.mark_no_show_absentees(StaffMember.objects.filter(pk=farhana.id))
-        assert not StaffAttendance.objects.filter(staff=farhana, date=date.today()).exists()
+        assert not StaffAttendance.objects.filter(staff=farhana, date=TEST_DAY).exists()
 
     def test_marks_absent_after_office_end(self, farhana):
         with mock.patch(
@@ -367,7 +376,7 @@ class TestNoShowAutoAbsent:
             return_value=_at_hour(services.OFFICE_END_HOUR + 1),
         ):
             services.mark_no_show_absentees(StaffMember.objects.filter(pk=farhana.id))
-        record = StaffAttendance.objects.get(staff=farhana, date=date.today())
+        record = StaffAttendance.objects.get(staff=farhana, date=TEST_DAY)
         assert record.status == StaffAttendance.Status.ABSENT
 
     def test_does_not_overwrite_an_existing_record(self, office_hours, farhana):
@@ -377,7 +386,7 @@ class TestNoShowAutoAbsent:
             return_value=_at_hour(services.OFFICE_END_HOUR + 1),
         ):
             services.mark_no_show_absentees(StaffMember.objects.filter(pk=farhana.id))
-        records = StaffAttendance.objects.filter(staff=farhana, date=date.today())
+        records = StaffAttendance.objects.filter(staff=farhana, date=TEST_DAY)
         assert records.count() == 1
         assert records.first().status == checked_in.status
 
@@ -425,7 +434,7 @@ class TestAutoCheckOutStragglers:
         ):
             checked_out = services.auto_check_out_stragglers(StaffMember.objects.filter(pk=farhana.id))
         assert checked_out == 0
-        record = StaffAttendance.objects.get(staff=farhana, date=date.today())
+        record = StaffAttendance.objects.get(staff=farhana, date=TEST_DAY)
         assert record.check_out_at is None
 
     def test_checks_out_after_office_end(self, office_hours, farhana):
@@ -436,7 +445,7 @@ class TestAutoCheckOutStragglers:
         ):
             checked_out = services.auto_check_out_stragglers(StaffMember.objects.filter(pk=farhana.id))
         assert checked_out == 1
-        record = StaffAttendance.objects.get(staff=farhana, date=date.today())
+        record = StaffAttendance.objects.get(staff=farhana, date=TEST_DAY)
         assert record.check_out_at is not None
         assert record.status == StaffAttendance.Status.PRESENT
 
@@ -446,7 +455,7 @@ class TestAutoCheckOutStragglers:
             "apps.staff.services.timezone.now", return_value=_at_hour(services.OFFICE_START_HOUR + 1)
         ):
             services.check_out(staff=farhana)
-        original_check_out_at = StaffAttendance.objects.get(staff=farhana, date=date.today()).check_out_at
+        original_check_out_at = StaffAttendance.objects.get(staff=farhana, date=TEST_DAY).check_out_at
 
         with mock.patch(
             "apps.staff.services.timezone.localtime",
@@ -454,7 +463,7 @@ class TestAutoCheckOutStragglers:
         ):
             checked_out = services.auto_check_out_stragglers(StaffMember.objects.filter(pk=farhana.id))
         assert checked_out == 0
-        record = StaffAttendance.objects.get(staff=farhana, date=date.today())
+        record = StaffAttendance.objects.get(staff=farhana, date=TEST_DAY)
         assert record.check_out_at == original_check_out_at
         assert record.status == StaffAttendance.Status.EARLY_LEAVE
 
@@ -466,7 +475,7 @@ class TestAutoCheckOutStragglers:
         ):
             checked_out = services.auto_check_out_stragglers(StaffMember.objects.filter(pk=farhana.id))
         assert checked_out == 0
-        assert not StaffAttendance.objects.filter(staff=farhana, date=date.today()).exists()
+        assert not StaffAttendance.objects.filter(staff=farhana, date=TEST_DAY).exists()
 
     def test_today_attendance_endpoint_reflects_the_auto_checkout(self, manager_client, office_hours, farhana):
         services.check_in(staff=farhana)
@@ -540,7 +549,7 @@ class TestCloseOutDailyAttendanceCommand:
             out = StringIO()
             call_command("close_out_daily_attendance", stdout=out)
 
-        record = StaffAttendance.objects.get(staff=farhana, date=date.today())
+        record = StaffAttendance.objects.get(staff=farhana, date=TEST_DAY)
         assert record.status == StaffAttendance.Status.ABSENT
         assert "Marked 1 staff member" in out.getvalue()
 
@@ -572,7 +581,7 @@ class TestCloseOutDailyAttendanceCommand:
             out = StringIO()
             call_command("close_out_daily_attendance", stdout=out)
 
-        record = StaffAttendance.objects.get(staff=farhana, date=date.today())
+        record = StaffAttendance.objects.get(staff=farhana, date=TEST_DAY)
         assert record.check_out_at is not None
         assert record.status == StaffAttendance.Status.PRESENT
         assert "auto-checked-out 1 staff member" in out.getvalue()
