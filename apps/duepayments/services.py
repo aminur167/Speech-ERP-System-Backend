@@ -15,6 +15,8 @@ for a past date if it was unpaid then, even if it's paid now.
 from datetime import date, datetime, time
 from decimal import Decimal
 
+from django.db.models import Count, DecimalField, F, IntegerField, OuterRef, Subquery, Sum, Value
+from django.db.models.functions import Coalesce, Greatest
 from django.utils import timezone
 
 from apps.enrollments.services import month_key
@@ -69,6 +71,43 @@ def _outstanding_at(payable, cutoff) -> Decimal:
     return payable.amount - payable.amount_paid
 
 
+def _remaining_on(model, parent: str):
+    """
+    What is still owed across every row of the same parent, as an annotation.
+
+    The database equivalent of `outstanding_total()` -- forgiven rows owe
+    nothing, and a row never owes less than zero -- so only the total crosses
+    the wire, not every bill of the patient's history.
+    """
+    money = DecimalField(max_digits=12, decimal_places=2)
+    owed = (
+        model.objects.filter(**{parent: OuterRef(parent)})
+        .exclude(status__in=FORGIVEN_STATUSES)
+        .order_by()
+        .values(parent)
+        .annotate(
+            total=Sum(
+                Greatest(F("amount") - F("amount_paid"), Value(Decimal("0.00"))),
+                output_field=money,
+            )
+        )
+        .values("total")[:1]
+    )
+    return Coalesce(Subquery(owed, output_field=money), Value(Decimal("0.00")), output_field=money)
+
+
+def _parts_in(model, parent: str):
+    """How many rows the parent has, as an annotation."""
+    count = (
+        model.objects.filter(**{parent: OuterRef(parent)})
+        .order_by()
+        .values(parent)
+        .annotate(n=Count("pk"))
+        .values("n")[:1]
+    )
+    return Subquery(count, output_field=IntegerField())
+
+
 def collect_due_items(
     *, branch_id=None, as_of: date | None = None, month: str | None = None
 ) -> list[dict]:
@@ -109,10 +148,10 @@ def collect_due_items(
         .select_related(
             "enrollment", "enrollment__patient", "enrollment__service", "enrollment__branch"
         )
-        # Every bill of each enrollment, fetched once: `outstanding_total()`
-        # reads `enrollment.bills.all()`, which without this is one query per
-        # row -- the page cost grew with every patient.
-        .prefetch_related("enrollment__bills")
+        # The enrollment's whole remaining balance, summed by the database:
+        # reading it per row was one query per patient, and prefetching every
+        # bill instead moved the patient's entire paid history each request.
+        .annotate(enrollment_remaining=_remaining_on(MonthlyBill, "enrollment_id"))
         .order_by("enrollment_id", "month")
     )
     if branch_id:
@@ -153,7 +192,7 @@ def collect_due_items(
                 # Everything unpaid on the enrollment, not just this bill —
                 # what terminating would write off, which the confirmation
                 # has to state before the manager agrees to it.
-                "outstandingTotal": enrollment.outstanding_total(),
+                "outstandingTotal": bill.enrollment_remaining,
                 "dueDate": bill.due_date,
                 "status": bill.effective_status(),
                 "serviceActive": enrollment.is_active,
@@ -164,9 +203,12 @@ def collect_due_items(
         Installment.objects
         .exclude(status__in=CLOSED_STATUSES)
         .select_related("plan", "plan__patient", "plan__service", "plan__branch")
-        # Same reason: the row's part count and remaining total both read the
-        # plan's installments, once per row without this.
-        .prefetch_related("plan__installments")
+        # Same reason: the plan's part count and remaining total, from the
+        # database rather than by reading every installment of every plan.
+        .annotate(
+            plan_remaining=_remaining_on(Installment, "plan_id"),
+            plan_parts=_parts_in(Installment, "plan_id"),
+        )
         .order_by("plan_id", "index")
     )
     if branch_id:
@@ -181,7 +223,7 @@ def collect_due_items(
         seen_plans.add(installment.plan_id)
 
         plan = installment.plan
-        total_parts = len(plan.installments.all())
+        total_parts = installment.plan_parts
         items.append(
             {
                 "key": f"installment-{plan.id}-{installment.index}",
@@ -198,7 +240,7 @@ def collect_due_items(
                 "amount": installment.outstanding,
                 # The whole remaining plan, not just this installment — see
                 # the matching note on the monthly branch above.
-                "outstandingTotal": plan.outstanding_total(),
+                "outstandingTotal": installment.plan_remaining,
                 "dueDate": installment.due_date,
                 "status": installment.effective_status(),
                 "serviceActive": plan.is_active,
