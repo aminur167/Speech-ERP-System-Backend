@@ -1,0 +1,44 @@
+# Keeps the Render free-plan backend awake.
+#
+# Render stops a free web service after 15 minutes without traffic, and the
+# next visitor waits 30-60 seconds while it starts again. A light request
+# every 10 minutes during clinic hours prevents that.
+#
+# Setup: repository Settings -> Secrets and variables -> Actions -> Variables,
+# add BACKEND_HEALTH_URL = https://<your-service>.onrender.com/api/health/
+# Without it the job does nothing and succeeds.
+#
+# Notes:
+#   * Hours are UTC. 02:00-16:59 UTC is 08:00-22:59 in Bangladesh (UTC+6).
+#   * GitHub may delay scheduled runs by several minutes under load.
+#   * GitHub disables schedules in a repository with no commits for 60 days;
+#     re-enable it from the Actions tab if that happens.
+#   * Render's free plan allows 750 instance hours a month, enough for one
+#     service running all month.
+
+name: Keep backend warm
+
+on:
+  schedule:
+    - cron: "*/10 2-16 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping health endpoint
+        env:
+          URL: ${{ vars.BACKEND_HEALTH_URL }}
+        run: |
+          if [ -z "$URL" ]; then
+            echo "BACKEND_HEALTH_URL is not set; nothing to do."
+            exit 0
+          fi
+          # A cold start can take up to a minute, so allow for it and retry.
+          curl --silent --show-error --fail --max-time 90 \
+               --retry 2 --retry-delay 10 --output /dev/null \
+               --write-out "HTTP %{http_code} in %{time_total}s\n" "$URL"
