@@ -17,7 +17,7 @@ services:
     plan: free
     region: singapore
     buildCommand: "pip install -r requirements/prod.txt && python manage.py collectstatic --noinput"
-    startCommand: "python manage.py migrate --noinput && gunicorn config.wsgi:application"
+    startCommand: "python manage.py migrate --noinput && gunicorn config.wsgi:application --workers 2 --threads 4 --timeout 60"
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
