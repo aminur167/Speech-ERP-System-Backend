@@ -56,7 +56,14 @@ SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SESSION_COOKIE_HTTPONLY = True
 CSRF_COOKIE_HTTPONLY = False  # the SPA must read the CSRF token
 
-CONN_MAX_AGE = 60  # persistent DB connections
+# Reuse database connections across requests. This must live inside
+# DATABASES -- a bare top-level CONN_MAX_AGE is not a Django setting and was
+# silently ignored, so every request opened a fresh TLS connection to the
+# hosted Postgres (Supabase), adding a network round trip or several to each
+# API call. Health checks drop a connection the pooler has closed instead of
+# failing the request that finds it.
+DATABASES["default"]["CONN_MAX_AGE"] = env.int("DB_CONN_MAX_AGE", default=60)  # noqa: F405
+DATABASES["default"]["CONN_HEALTH_CHECKS"] = True  # noqa: F405
 
 # Warn rather than crash if the error-tracking DSN isn't configured yet — a
 # clinic's first deploy shouldn't be blocked on having Sentry set up.
