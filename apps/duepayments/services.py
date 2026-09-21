@@ -109,6 +109,10 @@ def collect_due_items(
         .select_related(
             "enrollment", "enrollment__patient", "enrollment__service", "enrollment__branch"
         )
+        # Every bill of each enrollment, fetched once: `outstanding_total()`
+        # reads `enrollment.bills.all()`, which without this is one query per
+        # row -- the page cost grew with every patient.
+        .prefetch_related("enrollment__bills")
         .order_by("enrollment_id", "month")
     )
     if branch_id:
@@ -160,6 +164,9 @@ def collect_due_items(
         Installment.objects
         .exclude(status__in=CLOSED_STATUSES)
         .select_related("plan", "plan__patient", "plan__service", "plan__branch")
+        # Same reason: the row's part count and remaining total both read the
+        # plan's installments, once per row without this.
+        .prefetch_related("plan__installments")
         .order_by("plan_id", "index")
     )
     if branch_id:
@@ -174,7 +181,7 @@ def collect_due_items(
         seen_plans.add(installment.plan_id)
 
         plan = installment.plan
-        total_parts = plan.installments.count()
+        total_parts = len(plan.installments.all())
         items.append(
             {
                 "key": f"installment-{plan.id}-{installment.index}",
