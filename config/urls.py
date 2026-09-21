@@ -10,11 +10,14 @@ from django.urls import include, path
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 from rest_framework.permissions import AllowAny
 
+from apps.common.batch import BatchView
 from apps.common.views import HealthCheckView
 
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/health/", HealthCheckView.as_view(), name="health"),
+    # Several read-only dashboard requests in one round trip (apps/common/batch.py).
+    path("api/batch/", BatchView.as_view(), name="batch"),
     # Raw OpenAPI schema, and the interactive Swagger UI built from it.
     # Publicly viewable, like most APIs' docs (Stripe, GitHub, ...) — it only
     # describes request/response shapes, not data. Every actual endpoint
