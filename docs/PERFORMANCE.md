@@ -130,6 +130,60 @@ sleeps after 15 minutes idle), Postgres on Supabase free plan.
   `resizeImage.ts`); photos uploaded before that are still full size and are
   sent with every staff list.
 
+## 2026-09-21 — Pass 2: instant clicks
+
+Goal: data on screen as soon as a page is opened or a button pressed.
+Supabase and Render are both in Singapore, so region was ruled out.
+The rollback tags above still mark the state before both passes.
+
+| # | Change | Repo / commit | Undo with |
+|---|---|---|---|
+| 7 | Revisits show the last data at once (gcTime 7 days, matching the IndexedDB cache); branches, packages, staff, settings trusted for 10 min. **Cache tied to the signed-in user** — cleared on sign-out and when someone else signs in. | frontend `b329489` | `git revert b329489` (removes both; they depend on each other) |
+| 8 | Audit log and package requests keep the current page visible while the next loads | frontend `fd524ba` | `git revert fd524ba` |
+| 9 | Skeleton instead of spinner (`LoadingState`, 32 places) | frontend `70a5a54` | `git revert 70a5a54` |
+| 10 | Dashboard: one request instead of ten — `POST /api/batch/` (apps/common/batch.py) + `src/lib/api/batch.ts` | backend `1977ea6`, frontend `d04c0d3` | revert the frontend commit first; the endpoint alone is harmless |
+| 11 | Sidebar link hover/focus/touch prefetches that page's data (`src/lib/routePrefetch.ts`) | frontend `c9e8bfd` | `git revert c9e8bfd` |
+| 12 | Due Payments: remaining balance summed in SQL instead of loading every bill of every patient | backend `3edc349` | `git revert 3edc349` |
+| 13 | Staff photos stored as 160 px avatars; data migration shrank existing ones | backend `3a86863` | code: `git revert 3a86863`. The **shrunk photos cannot be restored** (not kept) |
+| 14 | Attendance marks show at once, roll back if refused (optimistic) | frontend `200b730` | `git revert 200b730` |
+
+### Notes that matter later
+
+- **Found along the way — security:** before #7, signing out did not clear
+  cached data, so on a shared PC the next user could briefly see the previous
+  user's patients and payments. Fixed in the same commit.
+- **Found along the way — offline:** the 5-minute gcTime had silently cut the
+  offline cache (meant to be 7 days) down to 5 minutes. Fixed by #7.
+- **Batch endpoint guarantees** (#10): each part runs through the same view as
+  the direct call, as the same user; `apps/common/tests/test_batch.py` compares
+  every allowed path both ways. Only allowlisted read-only paths, GET only,
+  at most 12. To batch a new endpoint, add it to `ALLOWED_PATHS` and to that
+  test's comparison.
+- **Optimistic updates are for attendance only.** Money (payments,
+  collections, refunds, advances) must never be shown before the server
+  confirms it.
+- **Hover prefetch** (#11) matches each page's *opening* filters. If a page's
+  defaults change and `routePrefetch.ts` is not updated, nothing breaks — the
+  prefetch just stops helping.
+
+## Planned: when moving to a VPS
+
+1. **Postgres on the same machine** as Django (or the same private network).
+   Each query drops from a network round trip to well under a millisecond.
+   Keep `CONN_MAX_AGE` (#2). Set up daily `pg_dump` backups off the machine
+   *before* moving real data — Supabase free has no backups either, so this
+   is not optional.
+2. **Redis as Django's cache** for data that rarely changes: the package
+   catalog, branch list, system settings, and the dashboard's month-level
+   figures (by-method, by-category). Invalidate on the writes that change
+   them (package/branch/settings saves, payments for the revenue figures), not
+   by waiting for a timer — stale money figures are worse than slow ones.
+   Configure through `CACHES` from an env var (`REDIS_URL`) so local and test
+   runs keep the in-memory cache.
+3. **gunicorn workers ≈ 2 × CPU cores + 1**, threads 2–4; no keep-warm ping
+   needed (#5 can be deleted).
+4. Region: Singapore (closest good option to Bangladesh).
+
 ## How to measure again
 
 Count queries per endpoint with realistic data: write a throwaway test that
