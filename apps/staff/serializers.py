@@ -6,6 +6,7 @@ from rest_framework import serializers
 
 from apps.payments.models import PaymentMethod
 from apps.staff.models import SalaryPayment, StaffAttendance, StaffBonus, StaffMember
+from apps.staff.photos import shrink_photo
 
 
 class StaffMemberSerializer(serializers.ModelSerializer):
@@ -52,7 +53,8 @@ class StaffMemberWriteSerializer(serializers.ModelSerializer):
     def validate_photo_url(self, value):
         if value and len(value) > MAX_PHOTO_URL_LENGTH:
             raise serializers.ValidationError("Photo is too large.")
-        return value
+        # Stored as a 160 px avatar whatever the client sent -- see photos.py.
+        return shrink_photo(value)
 
 
 class StaffAttendanceSerializer(serializers.ModelSerializer):

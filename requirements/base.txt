@@ -18,3 +18,6 @@ django-environ==0.14.0
 
 # OpenAPI schema + interactive docs at /api/schema/, /api/docs/.
 drf-spectacular==0.28.0
+
+# Shrinks staff photos to avatar size on the server (apps/staff/photos.py).
+Pillow==12.3.0
