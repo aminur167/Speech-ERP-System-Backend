@@ -221,6 +221,137 @@ def create_monthly_enrollment(*, actor, branch, patient, service, months_ahead: 
     return enrollment
 
 
+def admission_label(month_date: date) -> str:
+    """`Admission — September 2026`, within the bill label's 32 characters."""
+    return f"Admission — {month_label(month_date)}"
+
+
+@transaction.atomic
+def enroll_monthly_with_admission(
+    *,
+    actor,
+    branch,
+    patient,
+    service,
+    method: str,
+    discount: Decimal = Decimal("0.00"),
+    discount_reason: str = "",
+    idempotency_key: str | None = None,
+    client_created_at=None,
+):
+    """
+    Enroll a patient in a monthly package and take the admit fee — one step.
+
+    The enrollment month is billed at the package's admit fee, less whatever
+    discount the manager gives at the desk; the monthly fee starts the month
+    after, raised by the monthly job exactly as before. Returns
+    `(enrollment, payment)`; `payment` is None when the discount covered the
+    whole admit fee, because a zero-taka payment is not a payment.
+
+    **Enrollment and payment commit together.** They used to be two requests,
+    and a manager who stopped between them left an enrollment behind whose
+    first bill was already overdue. Now there is no enrollment until the
+    admit fee is settled, and a failure anywhere leaves nothing at all.
+
+    **The discount is recorded, never just subtracted.** The bill keeps the
+    admit fee, the discount and the reason beside the amount actually owed,
+    and the audit entry names all three — a lower first payment with no
+    explanation is exactly what a reconciliation cannot follow later.
+    `amount` holds the discounted figure, so refunds and every balance
+    calculation read it unchanged.
+    """
+    # A replay (a network retry, an offline queue flushing) must hand back
+    # the original enrollment — checked first, before anything is validated,
+    # because by now the patient is enrolled and paid and a second pass
+    # would be refused on other grounds. Kept on the enrollment rather than
+    # the payment: a fully discounted admission has no payment to find.
+    if idempotency_key:
+        existing = MonthlyEnrollment.objects.filter(idempotency_key=idempotency_key).first()
+        if existing is not None:
+            admission = existing.bills.filter(kind=MonthlyBill.Kind.ADMISSION).first()
+            payment = admission.payment if admission is not None else None
+            return existing, payment
+
+    if service.category != service.Category.MONTHLY:
+        raise EnrollmentError(
+            "Only a monthly package can be enrolled here.", code="not_monthly"
+        )
+
+    admission_fee = Decimal(service.effective_admission_fee)
+    discount = Decimal(discount or 0)
+    discount_reason = (discount_reason or "").strip()
+
+    if discount < 0:
+        raise EnrollmentError("A discount cannot be negative.", code="invalid_discount")
+    if discount > admission_fee:
+        raise EnrollmentError(
+            f"The discount cannot be more than the admit fee ({admission_fee}).",
+            code="discount_exceeds_fee",
+            extra={"admissionFee": str(admission_fee)},
+        )
+    if discount > 0 and not discount_reason:
+        raise EnrollmentError(
+            "Say why a discount is being given.", code="discount_reason_required"
+        )
+
+    _assert_no_outstanding_dues(patient, action="enroll in a new service")
+
+    enrollment = MonthlyEnrollment.objects.create(
+        patient=patient,
+        service=service,
+        branch=branch,
+        idempotency_key=idempotency_key or None,
+        client_created_at=client_created_at,
+    )
+
+    first_of_month = timezone.localdate().replace(day=1)
+    key = month_key(first_of_month)
+    payable = admission_fee - discount
+    bill = MonthlyBill.objects.create(
+        enrollment=enrollment,
+        month=key,
+        label=admission_label(first_of_month),
+        kind=MonthlyBill.Kind.ADMISSION,
+        gross_amount=admission_fee,
+        discount_amount=discount,
+        discount_reason=discount_reason,
+        amount=payable,
+        due_date=due_date_for_month(key),
+        status=BillStatus.DUE,
+    )
+
+    audit.record(
+        actor=actor,
+        action=AuditLog.Action.CREATE,
+        target=enrollment,
+        branch=branch,
+        reason=discount_reason,
+        changes={
+            "service": service.name,
+            "fee": str(service.fee),
+            "admissionFee": str(admission_fee),
+            "discount": str(discount),
+            "charged": str(payable),
+        },
+    )
+
+    if payable > 0:
+        payment, _ = collect_bill_payment(
+            actor=actor, branch=branch, bill=bill, method=method,
+            idempotency_key=idempotency_key,
+        )
+    else:
+        # Discounted to nothing: settled, with no money and no receipt. The
+        # bill and the audit entry above are the whole record of it.
+        payment = None
+        bill.status = bill.settled_status()
+        bill.paid_at = timezone.now()
+        bill.save(update_fields=["status", "paid_at"])
+
+    enrollment.refresh_from_db()
+    return enrollment, payment
+
+
 def split_equally(total: Decimal, parts: int) -> list[Decimal]:
     """
     `total` in `parts` equal amounts, remainder on the last.

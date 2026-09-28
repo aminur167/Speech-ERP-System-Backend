@@ -109,7 +109,7 @@ class TestMonthlyEnrollmentCreation:
 
         response = manager_client.post(
             reverse("enrollments:monthly-enrollment-list"),
-            {"patient": str(patient.id), "service": str(monthly_service.id)},
+            {"patient": str(patient.id), "service": str(monthly_service.id), "method": "cash"},
         )
         assert response.status_code == 404
 
@@ -576,7 +576,7 @@ class TestEnrollmentBranchIsolation:
 
         response = manager_client.post(
             reverse("enrollments:monthly-enrollment-list"),
-            {"patient": str(foreign.id), "service": str(monthly_service.id)},
+            {"patient": str(foreign.id), "service": str(monthly_service.id), "method": "cash"},
         )
         assert response.status_code == 404
 

@@ -41,6 +41,14 @@ The frontend mock currently shows a `registrationFee` on package cards (৳1,000
 
 If the clinic ever wants a one-time signup charge later, add it deliberately as a real charge with its own receipt line — not as decoration.
 
+### ✅ CONFIRMED (2026-09-28): monthly packages carry an `admission_fee`
+
+This is **not** the dropped `registration_fee`. Registering a patient is still free. The admit fee is what a **monthly package's first month** costs instead of its monthly fee, and it is actually charged, with a receipt, as the enrollment month's bill (see `05`).
+
+- `admission_fee` — Decimal, nullable in the schema; **required for `monthly` packages** by the write serializer, and dropped (stored as null) for every other category.
+- Packages that existed before the field got `admission_fee = fee` from migration `services/0008`, so enrolling in them costs what it did before until someone edits the package.
+- Changing it is a package edit: a Manager needs Admin's one-time approval, the same as for `fee`, and the audit entry records the before and after.
+
 ### ✅ CONFIRMED: deletion is blocked while the package is in use; deactivation is the alternative
 
 Two separate concepts, and the distinction matters:

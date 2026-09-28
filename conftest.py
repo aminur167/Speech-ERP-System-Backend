@@ -149,6 +149,10 @@ def service_factory(db, branch):
             "fee": Decimal("5000.00"),
         }
         defaults.update(overrides)
+        # Every monthly package has an admit fee; like the backfill migration,
+        # default it to the monthly fee unless a test sets its own.
+        if defaults["category"] == Service.Category.MONTHLY:
+            defaults.setdefault("admission_fee", defaults["fee"])
         return Service.objects.create(**defaults)
 
     return _create

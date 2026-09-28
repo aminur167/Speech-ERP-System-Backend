@@ -37,6 +37,20 @@ Collection endpoints currently require the **full remaining balance** — partia
 
 Bill generation: on enrollment, create the current month + next two. First is `due`, the rest `upcoming`.
 
+### ✅ CONFIRMED (2026-09-28): the enrollment month is the admit fee, paid up front
+
+A monthly enrollment is created **and its first month paid in one atomic request** — `POST /api/enrollments/monthly/` with `{ patient, service, method, discount?, discountReason?, idempotencyKey? }`, returning `{ enrollment, payment }`. There is no longer any way to enroll without paying: an enrollment created first and paid later is how an abandoned screen left behind an unpaid first month that was already overdue.
+
+- The enrollment month's bill is `kind = "admission"`, priced from the package's `admission_fee` (see `03`) — **not** the monthly fee. The monthly fee starts the following month, raised by the monthly job exactly as before. Advance months and a reactivated service's months are charged the monthly fee.
+- **Discount**, given by the Manager at the desk: from 0 up to the whole admit fee, and **a written reason is required** for any discount. The bill keeps `gross_amount` (the admit fee), `discount_amount` and `discount_reason`; `amount` holds what is actually owed (admit fee − discount), so refunds, Outstanding Due and every balance calculation read it unchanged. The audit entry names the fee, the discount, the amount charged and the reason.
+- A **100% discount** settles the bill with **no Payment and no receipt** (a Payment must be at least ৳0.01). The bill and the audit entry are the record.
+- Reporting counts the admit fee inside monthly revenue (the Payment's category is `monthly`); the receipt line says "Admission".
+- **Reactivating** a stopped service does not charge the admit fee again. A **fresh enrollment** does.
+- The package must belong to the Manager's own branch, be approved, and be active — otherwise 404.
+- Idempotency is keyed on the enrollment (`MonthlyEnrollment.idempotency_key`), not only the payment, so a replayed fully-discounted enrollment is also returned rather than duplicated.
+
+`services.create_monthly_enrollment` (enroll without payment, first month at the monthly fee) remains as an internal function for the seed command and tests; no endpoint reaches it.
+
 ### ✅ CONFIRMED: monthly billing rules
 
 **1. Bills auto-generate every month via a scheduled job.** A monthly task creates the next bill for every `active` enrollment, so billing continues indefinitely without manual re-enrollment. Unpaid bills accumulate as real outstanding dues — the clinic is owed for each month of service whether or not the patient paid.
@@ -110,7 +124,7 @@ Advance is **50%** of the service fee (`ADVANCE_RATIO = 0.5` in `OnlineServiceEn
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/monthly-enrollments/` | `{ patientId, serviceId, fee }` → enrollment + 3 bills |
+| POST | `/monthly-enrollments/` | Superseded — now `POST /api/enrollments/monthly/` `{ patient, service, method, discount?, discountReason?, idempotencyKey? }` → enrollment + admission bill + payment, atomically (see "the enrollment month is the admit fee" above) |
 | POST | `/monthly-enrollments/{id}/pay-bill/` | `{ month }` → Payment + mark bill paid + advance next |
 | POST | `/monthly-enrollments/{id}/terminate/` | Stops future billing |
 | POST | `/installment-plans/` | `{ patientId, serviceId, totalAmount, numberOfInstallments }` |

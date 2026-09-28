@@ -20,6 +20,9 @@ class ServiceSerializer(serializers.ModelSerializer):
     originalFee = serializers.DecimalField(
         source="original_fee", max_digits=12, decimal_places=2, read_only=True
     )
+    admissionFee = serializers.DecimalField(
+        source="admission_fee", max_digits=12, decimal_places=2, read_only=True
+    )
     durationLabel = serializers.CharField(source="duration_label", read_only=True)
     sessionsLabel = serializers.CharField(source="sessions_label", read_only=True)
     expiryLabel = serializers.CharField(source="expiry_label", read_only=True)
@@ -34,7 +37,7 @@ class ServiceSerializer(serializers.ModelSerializer):
         model = Service
         fields = [
             "id", "branchId", "branchName", "name", "code", "category", "fee", "isOnline",
-            "description", "originalFee", "durationLabel", "sessionsLabel", "expiryLabel",
+            "description", "originalFee", "admissionFee", "durationLabel", "sessionsLabel", "expiryLabel",
             "isActive", "reviewStatus", "proposedBy", "reviewNote", "reviewedBy", "reviewedAt",
         ]
         read_only_fields = fields
@@ -57,11 +60,15 @@ class ServiceWriteSerializer(serializers.ModelSerializer):
         model = Service
         fields = [
             "name", "category", "fee", "is_online", "description",
-            "original_fee", "duration_label", "sessions_label", "expiry_label",
+            "original_fee", "admission_fee", "duration_label", "sessions_label",
+            "expiry_label",
         ]
         extra_kwargs = {
             "description": {"required": False, "allow_blank": True},
             "original_fee": {"required": False, "allow_null": True},
+            # Required for monthly packages — enforced in validate(), where the
+            # category is known, not here.
+            "admission_fee": {"required": False, "allow_null": True},
             "duration_label": {"required": False, "allow_blank": True},
             "sessions_label": {"required": False, "allow_blank": True},
             "expiry_label": {"required": False, "allow_blank": True},
@@ -77,6 +84,36 @@ class ServiceWriteSerializer(serializers.ModelSerializer):
         if value is not None and value <= Decimal("0"):
             raise serializers.ValidationError("Original fee must be greater than zero.")
         return value
+
+    def validate_admission_fee(self, value):
+        if value is not None and value <= Decimal("0"):
+            raise serializers.ValidationError("Admit fee must be greater than zero.")
+        return value
+
+    def validate(self, attrs):
+        """
+        Admit fee belongs to monthly packages, and every monthly package has one.
+
+        Judged against the category the package will have after this write,
+        so a partial edit that leaves the category alone is checked against
+        the stored one. Any other category drops the value rather than storing
+        a fee nothing will ever charge.
+        """
+        category = attrs.get("category", getattr(self.instance, "category", None))
+        if category != Service.Category.MONTHLY:
+            if "admission_fee" in attrs or getattr(self.instance, "admission_fee", None):
+                attrs["admission_fee"] = None
+            return attrs
+
+        if "admission_fee" in attrs:
+            admission_fee = attrs["admission_fee"]
+        else:
+            admission_fee = getattr(self.instance, "admission_fee", None)
+        if admission_fee is None:
+            raise serializers.ValidationError(
+                {"admission_fee": ["A monthly package needs an admit fee."]}
+            )
+        return attrs
 
 
 class ServiceReviewSerializer(serializers.Serializer):

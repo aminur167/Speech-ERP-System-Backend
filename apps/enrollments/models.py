@@ -21,7 +21,7 @@ from django.core.validators import MinValueValidator
 from django.db import models
 from django.utils import timezone
 
-from apps.common.models import TimeStampedModel
+from apps.common.models import IdempotentModel, TimeStampedModel
 
 
 class EnrollmentStatus(models.TextChoices):
@@ -159,7 +159,7 @@ class PayableMixin(models.Model):
         return self.status
 
 
-class MonthlyEnrollment(TimeStampedModel):
+class MonthlyEnrollment(TimeStampedModel, IdempotentModel):
     class TerminationKind(models.TextChoices):
         """
         Why a monthly service stopped — which decides what can happen next.
@@ -241,11 +241,32 @@ class MonthlyEnrollment(TimeStampedModel):
 
 
 class MonthlyBill(PayableMixin):
+    class Kind(models.TextChoices):
+        # The enrollment month, charged at the package's admit fee.
+        ADMISSION = "admission", "Admission"
+        MONTHLY = "monthly", "Monthly fee"
+
     enrollment = models.ForeignKey(
         MonthlyEnrollment, on_delete=models.CASCADE, related_name="bills"
     )
     month = models.CharField(max_length=7, db_index=True)  # "2026-08"
     label = models.CharField(max_length=32)                # "August 2026"
+    kind = models.CharField(
+        max_length=16, choices=Kind.choices, default=Kind.MONTHLY
+    )
+
+    # Admission bills only. `amount` is what is actually owed — the admit fee
+    # less the discount — so every balance, refund and due calculation keeps
+    # reading `amount` exactly as before. These keep the other two figures,
+    # and the manager's reason, so a reduced first payment is never
+    # unexplained.
+    gross_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    discount_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
+    )
+    discount_reason = models.TextField(blank=True)
 
     class Meta:
         ordering = ["month"]

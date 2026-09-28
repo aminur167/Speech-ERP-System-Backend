@@ -61,6 +61,21 @@ class Service(TimeStampedModel, SoftDeleteModel):
         validators=[MinValueValidator(Decimal("0.01"))],
     )
 
+    # Monthly packages only: what the enrollment month costs instead of `fee`.
+    # A new patient pays this (less any discount given at the desk) to start,
+    # and `fee` from the following month on. Nullable because other
+    # categories have no such thing; the write serializer is what makes it
+    # required for a monthly package, the same "requiredness lives in the
+    # serializer" rule as patients. A monthly package that somehow lacks one
+    # falls back to `fee` (see `Service.effective_admission_fee`).
+    admission_fee = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0.01"))],
+    )
+
     is_online = models.BooleanField(default=False)
     description = models.TextField(blank=True)
 
@@ -107,6 +122,11 @@ class Service(TimeStampedModel, SoftDeleteModel):
     @property
     def is_discounted(self) -> bool:
         return self.original_fee is not None and self.original_fee > self.fee
+
+    @property
+    def effective_admission_fee(self) -> Decimal:
+        """What a new enrollment's first month costs, before any discount."""
+        return self.admission_fee if self.admission_fee is not None else self.fee
 
     def active_enrollment_count(self) -> int:
         """

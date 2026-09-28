@@ -107,7 +107,7 @@ class TestTheGateOnNewEnrollment:
         """
         response = manager_client.post(
             reverse("enrollments:monthly-enrollment-list"),
-            {"patient": patient.pk, "service": other_monthly_service.pk},
+            {"patient": patient.pk, "service": other_monthly_service.pk, "method": "cash"},
             format="json",
         )
 

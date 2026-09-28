@@ -34,6 +34,18 @@ from apps.services.serializers import (
 )
 
 
+def _audit_fields(service: Service) -> dict:
+    """The package figures an edit is judged by, as audit-log strings."""
+    return {
+        "name": service.name,
+        "fee": str(service.fee),
+        "admission_fee": (
+            str(service.admission_fee) if service.admission_fee is not None else None
+        ),
+        "code": service.code,
+    }
+
+
 class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
     """
     /api/services/ — branch-scoped, like Materials.
@@ -170,13 +182,13 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
             action=AuditLog.Action.CREATE,
             target=service,
             reason="Proposed for admin review" if not request.user.is_admin else "",
-            changes={"code": service.code, "name": service.name, "fee": str(service.fee)},
+            changes=_audit_fields(service),
         )
         return Response(ServiceSerializer(service).data, status=status.HTTP_201_CREATED)
 
     def update(self, request, *args, **kwargs):
         service = self.get_object()
-        before = {"name": service.name, "fee": str(service.fee), "code": service.code}
+        before = _audit_fields(service)
 
         serializer = ServiceWriteSerializer(
             instance=service,
@@ -195,7 +207,7 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         except services.ApprovalRequired as exc:
             return self._approval_required(exc)
 
-        after = {"name": service.name, "fee": str(service.fee), "code": service.code}
+        after = _audit_fields(service)
         changes = audit.diff(before, after)
         if changes or grant is not None:
             audit.record(

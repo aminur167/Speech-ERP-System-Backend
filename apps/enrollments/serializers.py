@@ -29,12 +29,22 @@ class MonthlyBillSerializer(serializers.ModelSerializer):
     outstanding = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     dueDate = serializers.DateField(source="due_date", read_only=True)
     paidAt = serializers.DateTimeField(source="paid_at", read_only=True)
+    # Admission bills: the admit fee before the discount, the discount, and
+    # why. `amount` is already net of the discount.
+    grossAmount = serializers.DecimalField(
+        source="gross_amount", max_digits=12, decimal_places=2, read_only=True
+    )
+    discountAmount = serializers.DecimalField(
+        source="discount_amount", max_digits=12, decimal_places=2, read_only=True
+    )
+    discountReason = serializers.CharField(source="discount_reason", read_only=True)
 
     class Meta:
         model = MonthlyBill
         fields = [
-            "id", "month", "label", "amount", "amountPaid", "outstanding",
-            "status", "dueDate", "paidAt",
+            "id", "month", "label", "kind", "amount", "amountPaid", "outstanding",
+            "status", "dueDate", "paidAt", "grossAmount", "discountAmount",
+            "discountReason",
         ]
         read_only_fields = fields
 
@@ -110,9 +120,27 @@ class InstallmentPlanSerializer(serializers.ModelSerializer):
         return str(plan.outstanding_total())
 
 
-class MonthlyEnrollmentCreateSerializer(serializers.Serializer):
+class MonthlyEnrollAndPaySerializer(serializers.Serializer):
+    """
+    Enroll in a monthly package and pay the admit fee, in one request.
+
+    No amount: the server prices the admission from the package's own admit
+    fee. The client sends only the discount it is asking for, which the
+    service layer checks against that fee.
+    """
+
     patient = serializers.IntegerField()
     service = serializers.IntegerField()
+    method = serializers.ChoiceField(choices=PaymentMethod.choices)
+    discount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, min_value=Decimal("0.00"),
+        default=Decimal("0.00"),
+    )
+    discountReason = serializers.CharField(
+        required=False, allow_blank=True, max_length=500, default=""
+    )
+    idempotencyKey = serializers.CharField(required=False, allow_blank=True, max_length=64)
+    clientCreatedAt = serializers.DateTimeField(required=False, allow_null=True)
 
 
 class InstallmentPlanCreateSerializer(serializers.Serializer):

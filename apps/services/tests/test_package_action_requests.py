@@ -53,6 +53,7 @@ def service(db, branch):
         code="MON-INDIV",
         category=Service.Category.MONTHLY,
         fee=Decimal("5000.00"),
+        admission_fee=Decimal("2000.00"),
     )
 
 

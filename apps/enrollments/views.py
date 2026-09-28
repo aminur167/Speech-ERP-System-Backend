@@ -36,7 +36,7 @@ from apps.enrollments.serializers import (
     CollectPaymentSerializer,
     InstallmentPlanCreateSerializer,
     InstallmentPlanSerializer,
-    MonthlyEnrollmentCreateSerializer,
+    MonthlyEnrollAndPaySerializer,
     MonthlyEnrollmentSerializer,
     StopMonthlyServiceSerializer,
     StopPreviewSerializer,
@@ -90,8 +90,17 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
     serializer_class = MonthlyEnrollmentSerializer
     filterset_fields = ["status", "patient"]
 
+    @extend_schema(request=MonthlyEnrollAndPaySerializer)
     def create(self, request, *args, **kwargs):
-        serializer = MonthlyEnrollmentCreateSerializer(data=request.data)
+        """
+        Enroll and take the admit fee together -> `{ enrollment, payment }`.
+
+        There is deliberately no way to enroll without paying: an enrollment
+        created first and paid for later is how an abandoned screen used to
+        leave an unpaid, already-overdue first month behind.
+        `payment` is null when the discount covered the whole admit fee.
+        """
+        serializer = MonthlyEnrollAndPaySerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
@@ -105,9 +114,16 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
             )
 
         try:
-            # Inactive services are excluded — a retired package must not take
-            # new enrollments, though existing ones keep billing.
-            service = Service.objects.get(pk=data["service"], is_active=True)
+            # This branch's own live packages only: packages are branch-owned,
+            # a proposal is not enrollable until Admin approves it, and a
+            # retired package takes no new enrollments (existing ones keep
+            # billing).
+            service = Service.objects.get(
+                pk=data["service"],
+                branch=branch,
+                is_active=True,
+                review_status=Service.ReviewStatus.APPROVED,
+            )
         except Service.DoesNotExist:
             return Response(
                 {"detail": "Service not found or no longer available."},
@@ -115,17 +131,32 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
             )
 
         try:
-            enrollment = services.create_monthly_enrollment(
-                actor=request.user, branch=branch, patient=patient, service=service
+            enrollment, payment = services.enroll_monthly_with_admission(
+                actor=request.user,
+                branch=branch,
+                patient=patient,
+                service=service,
+                method=data["method"],
+                discount=data["discount"],
+                discount_reason=data["discountReason"],
+                idempotency_key=data.get("idempotencyKey") or None,
+                client_created_at=data.get("clientCreatedAt"),
             )
         except services.EnrollmentError as exc:
-            # Chiefly the outstanding-due gate. Enforced in the service layer,
-            # so calling this endpoint directly with the screen bypassed is
-            # refused on exactly the same terms as the button.
+            # Chiefly the outstanding-due gate and the discount rules. Enforced
+            # in the service layer, so calling this endpoint directly with the
+            # screen bypassed is refused on exactly the same terms.
             return _error(exc)
 
+        enrollment = MonthlyEnrollment.objects.prefetch_related("bills").select_related(
+            "patient", "service"
+        ).get(pk=enrollment.pk)
         return Response(
-            MonthlyEnrollmentSerializer(enrollment).data, status=status.HTTP_201_CREATED
+            {
+                "enrollment": MonthlyEnrollmentSerializer(enrollment).data,
+                "payment": PaymentSerializer(payment).data if payment else None,
+            },
+            status=status.HTTP_201_CREATED,
         )
 
     @extend_schema(parameters=[OpenApiParameter("bill_id", int, location="path")])

@@ -22,6 +22,8 @@ def service_payload(**overrides):
         "name": "Monthly 1:1 Individual Plan",
         "category": "monthly",
         "fee": "12600.00",
+        # Required for a monthly package; dropped for any other category.
+        "admission_fee": "3000.00",
         "is_online": False,
         "description": "Twelve one-to-one therapy sessions per month.",
         "duration_label": "1 Month (auto-renew)",
@@ -40,6 +42,7 @@ def service(db, branch):
         code="MON-INDIV",
         category=Service.Category.MONTHLY,
         fee=Decimal("5000.00"),
+        admission_fee=Decimal("2000.00"),
     )
 
 
