@@ -199,7 +199,7 @@ def request_package_action(*, actor, service: Service, action: str, reason: str)
             f'{service.branch.name} wants to {_VERBS[action]} "{service.name}" '
             f"({service.code}): {reason}"
         ),
-        link="/admin/package-requests",
+        link="/admin/services",
         exclude=actor,
     )
     return request

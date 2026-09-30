@@ -11,11 +11,13 @@ from django.db import transaction
 from django.db.models import (
     Case,
     Count,
-    Exists,
+    DateTimeField,
+    F,
     IntegerField,
     OuterRef,
     Prefetch,
     Q,
+    Subquery,
     Value,
     When,
 )
@@ -152,40 +154,51 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
                 | Q(proposed_by=self.request.user)
             )
 
-        # Every package's open delete request in one query, for the
-        # `deleteRequest` field the catalog shows as the package's status.
+        # Every package's open change requests in one query, for the
+        # `changeRequests` field the catalog shows as the package's status.
         queryset = queryset.prefetch_related(
             Prefetch(
                 "action_requests",
-                queryset=PackageActionRequest.objects.filter(
-                    PackageActionRequest.open_filter(),
-                    action=PackageActionRequest.Action.DELETE,
-                )
+                queryset=PackageActionRequest.objects.filter(PackageActionRequest.open_filter())
                 .select_related("requested_by")
                 .order_by("-created_at"),
-                to_attr="open_delete_requests",
+                to_attr="open_requests",
             )
         )
 
         if include_pending:
             # Anything awaiting Admin goes on top of the catalog — a proposed
-            # package, or a Manager asking to delete one — and the rest keep
-            # the usual category/name order (compare apps/common/ordering.py).
-            awaiting_delete = Exists(
+            # package, or a Manager asking to change one — with the most
+            # recent request first, since that is the one Admin has not seen
+            # yet. Everything else keeps the usual category/name order.
+            latest_request = Subquery(
                 PackageActionRequest.objects.filter(
-                    service=OuterRef("pk"),
-                    action=PackageActionRequest.Action.DELETE,
-                    status=PackageActionRequest.Status.PENDING,
+                    service=OuterRef("pk"), status=PackageActionRequest.Status.PENDING
                 )
+                .order_by("-created_at")
+                .values("created_at")[:1]
             )
-            rank = Case(
-                When(review_status=Service.ReviewStatus.PENDING, then=Value(0)),
-                When(awaiting_delete, then=Value(0)),
-                default=Value(1),
-                output_field=IntegerField(),
+            waiting_since = Case(
+                When(review_status=Service.ReviewStatus.PENDING, then=F("created_at")),
+                default=latest_request,
+                output_field=DateTimeField(),
             )
-            queryset = queryset.annotate(pending_rank=rank).order_by(
-                "pending_rank", "category", "name", "id"
+            queryset = (
+                queryset.annotate(waiting_since=waiting_since)
+                .annotate(
+                    pending_rank=Case(
+                        When(waiting_since__isnull=False, then=Value(0)),
+                        default=Value(1),
+                        output_field=IntegerField(),
+                    )
+                )
+                .order_by(
+                    "pending_rank",
+                    F("waiting_since").desc(nulls_last=True),
+                    "category",
+                    "name",
+                    "id",
+                )
             )
         return queryset
 
@@ -270,7 +283,7 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
                 notify_admins(
                     title="Package edited by branch",
                     message=f'{service.branch.name} edited "{service.name}" using your approval.',
-                    link="/admin/package-requests",
+                    link="/admin/services",
                     exclude=request.user,
                 )
         return Response(ServiceSerializer(service).data)
@@ -425,15 +438,15 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         """
         Admin-only — powers the sidebar's Services badge, independent of
         whatever page is open. Counts everything Admin decides on the
-        Services page: proposed packages, and Managers' requests to delete one.
+        Services page: proposed packages, and Managers' requests to change one
+        (edit, delete, deactivate, activate).
         """
         proposals = Service.objects.filter(review_status=Service.ReviewStatus.PENDING).count()
-        delete_requests = PackageActionRequest.objects.filter(
-            action=PackageActionRequest.Action.DELETE,
+        change_requests = PackageActionRequest.objects.filter(
             status=PackageActionRequest.Status.PENDING,
             service__is_deleted=False,
         ).count()
-        return Response({"count": proposals + delete_requests})
+        return Response({"count": proposals + change_requests})
 
     @action(detail=True, methods=["post"])
     def deactivate(self, request, pk=None):
