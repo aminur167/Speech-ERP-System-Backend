@@ -19,7 +19,7 @@ from decimal import ROUND_DOWN, Decimal
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import F, Sum
 from django.utils import timezone
 
 from apps.common import audit
@@ -739,6 +739,16 @@ def collect_installment_payment(
         if nxt is not None:
             nxt.status = BillStatus.DUE
             nxt.save(update_fields=["status"])
+
+        # What the plan still owes now that this payment has landed — the
+        # receipt's "Remaining due". Stamped once, here, so a reprint reads
+        # the same however many payments follow. Summed in the database, and
+        # forgiven installments excluded, the same as `outstanding_total()`.
+        remaining = plan.installments.exclude(status__in=FORGIVEN_STATUSES).aggregate(
+            owed=Sum(F("amount") - F("amount_paid"))
+        )["owed"] or Decimal("0.00")
+        payment.due_after = max(Decimal("0.00"), remaining)
+        payment.save(update_fields=["due_after"])
 
     installment.refresh_from_db()
     return payment, installment

@@ -29,6 +29,11 @@ class PaymentSerializer(serializers.ModelSerializer):
     branchId = serializers.CharField(source="branch_id", read_only=True)
     branchName = serializers.CharField(source="branch.name", read_only=True)
     createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+    # Installment receipts: what that plan still owed right after this
+    # payment. Null for every other category.
+    dueAfter = serializers.DecimalField(
+        source="due_after", max_digits=12, decimal_places=2, read_only=True, allow_null=True
+    )
 
     class Meta:
         model = Payment
@@ -36,7 +41,7 @@ class PaymentSerializer(serializers.ModelSerializer):
             "id", "transactionId", "receiptNumber",
             "patientId", "patientName", "patientCode",
             "amount", "method", "status", "category", "description",
-            "collectedBy", "branchId", "branchName", "createdAt",
+            "collectedBy", "branchId", "branchName", "createdAt", "dueAfter",
         ]
         read_only_fields = fields
 

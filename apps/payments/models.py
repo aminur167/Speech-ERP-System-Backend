@@ -99,6 +99,14 @@ class Payment(TimeStampedModel, SoftDeleteModel):
     # actually happened.
     client_created_at = models.DateTimeField(null=True, blank=True)
 
+    # Installment payments only: what was still owed on that plan the moment
+    # this payment settled, printed on the receipt as "Remaining due".
+    # Stored rather than derived, like `description`: the receipt must read
+    # the same when reprinted months later, after further payments. Null for
+    # every other category, and for installment payments taken before this
+    # field existed (no reliable way to reconstruct the figure afterwards).
+    due_after = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
     class Meta:
         ordering = ["-created_at"]
         indexes = [
