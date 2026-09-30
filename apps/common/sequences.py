@@ -16,9 +16,29 @@ never has to coordinate with any other branch to hand out a receipt number
 (docs/04-payments-core.md).
 """
 
-from django.db import transaction
+from django.db import connection, transaction
 
 from apps.common.models import CodeSequence
+
+_TABLE = CodeSequence._meta.db_table
+
+# One statement where there used to be three (get_or_create, a locking
+# SELECT, an UPDATE). On a hosted database every statement is a network round
+# trip, and every payment draws two numbers, so this was six trips per
+# payment before the payment itself was written.
+#
+# Just as race-safe: an upsert that hits the existing row takes that row's
+# lock for the rest of the transaction, so a concurrent caller waits and then
+# sees the incremented value — the same queueing select_for_update gave. A
+# first-ever call for a scope inserts 1; two first-ever calls racing are
+# resolved by the (scope, year) unique constraint, the loser falling through
+# to the UPDATE branch once the winner commits.
+_NEXT_SQL = f"""
+    INSERT INTO {_TABLE} (scope, year, last_value) VALUES (%s, %s, 1)
+    ON CONFLICT (scope, year)
+    DO UPDATE SET last_value = {_TABLE}.last_value + 1
+    RETURNING last_value
+"""
 
 
 def next_value(scope: str, year: int) -> int:
@@ -29,15 +49,9 @@ def next_value(scope: str, year: int) -> int:
     that transaction ends, and the caller needs the number and the record it
     labels to commit together.
     """
-    # get_or_create first so the row exists; select_for_update can't lock a
-    # row that isn't there, and two concurrent creates are resolved by the
-    # unique constraint plus the retry below.
-    CodeSequence.objects.get_or_create(scope=scope, year=year)
-
-    row = CodeSequence.objects.select_for_update().get(scope=scope, year=year)
-    row.last_value += 1
-    row.save(update_fields=["last_value"])
-    return row.last_value
+    with connection.cursor() as cursor:
+        cursor.execute(_NEXT_SQL, [scope, year])
+        return cursor.fetchone()[0]
 
 
 def format_code(prefix: str, year: int | None, value: int, *, width: int = 5) -> str:

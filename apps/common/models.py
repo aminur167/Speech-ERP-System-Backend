@@ -205,6 +205,28 @@ class AuditLog(models.Model):
         return f"{self.action} {self.target_type}#{self.target_id} by {self.actor_email or 'system'}"
 
 
+class ApprovalActivity(models.Model):
+    """
+    A counter per branch that moves whenever anything in an approval queue
+    does — a request raised, decided, reversed, spent.
+
+    It exists so screens can ask "has anything changed?" every few seconds
+    for the price of one indexed read, and fetch the actual lists only when
+    the answer is yes (apps/common/approvals.py). Reading the queues
+    themselves that often would cost a scan of five tables per open tab.
+
+    The number means nothing on its own and is never shown; only a change in
+    it matters. Keyed by the plain branch id rather than a foreign key, so a
+    counter row never stands in the way of anything that happens to a branch.
+    """
+
+    branch_id = models.BigIntegerField(unique=True)
+    version = models.BigIntegerField(default=0)
+
+    def __str__(self):
+        return f"approval activity branch={self.branch_id} v{self.version}"
+
+
 def _default_stopped_coming_after_days() -> int:
     # A callable, not `settings.PATIENT_ABSENCE_ALERT_DAYS` evaluated inline —
     # a plain expression here is baked in once, at import time, and would

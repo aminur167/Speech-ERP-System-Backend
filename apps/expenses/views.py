@@ -13,6 +13,7 @@ from rest_framework.response import Response
 from apps.branches.models import Branch
 from apps.common.filters import apply_date_range
 from apps.common.mixins import BranchScopedQuerySetMixin
+from apps.common.ordering import pending_first
 from apps.common.permissions import IsAdmin, IsManager
 from apps.expenses import services
 from apps.expenses.models import Expense
@@ -73,7 +74,12 @@ class ExpenseViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
 
         # The Summary page's dateFrom/dateTo, shared with every other list it
         # reads (apps/common/filters.py).
-        return apply_date_range(queryset, self.request.query_params)
+        queryset = apply_date_range(queryset, self.request.query_params)
+
+        # Waiting for Admin goes on top (apps/common/ordering.py).
+        if self.action == "list":
+            queryset = pending_first(queryset, pending=Expense.Status.PENDING)
+        return queryset
 
     def create(self, request, *args, **kwargs):
         serializer = ExpenseWriteSerializer(data=request.data)

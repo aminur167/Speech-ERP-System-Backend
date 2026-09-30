@@ -174,6 +174,9 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
             bill = MonthlyBill.objects.get(pk=bill_id, enrollment=enrollment)
         except MonthlyBill.DoesNotExist:
             return Response({"detail": "Bill not found."}, status=status.HTTP_404_NOT_FOUND)
+        # Hand over the enrollment already loaded with its patient and
+        # service, so collecting doesn't fetch each of them again one by one.
+        bill.enrollment = enrollment
 
         try:
             payment, bill = services.collect_bill_payment(
@@ -190,7 +193,9 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
             {
                 "payment": PaymentSerializer(payment).data,
                 "enrollment": MonthlyEnrollmentSerializer(
-                    MonthlyEnrollment.objects.prefetch_related("bills").get(pk=enrollment.pk)
+                    MonthlyEnrollment.objects.select_related("patient", "service")
+                    .prefetch_related("bills")
+                    .get(pk=enrollment.pk)
                 ).data,
             }
         )
@@ -470,6 +475,8 @@ class InstallmentPlanViewSet(_EnrollmentBase):
             return Response(
                 {"detail": "Installment not found."}, status=status.HTTP_404_NOT_FOUND
             )
+        # The plan already carries its patient and service — see pay_bill.
+        installment.plan = plan
 
         try:
             payment, installment = services.collect_installment_payment(
@@ -489,7 +496,9 @@ class InstallmentPlanViewSet(_EnrollmentBase):
             {
                 "payment": PaymentSerializer(payment).data,
                 "plan": InstallmentPlanSerializer(
-                    InstallmentPlan.objects.prefetch_related("installments").get(pk=plan.pk)
+                    InstallmentPlan.objects.select_related("patient", "service")
+                    .prefetch_related("installments")
+                    .get(pk=plan.pk)
                 ).data,
             }
         )

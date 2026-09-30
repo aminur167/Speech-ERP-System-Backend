@@ -20,6 +20,7 @@ from apps.branches.models import Branch
 from apps.common import audit
 from apps.common.mixins import BranchScopedQuerySetMixin
 from apps.common.models import AuditLog
+from apps.common.ordering import pending_first
 from apps.common.permissions import IsAdmin, IsManager
 from apps.notifications.inapp import notify_admins, notify_many
 from apps.services import services
@@ -141,6 +142,13 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
                 | Q(proposed_by=self.request.user)
             )
 
+        if include_pending:
+            # Proposals awaiting Admin go on top of the catalog, the rest in
+            # its usual category/name order (apps/common/ordering.py).
+            queryset = pending_first(
+                queryset, field="review_status", pending=Service.ReviewStatus.PENDING,
+                then=("category", "name", "id"),
+            )
         return queryset
 
     def create(self, request, *args, **kwargs):
@@ -499,6 +507,10 @@ class PackageActionRequestViewSet(BranchScopedQuerySetMixin, viewsets.ReadOnlyMo
 
         if params.get("service"):
             queryset = queryset.filter(service_id=params["service"])
+
+        # Waiting for Admin goes on top (apps/common/ordering.py).
+        if self.action == "list":
+            queryset = pending_first(queryset, pending=PackageActionRequest.Status.PENDING)
         return queryset
 
     @action(detail=True, methods=["post"])

@@ -12,6 +12,7 @@ from rest_framework.response import Response
 
 from apps.branches.models import Branch
 from apps.common.mixins import BranchScopedQuerySetMixin
+from apps.common.ordering import pending_first
 from apps.common.permissions import IsAdmin, IsManager
 from apps.staff import services
 from apps.staff.models import SalaryPayment, StaffAttendance, StaffMember
@@ -299,6 +300,13 @@ class SalaryPaymentViewSet(BranchScopedQuerySetMixin, viewsets.ReadOnlyModelView
         if self.action == "pending_count":
             return [IsAdmin()]
         return [IsAuthenticated()]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        # Waiting for Admin goes on top (apps/common/ordering.py).
+        if self.action == "list":
+            queryset = pending_first(queryset, pending=SalaryPayment.Status.PENDING_APPROVAL)
+        return queryset
 
     @action(detail=False, methods=["get"], url_path="pending-count")
     def pending_count(self, request):
