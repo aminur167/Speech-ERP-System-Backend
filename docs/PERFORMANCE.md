@@ -166,6 +166,45 @@ The rollback tags above still mark the state before both passes.
   defaults change and `routePrefetch.ts` is not updated, nothing breaks — the
   prefetch just stops helping.
 
+## 2026-09-30 — Pass 3: approvals within seconds, faster money actions
+
+Asked for: approval requests always on top of Admin's lists and updating
+"instantly" (agreed: within 3–5 s, by polling — no push channel on this
+plan); money actions and page changes that respond as soon as clicked.
+
+Measured first. From the clinic's own connection, a warm request that
+touches no database takes 0.13–0.24 s end to end on the live backend, so
+the network is not the problem. Locally every endpoint finishes in 20–70 ms;
+the live server has 0.1 CPU, which stretches that roughly tenfold, and each
+database statement is a round trip to Supabase. So the lever in code is the
+number of statements per action.
+
+| # | Change | Repo / commit | Undo with |
+|---|---|---|---|
+| 15 | Code sequences drawn with one `INSERT … ON CONFLICT … RETURNING` instead of three statements (every payment draws two). Still race-safe — the real-thread test in `test_foundations.py` passes. | backend `147cbcb` | `git revert 147cbcb` (also undoes #16–#18) |
+| 16 | Pay endpoints reuse the enrollment/plan they already loaded; response rebuilt with `select_related`. | backend `147cbcb` | as above |
+| 17 | Approval lists sort pending first in the database (`apps/common/ordering.py`), before pagination, under any filter. | backend `147cbcb` | as above |
+| 18 | `GET /api/approvals/pulse/` — per-branch counter bumped after commit by `post_save`/`post_delete` on the five approval models (`apps/common/approvals.py`). | backend `147cbcb` | revert the frontend commit first; the endpoint alone is harmless |
+| 19 | Frontend polls the pulse every 4 s (visible tab only) and refetches queues/badges only when it moves; the three badge timers (10 s each) are gone. | frontend `5b62a97` | `git revert 5b62a97` (also undoes #20) |
+| 20 | After sign-in, every sidebar page's first data loads in the background, one page at a time while the browser is idle, so the first click on any page is instant. | frontend `5b62a97` | as above |
+
+Statements per action (local, before → after): collect monthly bill 27 → 18,
+collect installment 36 → 27, enroll + admit fee 30 → 26, daily payment
+13 → 9, material sale 20 → 16, expense 14 → 9.
+
+### Notes that matter later
+
+- **The pulse only sees saves that fire signals.** Nothing updates the five
+  approval models with `QuerySet.update()`. If something ever does, call
+  `apps.common.approvals.bump_on_commit(branch_id)` there too, or that change
+  will reach other screens only on focus/reload.
+- **Load:** with nothing changing, each open, visible tab costs one small
+  request every 4 s — fewer requests than the three 10 s badge timers it
+  replaced. The warm-up is a one-off trickle of ~10–15 GETs per sign-in.
+- **What code cannot fix:** on 0.1 CPU the server itself is the bottleneck.
+  A paid Render instance (more CPU, never sleeps) or the VPS plan below is
+  the change that makes every action several times faster.
+
 ## Planned: when moving to a VPS
 
 1. **Postgres on the same machine** as Django (or the same private network).
