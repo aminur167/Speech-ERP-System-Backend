@@ -227,3 +227,13 @@ class PackageActionRequest(TimeStampedModel):
     def effective_status(self) -> str:
         """`expired` is derived rather than stored, so it is never stale."""
         return "expired" if self.is_expired else self.status
+
+    @classmethod
+    def open_filter(cls) -> models.Q:
+        """
+        Still in play: waiting for Admin, or approved and not yet spent or
+        lapsed. What a package's status reflects while a change is underway.
+        """
+        return models.Q(status=cls.Status.PENDING) | models.Q(
+            status=cls.Status.APPROVED, expires_at__gt=timezone.now()
+        )

@@ -8,7 +8,17 @@ here and not by the frontend's `canManage` flag alone.
 """
 
 from django.db import transaction
-from django.db.models import Count, Q
+from django.db.models import (
+    Case,
+    Count,
+    Exists,
+    IntegerField,
+    OuterRef,
+    Prefetch,
+    Q,
+    Value,
+    When,
+)
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -142,12 +152,40 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
                 | Q(proposed_by=self.request.user)
             )
 
+        # Every package's open delete request in one query, for the
+        # `deleteRequest` field the catalog shows as the package's status.
+        queryset = queryset.prefetch_related(
+            Prefetch(
+                "action_requests",
+                queryset=PackageActionRequest.objects.filter(
+                    PackageActionRequest.open_filter(),
+                    action=PackageActionRequest.Action.DELETE,
+                )
+                .select_related("requested_by")
+                .order_by("-created_at"),
+                to_attr="open_delete_requests",
+            )
+        )
+
         if include_pending:
-            # Proposals awaiting Admin go on top of the catalog, the rest in
-            # its usual category/name order (apps/common/ordering.py).
-            queryset = pending_first(
-                queryset, field="review_status", pending=Service.ReviewStatus.PENDING,
-                then=("category", "name", "id"),
+            # Anything awaiting Admin goes on top of the catalog — a proposed
+            # package, or a Manager asking to delete one — and the rest keep
+            # the usual category/name order (compare apps/common/ordering.py).
+            awaiting_delete = Exists(
+                PackageActionRequest.objects.filter(
+                    service=OuterRef("pk"),
+                    action=PackageActionRequest.Action.DELETE,
+                    status=PackageActionRequest.Status.PENDING,
+                )
+            )
+            rank = Case(
+                When(review_status=Service.ReviewStatus.PENDING, then=Value(0)),
+                When(awaiting_delete, then=Value(0)),
+                default=Value(1),
+                output_field=IntegerField(),
+            )
+            queryset = queryset.annotate(pending_rank=rank).order_by(
+                "pending_rank", "category", "name", "id"
             )
         return queryset
 
@@ -384,9 +422,18 @@ class ServiceViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="pending-count")
     def pending_count(self, request):
-        """Admin-only — powers the sidebar's Services badge, independent of whatever page is open."""
-        count = Service.objects.filter(review_status=Service.ReviewStatus.PENDING).count()
-        return Response({"count": count})
+        """
+        Admin-only — powers the sidebar's Services badge, independent of
+        whatever page is open. Counts everything Admin decides on the
+        Services page: proposed packages, and Managers' requests to delete one.
+        """
+        proposals = Service.objects.filter(review_status=Service.ReviewStatus.PENDING).count()
+        delete_requests = PackageActionRequest.objects.filter(
+            action=PackageActionRequest.Action.DELETE,
+            status=PackageActionRequest.Status.PENDING,
+            service__is_deleted=False,
+        ).count()
+        return Response({"count": proposals + delete_requests})
 
     @action(detail=True, methods=["post"])
     def deactivate(self, request, pk=None):
@@ -508,6 +555,13 @@ class PackageActionRequestViewSet(BranchScopedQuerySetMixin, viewsets.ReadOnlyMo
         if params.get("service"):
             queryset = queryset.filter(service_id=params["service"])
 
+        # The Package Requests page leaves delete requests to the Services
+        # page, where they are decided from the package's own row.
+        if params.get("action"):
+            queryset = queryset.filter(action=params["action"])
+        if params.get("excludeAction"):
+            queryset = queryset.exclude(action=params["excludeAction"])
+
         # Waiting for Admin goes on top (apps/common/ordering.py).
         if self.action == "list":
             queryset = pending_first(queryset, pending=PackageActionRequest.Status.PENDING)
@@ -540,8 +594,14 @@ class PackageActionRequestViewSet(BranchScopedQuerySetMixin, viewsets.ReadOnlyMo
 
     @action(detail=False, methods=["get"], url_path="pending-count")
     def pending_count(self, request):
-        """Admin-only — powers the sidebar badge on Package Requests."""
-        count = PackageActionRequest.objects.filter(
-            status=PackageActionRequest.Status.PENDING
-        ).count()
+        """
+        Admin-only — powers the sidebar badge on Package Requests. Delete
+        requests are decided on the Services page and counted in its badge
+        instead, so they are left out here.
+        """
+        count = (
+            PackageActionRequest.objects.filter(status=PackageActionRequest.Status.PENDING)
+            .exclude(action=PackageActionRequest.Action.DELETE)
+            .count()
+        )
         return Response({"count": count})

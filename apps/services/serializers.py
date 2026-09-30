@@ -32,6 +32,7 @@ class ServiceSerializer(serializers.ModelSerializer):
     reviewNote = serializers.CharField(source="review_note", read_only=True)
     reviewedBy = serializers.CharField(source="reviewed_by.name", read_only=True, default="")
     reviewedAt = serializers.DateTimeField(source="reviewed_at", read_only=True)
+    deleteRequest = serializers.SerializerMethodField()
 
     class Meta:
         model = Service
@@ -39,8 +40,43 @@ class ServiceSerializer(serializers.ModelSerializer):
             "id", "branchId", "branchName", "name", "code", "category", "fee", "isOnline",
             "description", "originalFee", "admissionFee", "durationLabel", "sessionsLabel", "expiryLabel",
             "isActive", "reviewStatus", "proposedBy", "reviewNote", "reviewedBy", "reviewedAt",
+            "deleteRequest",
         ]
         read_only_fields = fields
+
+    def get_deleteRequest(self, obj) -> dict | None:
+        """
+        A Manager's request to delete this package, while it is still in play
+        — waiting for Admin, or approved and not yet used. The catalog shows
+        it as the package's status and lets Admin decide it from the row.
+
+        Read from `open_delete_requests` when the list view prefetched it
+        (one query for the whole page), otherwise looked up for this one
+        package.
+        """
+        if hasattr(obj, "open_delete_requests"):
+            candidates = obj.open_delete_requests
+        else:
+            candidates = list(
+                obj.action_requests.filter(
+                    PackageActionRequest.open_filter(),
+                    action=PackageActionRequest.Action.DELETE,
+                )
+                .select_related("requested_by")
+                .order_by("-created_at")[:1]
+            )
+        if not candidates:
+            return None
+        request = candidates[0]
+        return {
+            "id": str(request.pk),
+            "status": request.status,
+            "reason": request.reason,
+            "requestedBy": request.requested_by.name if request.requested_by else "",
+            "requestedById": str(request.requested_by_id) if request.requested_by_id else "",
+            "requestedAt": request.created_at.isoformat(),
+            "expiresAt": request.expires_at.isoformat() if request.expires_at else None,
+        }
 
 
 class ServiceWriteSerializer(serializers.ModelSerializer):
