@@ -13,7 +13,7 @@ Rules enforced here:
     404s rather than leaking via a guessed id.
 """
 
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import NotFound, ValidationError
 
 
 class BranchScopedQuerySetMixin:
@@ -60,3 +60,18 @@ class BranchScopedQuerySetMixin:
                 {"branch": ["Admin must specify which branch this belongs to."]}
             )
         return branch_id
+
+
+def manager_branch(request):
+    """
+    The acting Manager's own branch.
+
+    Already loaded with the user (apps/accounts/authentication.py), so it
+    costs no query — views used to fetch it again with
+    `Branch.objects.get(pk=request.user.branch_id)`. A branch that has since
+    been deleted is refused cleanly instead of crashing the request.
+    """
+    branch = request.user.branch
+    if branch is None or branch.is_deleted:
+        raise NotFound("Your branch is no longer available.")
+    return branch

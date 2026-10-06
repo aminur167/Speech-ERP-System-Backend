@@ -8,8 +8,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from apps.branches.models import Branch
-from apps.common.mixins import BranchScopedQuerySetMixin
+from apps.common.mixins import BranchScopedQuerySetMixin, manager_branch
 from apps.common.permissions import IsManager
 from apps.materials import services
 from apps.materials.models import Material
@@ -55,7 +54,7 @@ class MaterialViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         serializer = MaterialWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        branch = Branch.objects.get(pk=request.user.branch_id)
+        branch = manager_branch(request)
         material = services.create_material(
             actor=request.user, branch=branch, data=dict(serializer.validated_data)
         )
@@ -160,7 +159,7 @@ class MaterialViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        branch = Branch.objects.get(pk=request.user.branch_id)
+        branch = manager_branch(request)
 
         try:
             patient = Patient.objects.get(pk=data["patient"], branch=branch)

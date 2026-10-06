@@ -22,8 +22,7 @@ from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from apps.branches.models import Branch
-from apps.common.mixins import BranchScopedQuerySetMixin
+from apps.common.mixins import BranchScopedQuerySetMixin, manager_branch
 from apps.common.permissions import IsManager
 from apps.common.validators import normalize_phone
 from apps.enrollments import services as enrollment_services
@@ -211,7 +210,7 @@ class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         client_created_at = data.pop("client_created_at", None)
 
         # Always the manager's own branch, whatever the body claims.
-        branch = Branch.objects.get(pk=request.user.branch_id)
+        branch = manager_branch(request)
 
         patient = services.create_patient(
             actor=request.user, branch=branch, data=data,

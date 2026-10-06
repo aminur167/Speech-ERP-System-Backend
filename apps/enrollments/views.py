@@ -13,8 +13,7 @@ from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from apps.branches.models import Branch
-from apps.common.mixins import BranchScopedQuerySetMixin
+from apps.common.mixins import BranchScopedQuerySetMixin, manager_branch
 from apps.common.permissions import IsManager
 from apps.enrollments import services
 from apps.enrollments.models import (
@@ -104,7 +103,7 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        branch = Branch.objects.get(pk=request.user.branch_id)
+        branch = manager_branch(request)
 
         try:
             patient = Patient.objects.get(pk=data["patient"], branch=branch)
@@ -427,7 +426,7 @@ class InstallmentPlanViewSet(_EnrollmentBase):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        branch = Branch.objects.get(pk=request.user.branch_id)
+        branch = manager_branch(request)
 
         try:
             patient = Patient.objects.get(pk=data["patient"], branch=branch)
@@ -623,7 +622,7 @@ class BookingViewSet(_EnrollmentBase):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        branch = Branch.objects.get(pk=request.user.branch_id)
+        branch = manager_branch(request)
 
         try:
             patient = Patient.objects.get(pk=data["patient"], branch=branch)

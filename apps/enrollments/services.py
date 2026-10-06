@@ -25,6 +25,7 @@ from django.utils import timezone
 from apps.common import audit
 from apps.common.models import AuditLog
 from apps.common.sequences import next_value
+from apps.common.transactions import transactional
 from apps.enrollments.models import (
     CLOSED_STATUSES,
     FORGIVEN_STATUSES,
@@ -336,7 +337,7 @@ def enroll_monthly_with_admission(
     )
 
     if payable > 0:
-        payment, _ = collect_bill_payment(
+        payment, _ = collect_bill_payment.in_transaction(
             actor=actor, branch=branch, bill=bill, method=method,
             idempotency_key=idempotency_key,
         )
@@ -521,7 +522,7 @@ def _assert_is_oldest_unpaid(container, target) -> None:
         )
 
 
-@transaction.atomic
+@transactional
 def collect_bill_payment(
     *, actor, branch, bill, method: str, idempotency_key: str | None = None
 ):
@@ -561,7 +562,7 @@ def collect_bill_payment(
 
     _assert_is_oldest_unpaid(enrollment, bill)
 
-    payment, created = payment_services.create_payment(
+    payment, created = payment_services.record_payment(
         actor=actor,
         branch=branch,
         patient=enrollment.patient,
@@ -603,7 +604,7 @@ def _promote_next_bill(enrollment: MonthlyEnrollment) -> None:
         nxt.save(update_fields=["status"])
 
 
-@transaction.atomic
+@transactional
 def _redistribute_remaining(plan, *, after_index: int) -> None:
     """
     Re-divide what's still owed across the installments after `after_index`.
@@ -701,7 +702,7 @@ def collect_installment_payment(
     is_last = not plan.installments.filter(index__gt=installment.index).exists()
     short = collecting < scheduled
 
-    payment, created = payment_services.create_payment(
+    payment, created = payment_services.record_payment(
         actor=actor,
         branch=branch,
         patient=plan.patient,
@@ -733,7 +734,7 @@ def collect_installment_payment(
             installment.save(
                 update_fields=["amount", "amount_paid", "status", "paid_at", "payment"]
             )
-            _redistribute_remaining(plan, after_index=installment.index)
+            _redistribute_remaining.in_transaction(plan, after_index=installment.index)
 
         nxt = plan.installments.filter(status=BillStatus.UPCOMING).order_by("index").first()
         if nxt is not None:
@@ -759,7 +760,7 @@ def collect_installment_payment(
 # ---------------------------------------------------------------------------
 
 
-@transaction.atomic
+@transactional
 def terminate(
     *, actor, container, reason: str = "", waivers: dict | None = None,
     waived_status: str = BillStatus.WRITTEN_OFF,
@@ -954,7 +955,7 @@ def stop_monthly_service(*, actor, enrollment, decisions: dict, reason: str = ""
             )
         waivers[bill.pk] = why
 
-    terminate(
+    terminate.in_transaction(
         actor=actor, container=enrollment, reason=reason, waivers=waivers,
         waived_status=BillStatus.CANCELLED,
     )
@@ -1036,7 +1037,7 @@ def stop_installment_plan(*, actor, plan, decisions: dict, reason: str = ""):
             )
         waivers[item.pk] = why
 
-    terminate(
+    terminate.in_transaction(
         actor=actor, container=plan, reason=reason, waivers=waivers,
         waived_status=BillStatus.CANCELLED,
     )
@@ -1266,7 +1267,7 @@ def collect_monthly_advance(
                 "status": BillStatus.UPCOMING,
             },
         )
-        payment, _ = collect_bill_payment(
+        payment, _ = collect_bill_payment.in_transaction(
             actor=actor, branch=branch, bill=bill, method=method,
             idempotency_key=_advance_leg_key(idempotency_key, key),
         )
@@ -1465,7 +1466,7 @@ def create_booking(
         advance_amount=advance_amount,
     )
 
-    payment, _ = payment_services.create_payment(
+    payment, _ = payment_services.record_payment(
         actor=actor,
         branch=branch,
         patient=patient,
@@ -1525,7 +1526,7 @@ def collect_booking_advance(*, actor, booking: Booking, method: str) -> tuple[Bo
     if booking.payment_id is not None:
         raise EnrollmentError("This booking's advance has already been collected.", code="already_paid")
 
-    payment, _ = payment_services.create_payment(
+    payment, _ = payment_services.record_payment(
         actor=actor,
         branch=booking.branch,
         patient=booking.patient,
@@ -1576,7 +1577,7 @@ def _find_or_create_public_patient(*, branch, patient_data: dict) -> Patient:
     data = dict(patient_data)
     idempotency_key = data.pop("idempotency_key", None)
     client_created_at = data.pop("client_created_at", None)
-    return patient_services.create_patient(
+    return patient_services.create_patient.in_transaction(
         actor=None,
         branch=branch,
         data=data,

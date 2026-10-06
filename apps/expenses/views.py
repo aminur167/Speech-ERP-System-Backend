@@ -10,9 +10,8 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from apps.branches.models import Branch
 from apps.common.filters import apply_date_range
-from apps.common.mixins import BranchScopedQuerySetMixin
+from apps.common.mixins import BranchScopedQuerySetMixin, manager_branch
 from apps.common.ordering import pending_first
 from apps.common.permissions import IsAdmin, IsManager
 from apps.expenses import services
@@ -88,7 +87,7 @@ class ExpenseViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         idempotency_key = data.pop("idempotency_key", None)
         client_created_at = data.pop("client_created_at", None)
 
-        branch = Branch.objects.get(pk=request.user.branch_id)
+        branch = manager_branch(request)
         expense = services.create_expense(
             actor=request.user, branch=branch, data=data,
             idempotency_key=idempotency_key, client_created_at=client_created_at,

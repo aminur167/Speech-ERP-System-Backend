@@ -7,6 +7,7 @@ from apps.branches.models import Branch
 from apps.common import audit
 from apps.common.models import AuditLog
 from apps.common.sequences import next_value
+from apps.common.transactions import transactional
 from apps.patients.models import Patient
 
 
@@ -15,7 +16,7 @@ def build_patient_code(branch: Branch, year: int, value: int) -> str:
     return f"PT-{branch.short_code}-{year}-{str(value).zfill(5)}"
 
 
-@transaction.atomic
+@transactional
 def create_patient(
     *, actor, branch: Branch, data: dict,
     idempotency_key: str | None = None, client_created_at=None,

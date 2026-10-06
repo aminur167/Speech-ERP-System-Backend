@@ -5,9 +5,8 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from apps.branches.models import Branch
 from apps.common.filters import apply_date_range
-from apps.common.mixins import BranchScopedQuerySetMixin
+from apps.common.mixins import BranchScopedQuerySetMixin, manager_branch
 from apps.common.ordering import pending_first
 from apps.common.permissions import IsAdmin, IsManager
 from apps.patients.models import Patient
@@ -53,8 +52,10 @@ class PaymentViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        branch_id = self.get_effective_branch_id()
-        branch = Branch.objects.get(pk=branch_id)
+        # Only a Manager can reach this (IsManager above), and a Manager's
+        # branch is always their own -- already loaded with the user.
+        branch = manager_branch(request)
+        branch_id = branch.pk
 
         # Scope the patient lookup to the same branch, so a manager can't take
         # a payment against another branch's patient by posting their id.

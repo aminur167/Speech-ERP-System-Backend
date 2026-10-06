@@ -14,7 +14,8 @@ from django.utils import timezone
 from apps.branches.models import Branch
 from apps.common import audit
 from apps.common.models import AuditLog
-from apps.common.sequences import next_value
+from apps.common.sequences import next_values
+from apps.common.transactions import transactional
 from apps.notifications.inapp import notify_admins, notify_requester
 from apps.payments.models import (
     Payment,
@@ -43,8 +44,10 @@ def _allocate_codes(branch: Branch, year: int) -> tuple[str, str]:
     the row they label have to commit together, or a later failure burns codes
     and leaves gaps in a sequence people read.
     """
-    receipt_value = next_value(f"receipt:{branch.code}", year)
-    txn_value = next_value(f"txn:{branch.code}", year)
+    # One statement for both numbers (apps/common/sequences.py::next_values).
+    receipt_value, txn_value = next_values(
+        [(f"receipt:{branch.code}", year), (f"txn:{branch.code}", year)]
+    )
 
     suffix = branch.short_code
     receipt = f"RCPT-{suffix}-{year}-{str(receipt_value).zfill(5)}"
@@ -52,7 +55,7 @@ def _allocate_codes(branch: Branch, year: int) -> tuple[str, str]:
     return receipt, transaction_id
 
 
-@transaction.atomic
+@transactional
 def create_payment(
     *,
     actor,
@@ -73,6 +76,10 @@ def create_payment(
     original payment back rather than a second charge. That distinction
     matters for composite flows (a replayed material sale must not deduct
     stock twice).
+
+    A flow that is already inside a transaction — collecting a bill, selling
+    materials, taking a booking advance — calls `record_payment` (the same
+    function, without a savepoint of its own).
     """
     if idempotency_key:
         existing = Payment.all_objects.filter(idempotency_key=idempotency_key).first()
@@ -112,6 +119,10 @@ def create_payment(
         },
     )
     return payment, True
+
+
+#: For flows already inside a transaction -- no savepoint of its own.
+record_payment = create_payment.in_transaction
 
 
 # ---------------------------------------------------------------------------

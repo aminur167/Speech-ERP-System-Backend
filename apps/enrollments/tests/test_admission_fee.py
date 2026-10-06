@@ -383,7 +383,7 @@ class TestOneAtomicStep:
         def refuse(**kwargs):
             raise payment_services.PaymentError("Card declined", code="declined")
 
-        monkeypatch.setattr(payment_services, "create_payment", refuse)
+        monkeypatch.setattr(payment_services, "record_payment", refuse)
 
         with pytest.raises(payment_services.PaymentError):
             enroll_directly(manager, branch, patient, package)

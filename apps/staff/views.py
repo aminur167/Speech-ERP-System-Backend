@@ -10,8 +10,7 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from apps.branches.models import Branch
-from apps.common.mixins import BranchScopedQuerySetMixin
+from apps.common.mixins import BranchScopedQuerySetMixin, manager_branch
 from apps.common.ordering import pending_first
 from apps.common.permissions import IsAdmin, IsManager
 from apps.staff import services
@@ -76,7 +75,7 @@ class StaffMemberViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         serializer = StaffMemberWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        branch = Branch.objects.get(pk=request.user.branch_id)
+        branch = manager_branch(request)
         member = services.create_staff_member(
             actor=request.user, branch=branch, data=dict(serializer.validated_data)
         )

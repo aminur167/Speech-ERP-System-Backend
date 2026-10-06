@@ -54,6 +54,38 @@ def next_value(scope: str, year: int) -> int:
         return cursor.fetchone()[0]
 
 
+def next_values(pairs: list[tuple[str, int]]) -> list[int]:
+    """
+    Reserve the next integer for each `(scope, year)` — in ONE statement.
+
+    A payment needs a receipt number and a transaction number together; two
+    `next_value` calls are two round trips to the database for what is one
+    thought. Same guarantees as `next_value`, per row: each existing row is
+    locked until the transaction ends, so concurrent callers queue.
+
+    Returned in the order asked. The rows are written in a fixed (scope, year)
+    order whatever order they were asked in, so two requests drawing the same
+    pair of scopes always take their locks in the same order and can never
+    deadlock each other.
+    """
+    if len(set(pairs)) != len(pairs):
+        raise ValueError("Each (scope, year) may appear only once in one draw.")
+
+    ordered = sorted(pairs)
+    rows = ", ".join(["(%s, %s, 1)"] * len(ordered))
+    sql = f"""
+        INSERT INTO {_TABLE} (scope, year, last_value) VALUES {rows}
+        ON CONFLICT (scope, year)
+        DO UPDATE SET last_value = {_TABLE}.last_value + 1
+        RETURNING scope, year, last_value
+    """
+    params = [part for pair in ordered for part in pair]
+    with connection.cursor() as cursor:
+        cursor.execute(sql, params)
+        drawn = {(scope, year): value for scope, year, value in cursor.fetchall()}
+    return [drawn[pair] for pair in pairs]
+
+
 def format_code(prefix: str, year: int | None, value: int, *, width: int = 5) -> str:
     """`PT-2026-00042`, or `MAT-00042` when `year` is None."""
     number = str(value).zfill(width)

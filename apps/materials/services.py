@@ -165,7 +165,7 @@ def sell_materials(
 
         resolved.append({"material": material, "quantity": quantity, "unit_price": unit_price})
 
-    payment, _created = payment_services.create_payment(
+    payment, _created = payment_services.record_payment(
         actor=actor,
         branch=branch,
         patient=patient,
