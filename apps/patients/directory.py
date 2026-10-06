@@ -11,14 +11,14 @@ So the whole page is assembled in a fixed number of queries regardless of page
 size:
 
   1. the patient page itself (with `branch` joined),
-  2. active monthly enrollments for those patients,
-  3. active installment plans for those patients,
-  4. one grouped pass over payments giving every patient's distinct methods,
-  5. one grouped pass over payments giving every patient's distinct categories,
-  6. the latest payment method per patient.
+  2. active monthly enrollments and installment plans for those patients
+     (one UNION),
+  3. one grouped pass over payments giving every patient's distinct methods,
+     distinct categories and latest payment,
+  4. the overdue bills and installments (one UNION).
 
-Steps 2-6 are keyed by patient id into dictionaries, so building a row is
-dictionary lookups rather than database round trips. `TestDirectoryPerformance`
+Everything after the first is keyed by patient id into dictionaries, so
+building a row is dictionary lookups rather than database round trips. `TestDirectoryPerformance`
 pins this with a query-count bound: adding a patient to the page must not add
 a query.
 """
@@ -27,7 +27,7 @@ from collections import defaultdict
 from datetime import date
 from decimal import Decimal
 
-from django.db.models import F, Max, Q
+from django.db.models import CharField, F, Max, Q, Value
 
 from apps.enrollments.models import (
     NON_OUTSTANDING_STATUSES,
@@ -83,8 +83,7 @@ def build_rows(patients: list[Patient]) -> list[dict]:
 
     ids = [p.id for p in patients]
 
-    monthly = _active_monthly_by_patient(ids)
-    installment = _active_installment_by_patient(ids)
+    monthly, installment = _active_services_by_patient(ids)
     methods, categories, latest_method = _payment_facts(ids)
     overdue = overdue_status_by_patient(ids)
 
@@ -140,8 +139,8 @@ def overdue_status_by_patient(ids) -> dict:
     Which of these patients has an unpaid bill or installment past its due
     date, on a still-active enrollment/plan -- and how much, and since when.
 
-    Two bulk queries rather than a per-patient loop, same discipline as the
-    rest of this module. `overdueAmount` sums every overdue item (docs/05
+    One bulk query (a UNION of bills and installments) rather than a
+    per-patient loop, same discipline as the rest of this module. `overdueAmount` sums every overdue item (docs/05
     says a manager needs to see the total, not just a yes/no flag);
     `overdueSince` is the oldest overdue due date, so the UI can show how
     long, not just how much.
@@ -166,8 +165,6 @@ def overdue_status_by_patient(ids) -> dict:
         .filter(amount_paid__lt=F("amount"))
         .values_list("enrollment__patient_id", "due_date", "amount", "amount_paid")
     )
-    _accumulate(bills)
-
     installments = (
         Installment.objects.filter(
             plan__patient_id__in=ids,
@@ -178,40 +175,35 @@ def overdue_status_by_patient(ids) -> dict:
         .filter(amount_paid__lt=F("amount"))
         .values_list("plan__patient_id", "due_date", "amount", "amount_paid")
     )
-    _accumulate(installments)
+    # Both kinds in one round trip.
+    _accumulate(bills.union(installments, all=True))
 
     return dict(overdue)
 
 
-def _active_monthly_by_patient(ids) -> dict:
-    """Service name of each patient's active monthly enrollment, newest first."""
-    rows = (
-        MonthlyEnrollment.objects.filter(
-            patient_id__in=ids, status=EnrollmentStatus.ACTIVE
-        )
-        .select_related("service")
-        .order_by("patient_id", "-created_at")
-        .values_list("patient_id", "service__name")
+def _active_services_by_patient(ids) -> tuple[dict, dict]:
+    """
+    Service name of each patient's active monthly enrollment and of their
+    active installment plan, newest first -- one query for both.
+    """
+    monthly = (
+        MonthlyEnrollment.objects.filter(patient_id__in=ids, status=EnrollmentStatus.ACTIVE)
+        .annotate(kind=Value("monthly", output_field=CharField()))
+        .values_list("patient_id", "kind", "created_at", "service__name")
     )
-    # The first row per patient wins, so a patient holding several active
-    # enrollments is described by the most recent.
-    found = {}
-    for patient_id, service_name in rows:
-        found.setdefault(patient_id, service_name)
-    return found
-
-
-def _active_installment_by_patient(ids) -> dict:
-    rows = (
+    plans = (
         InstallmentPlan.objects.filter(patient_id__in=ids, status=EnrollmentStatus.ACTIVE)
-        .select_related("service")
-        .order_by("patient_id", "-created_at")
-        .values_list("patient_id", "service__name")
+        .annotate(kind=Value("installment", output_field=CharField()))
+        .values_list("patient_id", "kind", "created_at", "service__name")
     )
-    found = {}
-    for patient_id, service_name in rows:
-        found.setdefault(patient_id, service_name)
-    return found
+    found: dict[str, dict] = {"monthly": {}, "installment": {}}
+    # Newest first, so a patient holding several active enrollments is
+    # described by the most recent -- the first row per patient wins.
+    for patient_id, kind, _created_at, service_name in sorted(
+        monthly.union(plans, all=True), key=lambda row: row[2], reverse=True
+    ):
+        found[kind].setdefault(patient_id, service_name)
+    return found["monthly"], found["installment"]
 
 
 def _payment_facts(ids) -> tuple[dict, dict, dict]:
@@ -222,42 +214,32 @@ def _payment_facts(ids) -> tuple[dict, dict, dict]:
     happened, so it should not put a payment method or a service category
     against a patient's name.
     """
-    payments = Payment.objects.filter(patient_id__in=ids).exclude(
-        status=PaymentStatus.VOID
+    # One grouped read: a row per distinct (patient, method, category) with
+    # the time of the latest payment in that group. Distinct methods and
+    # categories fall out of the rows, and the latest payment overall is the
+    # group with the newest timestamp.
+    groups = (
+        Payment.objects.filter(patient_id__in=ids)
+        .exclude(status=PaymentStatus.VOID)
+        .values("patient_id", "method", "category")
+        .annotate(latest=Max("created_at"))
     )
 
     methods = defaultdict(set)
-    for patient_id, method in payments.values_list("patient_id", "method").distinct():
-        methods[patient_id].add(method)
-
     categories = defaultdict(set)
-    category_rows = (
-        payments.exclude(category="")
-        # Materials are goods, not therapy. Including them would put "Material
-        # sale" in the Service Type column for anyone who ever bought a kit.
-        .exclude(category=PaymentCategory.MATERIAL_SALE)
-        .values_list("patient_id", "category")
-        .distinct()
-    )
-    for patient_id, category in category_rows:
-        categories[patient_id].add(category)
-
-    # Latest method: find each patient's most recent payment timestamp, then
-    # match rows back to it. Two queries rather than one per patient.
-    latest_times = dict(
-        payments.values_list("patient_id").annotate(latest=Max("created_at")).values_list(
-            "patient_id", "latest"
-        )
-    )
-    latest_method = {}
-    if latest_times:
-        pairs = Q()
-        for patient_id, when in latest_times.items():
-            pairs |= Q(patient_id=patient_id, created_at=when)
-        for patient_id, method in payments.filter(pairs).values_list(
-            "patient_id", "method"
-        ):
-            latest_method.setdefault(patient_id, method)
+    latest_at: dict[int, object] = {}
+    latest_method: dict[int, str] = {}
+    for row in groups:
+        patient_id = row["patient_id"]
+        methods[patient_id].add(row["method"])
+        # Materials are goods, not therapy. Including them would put
+        # "Material sale" in the Service Type column for anyone who ever
+        # bought a kit.
+        if row["category"] not in ("", PaymentCategory.MATERIAL_SALE):
+            categories[patient_id].add(row["category"])
+        if patient_id not in latest_at or row["latest"] > latest_at[patient_id]:
+            latest_at[patient_id] = row["latest"]
+            latest_method[patient_id] = row["method"]
 
     return methods, categories, latest_method
 

@@ -3,6 +3,7 @@
 from datetime import date
 from decimal import Decimal
 
+from django.db.models import Count, Q, Sum
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -14,7 +15,7 @@ from apps.common.mixins import BranchScopedQuerySetMixin, manager_branch
 from apps.common.ordering import pending_first
 from apps.common.permissions import IsAdmin, IsManager
 from apps.staff import services
-from apps.staff.models import SalaryPayment, StaffAttendance, StaffMember
+from apps.staff.models import SalaryPayment, StaffAttendance, StaffBonus, StaffMember
 from apps.staff.serializers import (
     AddBonusSerializer,
     DisburseSalaryPaymentSerializer,
@@ -143,25 +144,35 @@ class StaffMemberViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         services.mark_no_show_absentees(queryset)
         services.auto_check_out_stragglers(queryset)
         today = timezone.localdate()
-        today_records = StaffAttendance.objects.filter(staff__in=queryset, date=today)
+        active = queryset.filter(status=StaffMember.Status.ACTIVE)
 
-        active = list(queryset.filter(status=StaffMember.Status.ACTIVE))
-        salary_payout = sum((member.monthly_salary for member in active), Decimal("0.00"))
+        # Headcount and the salary bill, summed by the database -- no need to
+        # load every staff member just to add up a column.
+        roster = active.aggregate(headcount=Count("pk"), salary=Sum("monthly_salary"))
 
-        report_rows = services.monthly_report(active, year=today.year, month=today.month)
-        bonus_payout = sum((row["bonusTotal"] for row in report_rows), Decimal("0.00"))
+        # Today's attendance: both counts from one read.
+        present_statuses = [StaffAttendance.Status.PRESENT, StaffAttendance.Status.EARLY_LEAVE]
+        away_statuses = [StaffAttendance.Status.ON_LEAVE, StaffAttendance.Status.ABSENT]
+        attendance = StaffAttendance.objects.filter(staff__in=queryset, date=today).aggregate(
+            present=Count("pk", filter=Q(status__in=present_statuses)),
+            away=Count("pk", filter=Q(status__in=away_statuses)),
+        )
+
+        # This month's bonuses for the active roster. The full per-person
+        # payroll report also counts attendance by status for everyone, which
+        # nothing on this summary reads.
+        month_start, month_end = services.month_range(today.year, today.month)
+        bonus_payout = StaffBonus.objects.filter(
+            staff__in=active, created_at__date__gte=month_start, created_at__date__lt=month_end
+        ).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
 
         return Response(
             StaffSummarySerializer(
                 {
-                    "totalStaff": len(active),
-                    "presentToday": today_records.filter(
-                        status__in=[StaffAttendance.Status.PRESENT, StaffAttendance.Status.EARLY_LEAVE]
-                    ).count(),
-                    "onLeaveToday": today_records.filter(
-                        status__in=[StaffAttendance.Status.ON_LEAVE, StaffAttendance.Status.ABSENT]
-                    ).count(),
-                    "monthlySalaryPayout": salary_payout,
+                    "totalStaff": roster["headcount"],
+                    "presentToday": attendance["present"],
+                    "onLeaveToday": attendance["away"],
+                    "monthlySalaryPayout": roster["salary"] or Decimal("0.00"),
                     "monthlyBonusPayout": bonus_payout,
                 }
             ).data

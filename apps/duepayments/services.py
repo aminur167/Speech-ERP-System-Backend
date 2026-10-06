@@ -15,7 +15,7 @@ for a past date if it was unpaid then, even if it's paid now.
 from datetime import date, datetime, time
 from decimal import Decimal
 
-from django.db.models import Count, DecimalField, F, IntegerField, OuterRef, Subquery, Sum, Value
+from django.db.models import Case, Count, DecimalField, F, IntegerField, OuterRef, Q, Subquery, Sum, Value, When
 from django.db.models.functions import Coalesce, Greatest
 from django.utils import timezone
 
@@ -266,9 +266,30 @@ def _installment_balance(*, branch_id=None) -> Decimal:
     if branch_id:
         installments = installments.filter(plan__branch_id=branch_id)
 
-    return sum(
-        (i.outstanding for i in installments if i.outstanding > 0), Decimal("0.00")
+    # Summed by the database. A row never owes less than zero (an installment
+    # over-collected on cannot make the plan look overpaid), hence Greatest.
+    return installments.aggregate(
+        s=Sum(Greatest(F("amount") - F("amount_paid"), Value(Decimal("0.00"))))
+    )["s"] or Decimal("0.00")
+
+
+def _next_payable_total(*, branch_id=None) -> Decimal:
+    """
+    What a manager could collect right now on monthly bills: the first unpaid
+    bill of each enrollment, summed -- the same figure `collect_due_items`
+    lists row by row, but computed by the database instead of loading every
+    unpaid bill with its enrollment, patient, service and branch.
+    """
+    unpaid = (
+        MonthlyBill.objects.exclude(status__in=NON_OUTSTANDING_STATUSES)
+        .filter(amount_paid__lt=F("amount"))
     )
+    if branch_id:
+        unpaid = unpaid.filter(enrollment__branch_id=branch_id)
+    first_per_enrollment = unpaid.order_by("enrollment_id", "month").distinct("enrollment_id")
+    return MonthlyBill.objects.filter(pk__in=first_per_enrollment.values("pk")).aggregate(
+        s=Sum(F("amount") - F("amount_paid"))
+    )["s"] or Decimal("0.00")
 
 
 def due_summary(*, branch_id=None, as_of: date | None = None) -> dict:
@@ -280,16 +301,13 @@ def due_summary(*, branch_id=None, as_of: date | None = None) -> dict:
     date picker needs, and why `paid_at` exists on bills at all.
     """
     if as_of is None:
-        items = collect_due_items(branch_id=branch_id)
-        monthly = sum(
-            (i["amount"] for i in items if i["type"] == "monthly"), Decimal("0.00")
-        )
-        # Deliberately NOT summed from `items`: that list is what a manager can
-        # collect right now, so it holds one installment per plan. What's owed
-        # is the whole remaining balance of every active plan — a patient who
+        monthly = _next_payable_total(branch_id=branch_id)
+        # Installments are deliberately NOT "the next payable one per plan"
+        # like monthly bills: what's owed is the whole remaining balance of
+        # every active plan — a patient who
         # has paid the 1st of 3 still owes the other two, and the dashboard has
-        # to say so. Monthly stays list-derived: those renew indefinitely, so
-        # "everything ahead" isn't a finite number there.
+        # to say so. Monthly stays one-bill-at-a-time: those renew
+        # indefinitely, so "everything ahead" isn't a finite number there.
         installment = _installment_balance(branch_id=branch_id)
         return {
             "totalDue": monthly + installment,
@@ -298,68 +316,57 @@ def due_summary(*, branch_id=None, as_of: date | None = None) -> dict:
         }
 
     cutoff = _end_of_day(as_of)
+    zero = Decimal("0.00")
 
-    monthly_total = Decimal("0.00")
-    # Inactive services included, matching `collect_due_items` — a kept month
-    # is owed whether or not the service is still running, and the two have to
-    # agree or today's reconstruction stops matching today's snapshot.
-    bills = (
-        MonthlyBill.objects
-        .select_related("enrollment")
-        .order_by("enrollment_id", "month")
+    # What was still owed on a payable at `cutoff`. `amount_paid` is current
+    # state, so a payment that landed after the cutoff must not count as
+    # paid yet: that case owes the full original amount (`_outstanding_at`).
+    owed_then = Case(
+        When(paid_at__gt=cutoff, then=F("amount")),
+        default=F("amount") - F("amount_paid"),
+        output_field=DecimalField(max_digits=12, decimal_places=2),
     )
-    if branch_id:
-        bills = bills.filter(enrollment__branch_id=branch_id)
-
-    seen = set()
-    for bill in bills:
-        if bill.enrollment_id in seen:
-            continue
-        # A bill's due_date says nothing about when the row started existing,
-        # so existence is decided by when the enrollment was created —
-        # mirroring the installment loop's `plan.created_at` check below.
-        # Ordinary months are now raised as they arrive, but months paid ahead
-        # are created early, which is what the advance guard just below is
-        # for.
-        if bill.enrollment.created_at > cutoff:
-            continue
-        # A month paid ahead was never owed on a date before it began. Its
-        # `paid_at` is after the cutoff, so `_was_outstanding_at` would call
-        # it outstanding and charge a past month for a future one; the
-        # enrollment guard above can't catch it because the enrollment is
-        # old, and `_was_outstanding_at` can't because it cannot see a month.
-        #
-        # Narrowed to advances on purpose. An ordinary unpaid future bill
-        # still counts, because the current snapshot counts it too — the next
-        # payable bill is what "outstanding" has always meant here, and
-        # today's reconstruction has to agree with today's snapshot.
-        if bill.status == BillStatus.ADVANCE and bill.month > month_key(as_of):
-            continue
-        if not _was_outstanding_at(bill, cutoff):
-            continue
-        seen.add(bill.enrollment_id)
-        monthly_total += _outstanding_at(bill, cutoff)
-
-    installment_total = Decimal("0.00")
-    installments = (
-        Installment.objects
-        .select_related("plan")
-        .order_by("plan_id", "index")
+    # `_was_outstanding_at` as a filter: not forgiven, and either never paid
+    # or paid only after the cutoff.
+    unpaid_then = ~Q(status__in=FORGIVEN_STATUSES) & (
+        Q(paid_at__isnull=True) | Q(paid_at__gt=cutoff)
     )
-    if branch_id:
-        installments = installments.filter(plan__branch_id=branch_id)
 
-    # Every unpaid installment, not just the currently-payable one: an
+    # Monthly: for each enrollment, the FIRST bill (by month) that was
+    # outstanding then -- the one a manager could have collected that day.
+    # Inactive services included, matching `collect_due_items` -- a kept
+    # month is owed whether or not the service is still running, and the two
+    # have to agree or today's reconstruction stops matching today's
+    # snapshot.
+    #
+    # A bill's due_date says nothing about when the row started existing, so
+    # existence is decided by when the enrollment was created. And a month
+    # paid ahead was never owed on a date before it began: its `paid_at` is
+    # after the cutoff, so it would otherwise read as outstanding and charge
+    # a past month for a future one. Narrowed to advances on purpose -- an
+    # ordinary unpaid future bill still counts, because the current snapshot
+    # counts it too.
+    candidates = MonthlyBill.objects.filter(
+        unpaid_then, enrollment__created_at__lte=cutoff
+    ).exclude(status=BillStatus.ADVANCE, month__gt=month_key(as_of))
+    if branch_id:
+        candidates = candidates.filter(enrollment__branch_id=branch_id)
+    first_per_enrollment = candidates.order_by("enrollment_id", "month").distinct(
+        "enrollment_id"
+    )
+    monthly_total = MonthlyBill.objects.filter(
+        pk__in=first_per_enrollment.values("pk")
+    ).aggregate(s=Sum(owed_then))["s"] or zero
+
+    # Installments: every unpaid one, not just the currently-payable one. An
     # installment plan is a single agreed debt, so once a patient is on one
     # the whole remaining balance is money the clinic is owed. Monthly
     # enrollments above stay one-bill-at-a-time on purpose -- they renew
     # indefinitely, so "everything ahead" isn't a finite figure there.
-    for installment in installments:
-        if installment.plan.created_at > cutoff:
-            continue
-        if not _was_outstanding_at(installment, cutoff):
-            continue
-        installment_total += _outstanding_at(installment, cutoff)
+    installments = Installment.objects.filter(unpaid_then, plan__created_at__lte=cutoff)
+    if branch_id:
+        installments = installments.filter(plan__branch_id=branch_id)
+    installment_total = installments.aggregate(s=Sum(owed_then))["s"] or zero
 
     return {
         "totalDue": monthly_total + installment_total,

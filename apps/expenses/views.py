@@ -3,7 +3,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from django.db.models import Q, Sum
+from django.db.models import Count, Q, Sum
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -126,28 +126,34 @@ class ExpenseViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         base = super().get_queryset()  # unfiltered by the date params above
 
         reference = _parse_date(request.query_params.get("date")) or timezone.localdate()
-        counted = base.filter(status__in=COUNTED_STATUSES)
+        counted = Q(status__in=COUNTED_STATUSES)
+        pending = Q(status=Expense.Status.PENDING)
 
-        total = counted.aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
-        today_total = counted.filter(created_at__date=reference).aggregate(s=Sum("amount"))[
-            "s"
-        ] or Decimal("0.00")
-        month_total = counted.filter(
-            created_at__year=reference.year, created_at__month=reference.month
-        ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
-
-        pending = base.filter(status=Expense.Status.PENDING)
-        pending_amount = pending.aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+        # Six figures, one query: each is a conditional sum or count over the
+        # same rows, not a query of its own.
+        stats = base.aggregate(
+            total=Sum("amount", filter=counted),
+            today=Sum("amount", filter=counted & Q(created_at__date=reference)),
+            month=Sum(
+                "amount",
+                filter=counted
+                & Q(created_at__year=reference.year, created_at__month=reference.month),
+            ),
+            pending_amount=Sum("amount", filter=pending),
+            pending_count=Count("pk", filter=pending),
+            vouchers=Count("pk"),
+        )
+        zero = Decimal("0.00")
 
         return Response(
             ExpenseSummarySerializer(
                 {
-                    "total": total,
-                    "todayTotal": today_total,
-                    "monthTotal": month_total,
-                    "pendingAmount": pending_amount,
-                    "pendingCount": pending.count(),
-                    "voucherCount": base.count(),
+                    "total": stats["total"] or zero,
+                    "todayTotal": stats["today"] or zero,
+                    "monthTotal": stats["month"] or zero,
+                    "pendingAmount": stats["pending_amount"] or zero,
+                    "pendingCount": stats["pending_count"],
+                    "voucherCount": stats["vouchers"],
                 }
             ).data
         )

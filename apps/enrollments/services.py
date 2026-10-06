@@ -19,7 +19,7 @@ from decimal import ROUND_DOWN, Decimal
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import F, Sum
+from django.db.models import CharField, F, Sum, Value
 from django.utils import timezone
 
 from apps.common import audit
@@ -91,47 +91,56 @@ def patient_outstanding_dues(patient) -> dict:
     `unpaid_installments` already exclude them — nobody owes a forgiven
     amount, which is the whole point of having forgiven it.
     """
+    # One query for every owed item across every service the patient holds:
+    # a UNION of the unpaid monthly bills and the unpaid installments, each
+    # joined to the service it belongs to. This used to loop over the
+    # patient's enrollments and plans and ask each for its unpaid rows -- a
+    # query per enrollment, so a patient with a long history paid for it on
+    # every enrollment, reactivation and delete check.
+    #
+    # `unpaid_bills` / `unpaid_installments` (models.py) are the definition of
+    # "still owed", and these filters are the same ones: not closed, not
+    # forgiven, and `amount_paid < amount`.
+    bills = (
+        MonthlyBill.objects.filter(enrollment__patient=patient)
+        .exclude(status__in=NON_OUTSTANDING_STATUSES)
+        .filter(amount_paid__lt=F("amount"))
+        .annotate(owed_type=Value("monthly", output_field=CharField()))
+        .values_list(
+            "owed_type", "enrollment_id", "id", "enrollment__service__name", "month",
+            "label", "amount", "amount_paid", "enrollment__status",
+        )
+    )
+    installments = (
+        Installment.objects.filter(plan__patient=patient)
+        .exclude(status__in=CLOSED_STATUSES)
+        .filter(amount_paid__lt=F("amount"))
+        .annotate(owed_type=Value("installment", output_field=CharField()), blank_month=Value("", output_field=CharField()))
+        .values_list(
+            "owed_type", "plan_id", "id", "plan__service__name", "blank_month",
+            "label", "amount", "amount_paid", "plan__status",
+        )
+    )
+
     items: list[dict] = []
-
-    enrollments = patient.monthly_enrollments.select_related("service").prefetch_related(
-        "bills"
-    )
-    for enrollment in enrollments:
-        for bill in enrollment.unpaid_bills():
-            if bill.outstanding <= 0:
-                continue
-            items.append(
-                {
-                    "type": "monthly",
-                    "refId": str(enrollment.pk),
-                    "itemId": str(bill.pk),
-                    "serviceName": enrollment.service.name,
-                    "month": bill.month,
-                    "label": bill.label,
-                    "amount": bill.outstanding,
-                    "serviceActive": enrollment.is_active,
-                }
-            )
-
-    plans = patient.installment_plans.select_related("service").prefetch_related(
-        "installments"
-    )
-    for plan in plans:
-        for installment in plan.unpaid_installments():
-            if installment.outstanding <= 0:
-                continue
-            items.append(
-                {
-                    "type": "installment",
-                    "refId": str(plan.pk),
-                    "itemId": str(installment.pk),
-                    "serviceName": plan.service.name,
-                    "month": "",
-                    "label": installment.label,
-                    "amount": installment.outstanding,
-                    "serviceActive": plan.is_active,
-                }
-            )
+    for kind, ref_id, item_id, service_name, month, label, amount, paid, parent_status in (
+        bills.union(installments, all=True)
+    ):
+        owed = amount - paid
+        if owed <= 0:
+            continue
+        items.append(
+            {
+                "type": kind,
+                "refId": str(ref_id),
+                "itemId": str(item_id),
+                "serviceName": service_name,
+                "month": month,
+                "label": label,
+                "amount": owed,
+                "serviceActive": parent_status == EnrollmentStatus.ACTIVE,
+            }
+        )
 
     items.sort(key=lambda row: (row["month"], row["label"]))
     return {
@@ -337,9 +346,13 @@ def enroll_monthly_with_admission(
     )
 
     if payable > 0:
-        payment, _ = collect_bill_payment.in_transaction(
-            actor=actor, branch=branch, bill=bill, method=method,
-            idempotency_key=idempotency_key,
+        # Settled directly rather than through collect_bill_payment: the bill
+        # was created a moment ago in this transaction, so nobody else can
+        # see it (nothing to lock) and it is the only bill (nothing older to
+        # pay first).
+        payment, _ = _settle_bill(
+            actor=actor, branch=branch, enrollment=enrollment, bill=bill,
+            method=method, idempotency_key=idempotency_key,
         )
     else:
         # Discounted to nothing: settled, with no money and no receipt. The
@@ -349,7 +362,8 @@ def enroll_monthly_with_admission(
         bill.paid_at = timezone.now()
         bill.save(update_fields=["status", "paid_at"])
 
-    enrollment.refresh_from_db()
+    # The enrollment in memory is the row in the database: it was created in
+    # this call and nothing since has changed any of its own columns.
     return enrollment, payment
 
 
@@ -510,7 +524,11 @@ def _assert_is_oldest_unpaid(container, target) -> None:
         if isinstance(container, MonthlyEnrollment)
         else container.oldest_unpaid_installment()
     )
+    _require_oldest(oldest, target)
 
+
+def _require_oldest(oldest, target) -> None:
+    """The refusals of `_assert_is_oldest_unpaid`, given the oldest unpaid item."""
     if oldest is None:
         raise EnrollmentError("Nothing is currently outstanding.", code="nothing_due")
 
@@ -560,8 +578,62 @@ def collect_bill_payment(
     if bill.is_settled or bill.status in CLOSED_STATUSES:
         raise EnrollmentError("This bill has already been settled.", code="already_paid")
 
-    _assert_is_oldest_unpaid(enrollment, bill)
+    # The two oldest unpaid bills, in one read. The first must be this one
+    # (oldest-first); once it is paid, the second is the one to bring forward
+    # -- so the check before and the promotion after share a single query
+    # instead of asking "what is the oldest unpaid bill?" twice.
+    unpaid = list(enrollment.unpaid_bills()[:2])
+    _require_oldest(unpaid[0] if unpaid else None, bill)
 
+    payment, created = _settle_bill(
+        actor=actor, branch=branch, enrollment=enrollment, bill=bill,
+        method=method, idempotency_key=idempotency_key,
+    )
+
+    # A replayed key means this bill was already settled by the original
+    # request; don't apply the settlement twice.
+    if created:
+        _promote_bill(unpaid[1] if len(unpaid) > 1 else None)
+
+    return payment, bill
+
+
+@transactional
+def collect_bill_payment_by_id(
+    *, actor, branch, enrollment, bill_id, method: str, idempotency_key: str | None = None
+):
+    """
+    `collect_bill_payment` for a request that names the bill by id.
+
+    The bill is looked up and locked in one statement, scoped to the
+    enrollment the request is for -- instead of an unlocked lookup (to answer
+    "is there such a bill?") followed by a second, locking one. Raises
+    `EnrollmentError` with code `bill_not_found` for a bill that is not this
+    enrollment's.
+    """
+    try:
+        bill = MonthlyBill.objects.select_for_update().get(
+            pk=bill_id, enrollment_id=enrollment.pk
+        )
+    except MonthlyBill.DoesNotExist:
+        raise EnrollmentError("Bill not found.", code="bill_not_found") from None
+    bill.enrollment = enrollment
+    return collect_bill_payment.in_transaction(
+        actor=actor, branch=branch, bill=bill, method=method,
+        idempotency_key=idempotency_key,
+    )
+
+
+def _settle_bill(*, actor, branch, enrollment, bill, method: str, idempotency_key):
+    """
+    Take the payment for `bill` and mark it settled. Returns `(payment, created)`.
+
+    The caller has already established that the bill may be paid now: locked
+    it, confirmed it is open and the oldest unpaid. `enroll_monthly_with_admission`
+    calls this directly for the bill it has just created, where there is
+    nothing to lock (no other transaction can see it yet) and nothing older
+    to be paid first.
+    """
     payment, created = payment_services.record_payment(
         actor=actor,
         branch=branch,
@@ -572,9 +644,6 @@ def collect_bill_payment(
         description=f"{enrollment.service.name} — {bill.label}",
         idempotency_key=idempotency_key,
     )
-
-    # A replayed key means this bill was already settled by the original
-    # request; don't apply the settlement twice.
     if created:
         bill.amount_paid = bill.amount
         # Not a literal PAID: a month settled before it arrives is an advance.
@@ -582,23 +651,11 @@ def collect_bill_payment(
         bill.paid_at = timezone.now()
         bill.payment = payment
         bill.save(update_fields=["amount_paid", "status", "paid_at", "payment"])
-
-        _promote_next_bill(enrollment)
-
-    return payment, bill
+    return payment, created
 
 
-def _promote_next_bill(enrollment: MonthlyEnrollment) -> None:
-    """
-    Make the next payable bill due once the current one clears.
-
-    Reads the oldest *unpaid* bill rather than filtering for UPCOMING: with
-    months payable in advance, the nearest upcoming row may already be
-    prepaid, and filtering by status would step over it to promote a later
-    month — leaving a further-out bill marked due while a nearer one sat
-    settled ahead of it.
-    """
-    nxt = enrollment.oldest_unpaid_bill()
+def _promote_bill(nxt) -> None:
+    """Bring the next unpaid bill (already read) forward if it is still upcoming."""
     if nxt is not None and nxt.status == BillStatus.UPCOMING:
         nxt.status = BillStatus.DUE
         nxt.save(update_fields=["status"])

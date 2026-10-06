@@ -2,7 +2,7 @@
 
 from decimal import Decimal
 
-from django.db.models import DecimalField, ExpressionWrapper, F, Sum
+from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -97,22 +97,24 @@ class MaterialViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         """
         queryset = self.get_queryset()
 
+        # Item count, stock value and low-stock count: one query.
         totals = queryset.aggregate(
+            items=Count("pk"),
             stock_value=Sum(
                 ExpressionWrapper(
                     F("quantity") * F("unit_cost"),
                     output_field=DecimalField(max_digits=14, decimal_places=2),
                 )
-            )
+            ),
+            low_stock=Count("pk", filter=Q(quantity__lte=F("reorder_level"))),
         )
-        low_stock = queryset.filter(quantity__lte=F("reorder_level")).count()
 
         return Response(
             MaterialsSummarySerializer(
                 {
-                    "totalItems": queryset.count(),
+                    "totalItems": totals["items"],
                     "totalStockValue": totals["stock_value"] or Decimal("0.00"),
-                    "lowStockCount": low_stock,
+                    "lowStockCount": totals["low_stock"],
                 }
             ).data
         )

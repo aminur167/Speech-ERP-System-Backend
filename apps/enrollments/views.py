@@ -6,7 +6,7 @@ Admin can see everything but shouldn't transact on a branch's behalf.
 """
 
 from drf_spectacular.utils import OpenApiParameter, extend_schema
-from django.db.models import Q
+from django.db.models import Q, prefetch_related_objects
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
@@ -89,6 +89,14 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
     serializer_class = MonthlyEnrollmentSerializer
     filterset_fields = ["status", "patient"]
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.action == "pay_bill":
+            # The bills are read once, after paying (so the response shows
+            # them as they now are) -- not also before.
+            queryset = queryset.prefetch_related(None)
+        return queryset
+
     @extend_schema(request=MonthlyEnrollAndPaySerializer)
     def create(self, request, *args, **kwargs):
         """
@@ -147,9 +155,9 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
             # screen bypassed is refused on exactly the same terms.
             return _error(exc)
 
-        enrollment = MonthlyEnrollment.objects.prefetch_related("bills").select_related(
-            "patient", "service"
-        ).get(pk=enrollment.pk)
+        # The enrollment is already in memory with its patient and service;
+        # only its bills still need reading (one query, not a full re-fetch).
+        prefetch_related_objects([enrollment], "patient", "service", "bills")
         return Response(
             {
                 "enrollment": MonthlyEnrollmentSerializer(enrollment).data,
@@ -170,32 +178,26 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
         serializer.is_valid(raise_exception=True)
 
         try:
-            bill = MonthlyBill.objects.get(pk=bill_id, enrollment=enrollment)
-        except MonthlyBill.DoesNotExist:
-            return Response({"detail": "Bill not found."}, status=status.HTTP_404_NOT_FOUND)
-        # Hand over the enrollment already loaded with its patient and
-        # service, so collecting doesn't fetch each of them again one by one.
-        bill.enrollment = enrollment
-
-        try:
-            payment, bill = services.collect_bill_payment(
+            payment, _bill = services.collect_bill_payment_by_id(
                 actor=request.user,
                 branch=enrollment.branch,
-                bill=bill,
+                enrollment=enrollment,
+                bill_id=bill_id,
                 method=serializer.validated_data["method"],
                 idempotency_key=serializer.validated_data.get("idempotencyKey") or None,
             )
         except services.EnrollmentError as exc:
+            if exc.code == "bill_not_found":
+                return Response({"detail": "Bill not found."}, status=status.HTTP_404_NOT_FOUND)
             return _error(exc)
 
+        # `enrollment` is already loaded with its patient, service and branch;
+        # only its bills (just changed) need reading again.
+        prefetch_related_objects([enrollment], "bills")
         return Response(
             {
                 "payment": PaymentSerializer(payment).data,
-                "enrollment": MonthlyEnrollmentSerializer(
-                    MonthlyEnrollment.objects.select_related("patient", "service")
-                    .prefetch_related("bills")
-                    .get(pk=enrollment.pk)
-                ).data,
+                "enrollment": MonthlyEnrollmentSerializer(enrollment).data,
             }
         )
 

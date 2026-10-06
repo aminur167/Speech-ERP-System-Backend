@@ -19,7 +19,7 @@ from apps.branches.serializers import (
     BranchWriteSerializer,
 )
 from apps.common.permissions import IsAdmin
-from apps.reporting.services import patient_directory_summary, transactions_summary
+from apps.reporting.services import branch_headline_figures
 from apps.common import audit
 from apps.common.models import AuditLog
 from apps.enrollments.models import EnrollmentStatus
@@ -163,8 +163,10 @@ class BranchViewSet(viewsets.ModelViewSet):
         exist (Phases 2-3); the shape is settled now so the frontend's
         branches grid can bind against it.
         """
-        branches = self.get_queryset()
-        data = [self._build_overview(branch) for branch in branches]
+        branches = list(self.get_queryset())
+        # Every branch's figures in two grouped queries, not a few per branch.
+        figures = branch_headline_figures(branch.id for branch in branches)
+        data = [self._build_overview(branch, figures[branch.id]) for branch in branches]
         return Response(BranchOverviewSerializer(data, many=True).data)
 
     @extend_schema(operation_id="branches_overview_retrieve")
@@ -172,14 +174,14 @@ class BranchViewSet(viewsets.ModelViewSet):
     def overview_detail(self, request, pk=None):
         """GET /api/branches/{id}/overview/ — one branch's figures."""
         branch = self.get_object()
-        return Response(BranchOverviewSerializer(self._build_overview(branch)).data)
+        figures = branch_headline_figures([branch.id])[branch.id]
+        return Response(BranchOverviewSerializer(self._build_overview(branch, figures)).data)
 
-    def _build_overview(self, branch: Branch) -> dict:
-        patients = patient_directory_summary(branch_id=branch.id)
-        revenue = transactions_summary(branch_id=branch.id)
+    @staticmethod
+    def _build_overview(branch: Branch, figures: dict) -> dict:
         return {
             "branch": branch,
-            "patientCount": patients["total"],
-            "totalCollected": revenue["totalCollected"],
-            "monthlyRevenue": revenue["monthCollected"],
+            "patientCount": figures["patients"],
+            "totalCollected": figures["collected"],
+            "monthlyRevenue": figures["month"],
         }

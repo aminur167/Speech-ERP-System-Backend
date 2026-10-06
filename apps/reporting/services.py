@@ -27,7 +27,7 @@ disturb a closed period.
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
-from django.db.models import Count, Q, Sum
+from django.db.models import Count, Exists, OuterRef, Q, Sum
 from django.db.models.functions import TruncDate
 from django.utils import timezone
 
@@ -81,24 +81,37 @@ def _sum(queryset, field="amount") -> Decimal:
 
 
 def transactions_summary(*, branch_id=None, as_of: date | None = None) -> dict:
-    """Headline collection figures for a day and its month."""
+    """
+    Headline collection figures for a day and its month.
+
+    Three queries however many figures there are: one grouped read of the
+    payments (the all-time total, the count, the day's and the month's
+    figures, and the by-method split are all sums over the same rows), one of
+    the refunds and one of the expenses. Each figure is a conditional sum
+    (`Sum(..., filter=...)`) instead of a query of its own.
+    """
     reference = as_of or timezone.localdate()
-    revenue = _revenue_queryset(branch_id)
+    in_month = Q(created_at__year=reference.year, created_at__month=reference.month)
 
-    day_total = _sum(revenue.filter(created_at__date=reference))
-    month_total = _sum(
-        revenue.filter(
-            created_at__year=reference.year, created_at__month=reference.month
+    per_method = list(
+        _revenue_queryset(branch_id)
+        .values("method")
+        .annotate(
+            total=Sum("amount"),
+            count=Count("id"),
+            day=Sum("amount", filter=Q(created_at__date=reference)),
+            month=Sum("amount", filter=in_month),
         )
+        .order_by("-total")
     )
 
-    refunds = _refund_queryset(branch_id)
-    month_refunds = _sum(
-        refunds.filter(
-            reviewed_at__year=reference.year, reviewed_at__month=reference.month
-        )
+    refunds = _refund_queryset(branch_id).aggregate(
+        total=Sum("amount"),
+        month=Sum(
+            "amount",
+            filter=Q(reviewed_at__year=reference.year, reviewed_at__month=reference.month),
+        ),
     )
-    total_refunds = _sum(refunds)
 
     # Every approved/pending expense, salaries included: a salary payment
     # becomes an Expense (category SALARIES) the moment it's disbursed
@@ -109,21 +122,53 @@ def transactions_summary(*, branch_id=None, as_of: date | None = None) -> dict:
         expenses = expenses.filter(branch_id=branch_id)
     total_expenses = _sum(expenses)
 
-    by_method = [
-        {"method": row["method"], "amount": row["amount"]}
-        for row in revenue.values("method").annotate(amount=Sum("amount")).order_by("-amount")
-    ]
-
     return {
-        "totalCollected": _sum(revenue),
-        "totalRefunded": total_refunds,
+        "totalCollected": sum((row["total"] for row in per_method), Decimal("0.00")),
+        "totalRefunded": refunds["total"] or Decimal("0.00"),
         "totalExpenses": total_expenses,
-        "transactionCount": revenue.count(),
-        "todayCollected": day_total,
-        "monthCollected": month_total,
-        "monthRefunded": month_refunds,
-        "byMethod": by_method,
+        "transactionCount": sum(row["count"] for row in per_method),
+        "todayCollected": sum((row["day"] or Decimal("0.00") for row in per_method), Decimal("0.00")),
+        "monthCollected": sum((row["month"] or Decimal("0.00") for row in per_method), Decimal("0.00")),
+        "monthRefunded": refunds["month"] or Decimal("0.00"),
+        "byMethod": [{"method": row["method"], "amount": row["total"]} for row in per_method],
     }
+
+
+def branch_headline_figures(branch_ids) -> dict[int, dict]:
+    """
+    Patient count, all-time collection and this month's collection for each
+    of `branch_ids` -- two queries however many branches there are.
+
+    The Admin branches grid used to ask for these one branch at a time (a few
+    queries per branch); this is the same three numbers, grouped by branch.
+    A branch with no patients or payments reads as zeros.
+    """
+    ids = list(branch_ids)
+    today = timezone.localdate()
+
+    figures = {
+        branch_id: {"patients": 0, "collected": Decimal("0.00"), "month": Decimal("0.00")}
+        for branch_id in ids
+    }
+    for row in (
+        Patient.objects.filter(branch_id__in=ids).values("branch_id").annotate(n=Count("pk"))
+    ):
+        figures[row["branch_id"]]["patients"] = row["n"]
+    for row in (
+        _revenue_queryset()
+        .filter(branch_id__in=ids)
+        .values("branch_id")
+        .annotate(
+            total=Sum("amount"),
+            month=Sum(
+                "amount",
+                filter=Q(created_at__year=today.year, created_at__month=today.month),
+            ),
+        )
+    ):
+        figures[row["branch_id"]]["collected"] = row["total"] or Decimal("0.00")
+        figures[row["branch_id"]]["month"] = row["month"] or Decimal("0.00")
+    return figures
 
 
 def revenue_trend(*, branch_id=None, days: int = 7) -> list[dict]:
@@ -183,11 +228,14 @@ def revenue_by_category(*, branch_id=None, as_of: date | None = None) -> list[di
 def dashboard_metrics(*, branch_id=None, as_of: date | None = None) -> dict:
     """Per-day figures that don't fit the other summaries."""
     reference = as_of or timezone.localdate()
-    day = _revenue_queryset(branch_id).filter(created_at__date=reference)
+    day = _revenue_queryset(branch_id).filter(created_at__date=reference).aggregate(
+        patients=Count("patient_id", distinct=True),
+        due=Sum("amount", filter=Q(category__in=["monthly", "installment"])),
+    )
 
     return {
-        "todayPatientsSeen": day.values("patient_id").distinct().count(),
-        "todayDueCollected": _sum(day.filter(category__in=["monthly", "installment"])),
+        "todayPatientsSeen": day["patients"],
+        "todayDueCollected": day["due"] or Decimal("0.00"),
     }
 
 
@@ -271,27 +319,31 @@ def patient_directory_summary(*, branch_id=None, as_of: date | None = None) -> d
     if branch_id:
         patients = patients.filter(branch_id=branch_id)
 
-    active_care = patients.filter(
-        monthly_enrollments__status="active"
-    ).distinct().count()
-
-    in_progress = (
-        patients.filter(installment_plans__status="active")
-        .exclude(monthly_enrollments__status="active")
-        .distinct()
-        .count()
+    # Does the patient hold an active monthly service / installment plan?
+    # Asked as EXISTS subqueries inside one aggregate, so the four counts
+    # (everyone, active care, in progress, this month's intake) are one query.
+    has_monthly = Exists(
+        MonthlyEnrollment.objects.filter(patient=OuterRef("pk"), status="active")
+    )
+    has_plan = Exists(
+        InstallmentPlan.objects.filter(patient=OuterRef("pk"), status="active")
+    )
+    counts = patients.aggregate(
+        total=Count("pk"),
+        active_care=Count("pk", filter=has_monthly),
+        in_progress=Count("pk", filter=has_plan & ~has_monthly),
+        intake=Count(
+            "pk",
+            filter=Q(created_at__year=reference.year, created_at__month=reference.month),
+        ),
     )
 
-    total = patients.count()
-
     return {
-        "total": total,
-        "activeCare": active_care,
-        "inProgress": in_progress,
-        "actionNeeded": total - active_care - in_progress,
-        "intake": patients.filter(
-            created_at__year=reference.year, created_at__month=reference.month
-        ).count(),
+        "total": counts["total"],
+        "activeCare": counts["active_care"],
+        "inProgress": counts["in_progress"],
+        "actionNeeded": counts["total"] - counts["active_care"] - counts["in_progress"],
+        "intake": counts["intake"],
     }
 
 
@@ -314,36 +366,52 @@ def branch_summary(*, branch_id=None, date_from: date, date_to: date) -> dict:
     # last day off at midnight).
     in_range = {"created_at__date__gte": date_from, "created_at__date__lte": date_to}
 
+    # Revenue: one grouped read by (method, category) -- the total, the count
+    # and both breakdowns are sums over those same rows -- plus one for the
+    # distinct patients, which can't be summed from groups.
     revenue = _revenue_queryset(branch_id).filter(**in_range)
-    gross = _sum(revenue)
+    groups = list(
+        revenue.values("method", "category").annotate(total=Sum("amount"), count=Count("id"))
+    )
+    patients_seen = revenue.aggregate(n=Count("patient_id", distinct=True))["n"]
+    gross = sum((row["total"] for row in groups), Decimal("0.00"))
+
+    by_method_totals: dict[str, Decimal] = {}
+    by_category_totals: dict[str, Decimal] = {}
+    for row in groups:
+        by_method_totals[row["method"]] = by_method_totals.get(row["method"], Decimal("0.00")) + row["total"]
+        # The category split leaves out uncategorised payments and material
+        # sales, exactly as `revenue_by_category` does.
+        if row["category"] not in ("", "material_sale"):
+            by_category_totals[row["category"]] = (
+                by_category_totals.get(row["category"], Decimal("0.00")) + row["total"]
+            )
+    by_method = [
+        {"method": method, "amount": amount}
+        for method, amount in sorted(by_method_totals.items(), key=lambda item: -item[1])
+    ]
+    by_category = [
+        {"category": category, "amount": amount}
+        for category, amount in sorted(by_category_totals.items(), key=lambda item: -item[1])
+    ]
 
     refunds = _refund_queryset(branch_id).filter(
         reviewed_at__date__gte=date_from, reviewed_at__date__lte=date_to
-    )
-    refunded = _sum(refunds)
+    ).aggregate(total=Sum("amount"), count=Count("id"))
+    refunded = refunds["total"] or Decimal("0.00")
 
     expenses = Expense.objects.filter(status__in=COUNTED_EXPENSE_STATUSES)
     if branch_id:
         expenses = expenses.filter(branch_id=branch_id)
-    expenses = expenses.filter(**in_range)
-    expense_total = _sum(expenses)
+    expense_stats = expenses.filter(**in_range).aggregate(total=Sum("amount"), count=Count("id"))
+    expense_total = expense_stats["total"] or Decimal("0.00")
 
     patients = Patient.objects.all()
     if branch_id:
         patients = patients.filter(branch_id=branch_id)
-
-    by_method = [
-        {"method": row["method"], "amount": row["amount"]}
-        for row in revenue.values("method").annotate(amount=Sum("amount")).order_by("-amount")
-    ]
-    by_category = [
-        {"category": row["category"], "amount": row["amount"]}
-        for row in revenue.exclude(category="")
-        .exclude(category="material_sale")
-        .values("category")
-        .annotate(amount=Sum("amount"))
-        .order_by("-amount")
-    ]
+    patient_stats = patients.aggregate(
+        new=Count("pk", filter=Q(**in_range)), total=Count("pk")
+    )
 
     return {
         "dateFrom": date_from,
@@ -352,12 +420,12 @@ def branch_summary(*, branch_id=None, date_from: date, date_to: date) -> dict:
         "refunded": refunded,
         "expenses": expense_total,
         "netRevenue": gross - refunded - expense_total,
-        "paymentCount": revenue.count(),
-        "patientsSeen": revenue.values("patient_id").distinct().count(),
-        "newPatients": patients.filter(**in_range).count(),
-        "totalPatients": patients.count(),
-        "expenseCount": expenses.count(),
-        "refundCount": refunds.count(),
+        "paymentCount": sum(row["count"] for row in groups),
+        "patientsSeen": patients_seen,
+        "newPatients": patient_stats["new"],
+        "totalPatients": patient_stats["total"],
+        "expenseCount": expense_stats["count"],
+        "refundCount": refunds["count"],
         # Reuses the due-payments module rather than re-deriving it: that one
         # already handles partially-paid bills (outstanding is amount − paid,
         # not amount), and two implementations of "what is owed" would drift.
@@ -541,7 +609,7 @@ def branch_activity(*, branch_id=None, date_from: date, date_to: date) -> list[d
 
     patient_registrations = audit_in_range.filter(
         action=AuditLog.Action.CREATE, target_type="Patient"
-    )
+    ).select_related("actor")  # read per row below -- one query, not one per patient
     for entry in patient_registrations:
         name = entry.changes.get("name", "")
         rows.append(

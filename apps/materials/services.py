@@ -135,24 +135,35 @@ def sell_materials(
         if existing is not None:
             return existing, list(existing.sale_items.all()), False
 
+    # Every material in the cart, locked in ONE statement and in id order --
+    # not a locking query per line, and the same order for every concurrent
+    # sale, so two carts sharing items queue instead of deadlocking.
+    wanted_ids = [item["material_id"] for item in items]
+    materials = {
+        material.pk: material
+        for material in Material.objects.select_for_update()
+        .filter(pk__in=wanted_ids, branch=branch)
+        .order_by("pk")
+    }
+
     total = Decimal("0.00")
-    resolved: list[dict] = []
+    lines: dict[int, dict] = {}  # one line per material, in cart order
 
     for item in items:
         quantity = int(item["quantity"])
         if quantity <= 0:
             raise MaterialError("Quantity must be at least 1.", code="invalid_quantity")
 
-        try:
-            material = Material.objects.select_for_update().get(
-                pk=item["material_id"], branch=branch
-            )
-        except Material.DoesNotExist:
+        material = materials.get(item["material_id"])
+        if material is None:
             raise MaterialError(
                 "That item isn't available at this branch.", code="material_not_found"
-            ) from None
+            )
 
-        if material.quantity < quantity:
+        # The same material twice in one cart is one demand on the same stock:
+        # the check is against everything this cart asks of it so far.
+        asked = lines[material.pk]["quantity"] + quantity if material.pk in lines else quantity
+        if material.quantity < asked:
             raise MaterialError(
                 f"Only {material.quantity} of {material.name} in stock.",
                 code="insufficient_stock",
@@ -163,7 +174,9 @@ def sell_materials(
         unit_price = material.selling_price
         total += unit_price * quantity
 
-        resolved.append({"material": material, "quantity": quantity, "unit_price": unit_price})
+        lines[material.pk] = {"material": material, "quantity": asked, "unit_price": unit_price}
+
+    resolved = list(lines.values())
 
     payment, _created = payment_services.record_payment(
         actor=actor,
@@ -176,31 +189,36 @@ def sell_materials(
         idempotency_key=idempotency_key,
     )
 
-    sale_items = []
+    # Stock, the sale lines and the stock movements, each written in one
+    # statement however many items are in the cart.
     for row in resolved:
-        material = row["material"]
-        material.quantity -= row["quantity"]
-        material.save(update_fields=["quantity"])
+        row["material"].quantity -= row["quantity"]
+    Material.objects.bulk_update([row["material"] for row in resolved], ["quantity"])
 
-        sale_items.append(
-            MaterialSaleItem(
-                payment=payment,
-                material=material,
-                quantity=row["quantity"],
-                unit_price=row["unit_price"],
-            )
-        )
-
-        MaterialMovement.objects.create(
-            material=material,
-            type=MaterialMovement.Type.OUT,
+    sale_items = [
+        MaterialSaleItem(
+            payment=payment,
+            material=row["material"],
             quantity=row["quantity"],
-            note=f"Sold — {payment.receipt_number}",
-            branch=branch,
-            created_by=actor,
+            unit_price=row["unit_price"],
         )
-
+        for row in resolved
+    ]
     MaterialSaleItem.objects.bulk_create(sale_items)
+
+    MaterialMovement.objects.bulk_create(
+        [
+            MaterialMovement(
+                material=row["material"],
+                type=MaterialMovement.Type.OUT,
+                quantity=row["quantity"],
+                note=f"Sold — {payment.receipt_number}",
+                branch=branch,
+                created_by=actor,
+            )
+            for row in resolved
+        ]
+    )
 
     audit.record(
         actor=actor,
