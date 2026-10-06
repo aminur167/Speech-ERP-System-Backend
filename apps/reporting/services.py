@@ -32,7 +32,6 @@ from django.db.models.functions import TruncDate
 from django.utils import timezone
 
 from apps.common.models import AuditLog
-from apps.dailyclosing.models import DailyClosing
 from apps.duepayments.services import due_summary
 from apps.enrollments.models import InstallmentPlan, MonthlyEnrollment
 from apps.expenses.models import Expense
@@ -346,10 +345,6 @@ def branch_summary(*, branch_id=None, date_from: date, date_to: date) -> dict:
         .order_by("-amount")
     ]
 
-    closings = DailyClosing.objects.filter(date__gte=date_from, date__lte=date_to)
-    if branch_id:
-        closings = closings.filter(branch_id=branch_id)
-
     return {
         "dateFrom": date_from,
         "dateTo": date_to,
@@ -369,8 +364,6 @@ def branch_summary(*, branch_id=None, date_from: date, date_to: date) -> dict:
         "outstandingDue": due_summary(branch_id=branch_id)["totalDue"],
         "byMethod": by_method,
         "byCategory": by_category,
-        "closingsSubmitted": closings.count(),
-        "closingsMismatched": closings.exclude(status=DailyClosing.Status.MATCHED).count(),
     }
 
 
@@ -385,12 +378,6 @@ def daily_ledger(*, branch_id=None, date_from: date, date_to: date) -> list[dict
     Days with no activity at all are omitted rather than padded with zeros. A
     year-long range would otherwise be mostly empty rows, and a reader
     scanning for the day something went wrong has to skip past them.
-
-    Viewed across every branch (Admin without `?branch=`), the closing columns
-    aggregate: `closingDifference` sums each branch's variance for that day and
-    `closingStatus` reads "mismatched" if any one of them did not balance —
-    the safe direction to round, since it can only draw attention to a day
-    that deserves it.
     """
     rows: dict[date, dict] = {}
 
@@ -406,9 +393,6 @@ def daily_ledger(*, branch_id=None, date_from: date, date_to: date) -> list[dict
                 "refunded": Decimal("0.00"),
                 "expenseCount": 0,
                 "expenses": Decimal("0.00"),
-                "closingsSubmitted": 0,
-                "closingStatus": "",
-                "closingDifference": Decimal("0.00"),
             },
         )
 
@@ -458,18 +442,6 @@ def daily_ledger(*, branch_id=None, date_from: date, date_to: date) -> list[dict
         row = row_for(entry["day"])
         row["expenses"] = entry["amount"] or Decimal("0.00")
         row["expenseCount"] = entry["count"]
-
-    closings = DailyClosing.objects.filter(date__gte=date_from, date__lte=date_to)
-    if branch_id:
-        closings = closings.filter(branch_id=branch_id)
-    for closing in closings:
-        row = row_for(closing.date)
-        row["closingsSubmitted"] += 1
-        row["closingDifference"] += closing.difference
-        if closing.status != DailyClosing.Status.MATCHED:
-            row["closingStatus"] = "mismatched"
-        elif not row["closingStatus"]:
-            row["closingStatus"] = "matched"
 
     for row in rows.values():
         row["netRevenue"] = row["collected"] - row["refunded"] - row["expenses"]

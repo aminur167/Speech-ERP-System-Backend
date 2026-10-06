@@ -35,8 +35,6 @@ MAX_REQUESTS = 12
 ALLOWED_PATHS = frozenset(
     {
         "/branches/overview/",
-        "/daily-closing/today-summary/",
-        "/daily-closing/history/",
         "/due-payments/summary/",
         "/expenses/summary/",
         "/patients/directory/summary/",

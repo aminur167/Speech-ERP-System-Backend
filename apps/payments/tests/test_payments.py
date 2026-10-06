@@ -293,24 +293,6 @@ class TestVoid:
         assert response.status_code == 403
         assert response.json()["code"] == "not_same_day"
 
-    def test_manager_cannot_void_after_the_closing_is_submitted(
-        self, manager_client, manager, branch, payment
-    ):
-        """
-        The reconciliation cutoff: once the day is signed off, changing it
-        would invalidate the count that was signed off.
-        """
-        from apps.dailyclosing.services import submit_closing
-
-        submit_closing(actor=manager, branch=branch, actual_total=Decimal("800.00"))
-
-        response = manager_client.post(
-            reverse("payments:payment-void", args=[payment.id]), {"reason": "Too late"}
-        )
-
-        assert response.status_code == 403
-        assert response.json()["code"] == "closing_submitted"
-
     def test_admin_can_void_a_previous_day_payment(self, admin_client, payment):
         from datetime import timedelta
 

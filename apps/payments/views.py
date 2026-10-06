@@ -99,11 +99,11 @@ class PaymentViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
                 actor=request.user, payment=payment, reason=serializer.validated_data["reason"]
             )
         except services.PaymentError as exc:
-            # Same-day and closing-cutoff refusals are authorisation failures,
-            # not malformed input.
+            # The same-day refusal is an authorisation failure, not malformed
+            # input.
             http_status = (
                 status.HTTP_403_FORBIDDEN
-                if exc.code in {"not_same_day", "closing_submitted"}
+                if exc.code == "not_same_day"
                 else status.HTTP_400_BAD_REQUEST
             )
             return _error_response(exc, http_status)

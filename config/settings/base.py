@@ -62,7 +62,6 @@ LOCAL_APPS = [
     "apps.staff",
     "apps.duepayments",
     "apps.expenses",
-    "apps.dailyclosing",
     "apps.reporting",
     "apps.notifications",
 ]
@@ -195,7 +194,7 @@ SPECTACULAR_SETTINGS = {
     "TITLE": "Speech ERP API",
     "DESCRIPTION": (
         "Branch-scoped clinic management: patients, enrollments, payments, "
-        "materials, expenses, daily closing, and reporting. See docs/ in the "
+        "materials, expenses, and reporting. See docs/ in the "
         "repository for the business rules behind each endpoint."
     ),
     "VERSION": "1.0.0",
@@ -219,7 +218,6 @@ SPECTACULAR_SETTINGS = {
         {"name": "materials", "description": "Stock and the POS sale flow"},
         {"name": "due-payments", "description": "Outstanding dues, current and historical"},
         {"name": "expenses", "description": "Branch expenses and Admin approval"},
-        {"name": "daily-closing", "description": "Cash reconciliation and amendments"},
         {"name": "reporting", "description": "Transactions, dashboards, and analytics"},
     ],
 }

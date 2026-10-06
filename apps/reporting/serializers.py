@@ -84,8 +84,6 @@ class BranchSummarySerializer(serializers.Serializer):
     totalPatients = serializers.IntegerField()
     expenseCount = serializers.IntegerField()
     refundCount = serializers.IntegerField()
-    closingsSubmitted = serializers.IntegerField()
-    closingsMismatched = serializers.IntegerField()
 
     byMethod = ByMethodRowSerializer(many=True)
     byCategory = RevenueByCategoryRowSerializer(many=True)
@@ -122,7 +120,3 @@ class DailyLedgerRowSerializer(serializers.Serializer):
     expenseCount = serializers.IntegerField()
     expenses = serializers.DecimalField(max_digits=14, decimal_places=2)
     netRevenue = serializers.DecimalField(max_digits=14, decimal_places=2)
-    closingsSubmitted = serializers.IntegerField()
-    # "", "matched" or "mismatched" — empty when the day was never closed.
-    closingStatus = serializers.CharField(allow_blank=True)
-    closingDifference = serializers.DecimalField(max_digits=14, decimal_places=2)

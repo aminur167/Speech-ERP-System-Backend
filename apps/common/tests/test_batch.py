@@ -22,7 +22,6 @@ PARAMS = {
     "/transactions/trend/": {"days": "7"},
     "/transactions/by-category/": {},
     "/transactions/by-method/": {},
-    "/daily-closing/history/": {},
     "/branches/overview/": {},
 }
 

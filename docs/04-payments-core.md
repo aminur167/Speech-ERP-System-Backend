@@ -85,11 +85,11 @@ Never mutate the original payment's `amount` or delete it. Status transitions to
 
 Manager can void a payment they took **on the same calendar day**, with a required reason.
 
-**Hard cutoff: voiding is blocked once that day's Daily Closing has been submitted.** Before closing, the day's cash is still being counted and a correction is just bookkeeping. After closing, the day has been reconciled and signed off — silently changing a settled day would invalidate the reconciliation. After that point the correction path is a refund (or an Admin closing amendment per `09`).
+Once the day is over, the correction path is a refund, which Admin approves. (There used to be an earlier cutoff at the day's Daily Closing; that feature was removed on 2026-10-01 — see `09`.)
 
 - Payment from a previous day → Manager gets 403 with a message pointing to the refund flow.
 - Reason required; recorded in the audit log with the acting user.
-- Admin can void any payment regardless of day (they own the amendment path anyway).
+- Admin can void any payment regardless of day.
 
 ---
 
@@ -181,7 +181,7 @@ Payments are mostly created *through* other flows rather than posted directly, s
 |---|---|---|
 | POST | `/payments/` | Direct creation (daily service enrollment, online booking advance). Requires idempotency key |
 | GET | `/payments/{id}/` | Branch-scoped |
-| POST | `/payments/{id}/void/` | **Manager** (same day, before closing) or Admin. `{ reason }` |
+| POST | `/payments/{id}/void/` | **Manager** (same day) or Admin. `{ reason }` |
 | POST | `/payments/{id}/refund-requests/` | **Manager** — `{ amount, reason }` |
 | GET | `/refund-requests/` | `?status=pending` — the Admin approval queue |
 | POST | `/refund-requests/{id}/approve/` | **Admin only** — `{ billAction, refundMethod, reviewNote? }` |
@@ -219,12 +219,11 @@ This module deserves the most thorough suite in the project.
 - Replaying a key after a delay (the offline-queue case) still returns the original, doesn't create a duplicate.
 
 **Void**
-- Manager voiding a **same-day** payment before closing → succeeds, status `void`, original `amount` unchanged.
+- Manager voiding a **same-day** payment → succeeds, status `void`, original `amount` unchanged.
 - Manager voiding a **previous-day** payment → 403.
-- Manager voiding a same-day payment **after Daily Closing was submitted** → 403 (the reconciliation cutoff — test explicitly).
 - Voiding without a reason → validation error.
 - Admin can void regardless of day.
-- Voided payment excluded from revenue totals and from that day's closing `system_total`.
+- Voided payment excluded from revenue totals.
 
 **Refund request flow (separation of duties — the highest-value tests here)**
 - Manager creates a refund request → `pending`; the payment is **still `paid`** (nothing changes until approval).

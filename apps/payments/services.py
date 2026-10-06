@@ -6,7 +6,6 @@ receipt numbering, idempotency and audit behave identically whether the money
 came from a daily service, a bill, a booking or the materials counter.
 """
 
-from datetime import date
 from decimal import Decimal
 
 from django.db import transaction
@@ -120,30 +119,15 @@ def create_payment(
 # ---------------------------------------------------------------------------
 
 
-def _closing_submitted_for(branch: Branch, day: date) -> bool:
-    """
-    Has this branch signed off that day's cash yet?
-
-    Imported lazily so payments doesn't hard-depend on the daily-closing app
-    at module load; the modules are built in separate phases.
-    """
-    try:
-        from apps.dailyclosing.models import DailyClosing
-    except (ImportError, LookupError):
-        return False
-    return DailyClosing.objects.filter(branch=branch, date=day).exists()
-
-
 @transaction.atomic
 def void_payment(*, actor, payment: Payment, reason: str) -> Payment:
     """
     Cancel a payment that never really happened.
 
-    Managers may only void the current day's payments, and only before that
-    day's closing is submitted. Before closing, the cash is still being
-    counted and a correction is bookkeeping; after closing, the day has been
-    reconciled and signed off, so changing it would invalidate the
-    reconciliation. From that point the path is a refund.
+    Managers may only void the current day's payments: the same day, a
+    mistaken entry is bookkeeping; once the day is over, money that was
+    taken is given back through a refund, which Admin approves. Admin may
+    void any day.
     """
     if not reason or not reason.strip():
         raise PaymentError("A reason is required to void a payment.", code="reason_required")
@@ -161,13 +145,6 @@ def void_payment(*, actor, payment: Payment, reason: str) -> Payment:
             raise PaymentError(
                 "Only today's payments can be voided. Request a refund instead.",
                 code="not_same_day",
-            )
-
-        if _closing_submitted_for(payment.branch, payment_day):
-            raise PaymentError(
-                "Today's closing has already been submitted, so this payment can no "
-                "longer be voided. Request a refund instead.",
-                code="closing_submitted",
             )
 
     payment.status = PaymentStatus.VOID

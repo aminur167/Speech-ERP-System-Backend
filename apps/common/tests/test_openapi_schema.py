@@ -51,7 +51,7 @@ def test_every_endpoint_group_is_represented():
     for prefix in (
         "/api/auth/", "/api/branches/", "/api/patients/", "/api/services/",
         "/api/payments/", "/api/enrollments/", "/api/materials/",
-        "/api/due-payments/", "/api/expenses/", "/api/daily-closing/",
+        "/api/due-payments/", "/api/expenses/",
         "/api/transactions/",
     ):
         assert any(p.startswith(prefix) for p in paths), f"nothing under {prefix}"

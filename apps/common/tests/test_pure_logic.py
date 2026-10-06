@@ -17,7 +17,6 @@ import pytest
 
 from apps.common.sequences import format_code
 from apps.common.validators import normalize_phone, validate_bd_phone
-from apps.dailyclosing.models import DailyClosing
 from apps.enrollments.models import due_date_for_month
 from apps.enrollments.services import add_months, month_key, month_label
 from apps.patients.models import calculate_age
@@ -173,38 +172,6 @@ class TestDueDate:
 
     def test_february(self):
         assert due_date_for_month("2026-02") == date(2026, 2, 5)
-
-
-class TestClosingReconciliation:
-    """
-    Difference and status are computed server-side — accepting them from the
-    client would let a screen claim a day balanced when it didn't.
-    """
-
-    def test_exact_match(self):
-        difference, status = DailyClosing.compute(Decimal("2300.00"), Decimal("2300.00"))
-        assert difference == Decimal("0.00")
-        assert status == DailyClosing.Status.MATCHED
-
-    def test_over(self):
-        difference, status = DailyClosing.compute(Decimal("2300.00"), Decimal("2500.00"))
-        assert difference == Decimal("200.00")
-        assert status == DailyClosing.Status.OVER
-
-    def test_short(self):
-        difference, status = DailyClosing.compute(Decimal("2300.00"), Decimal("2000.00"))
-        assert difference == Decimal("-300.00")
-        assert status == DailyClosing.Status.SHORT
-
-    def test_one_paisa_short_is_still_short(self):
-        """Exactness matters — a rounding fudge here hides real discrepancies."""
-        difference, status = DailyClosing.compute(Decimal("2300.00"), Decimal("2299.99"))
-        assert difference == Decimal("-0.01")
-        assert status == DailyClosing.Status.SHORT
-
-    def test_zero_day_matches(self):
-        difference, status = DailyClosing.compute(Decimal("0.00"), Decimal("0.00"))
-        assert status == DailyClosing.Status.MATCHED
 
 
 class TestInstallmentSplitArithmetic:

@@ -108,7 +108,6 @@ Offline-first is mostly a frontend build, but it imposes hard constraints on the
   2. A branch-prefixed provisional number reconciled on sync (receipt reprints with the final number).
   
   Decide this before building the payment module — it affects the receipt-number scheme in `04-payments-core.md`. Don't leave it to integration time.
-- **Daily closing can't be computed offline** — `system_total` is derived server-side from Payments. If a branch closes the day while offline, the closing must wait for sync, and the UI must say so rather than showing a wrong total. Flag any unsynced payments on the closing screen.
 
 ### Scope note
 
@@ -140,6 +139,6 @@ This is a substantial piece of work — larger than any single module in `01`–
 | `06-materials.md` | Material + MaterialMovement, stock adjustment, POS-style sell flow |
 | `07-due-payments.md` | Aggregated due-items view, collection action, historical "due as of date" reconstruction |
 | `08-expenses.md` | Expense model, auto-approve threshold rule |
-| `09-daily-closing.md` | DailyClosing model, system-vs-actual reconciliation |
+| `09-daily-closing.md` | **Removed (2026-10-01)** — why, and where its data still lives |
 | `10-transactions-reporting.md` | All reporting/analytics/dashboard endpoints |
 | `ROADMAP.md` | Build order across all of the above |
