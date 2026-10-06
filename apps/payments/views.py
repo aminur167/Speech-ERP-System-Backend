@@ -1,5 +1,6 @@
 """Payment, void, and refund endpoints."""
 
+from django.db.models import Prefetch
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -11,7 +12,7 @@ from apps.common.ordering import pending_first
 from apps.common.permissions import IsAdmin, IsManager
 from apps.patients.models import Patient
 from apps.payments import services
-from apps.payments.models import Payment, RefundRequest
+from apps.payments.models import Payment, RefundRequest, RefundRequestItem
 from apps.payments.serializers import (
     PaymentCreateSerializer,
     PaymentSerializer,
@@ -153,8 +154,13 @@ class RefundRequestViewSet(BranchScopedQuerySetMixin, viewsets.ReadOnlyModelView
     """
 
     queryset = RefundRequest.objects.select_related(
-        "payment", "payment__patient", "payment__branch", "requested_by", "reviewed_by"
-    ).prefetch_related("items__material")
+        "payment", "payment__patient", "payment__branch", "payment__collected_by",
+        "requested_by", "reviewed_by",
+    ).prefetch_related(
+        # The lines and their materials in one read (the join), not one read
+        # for the lines and another for the materials.
+        Prefetch("items", queryset=RefundRequestItem.objects.select_related("material"))
+    )
     serializer_class = RefundRequestSerializer
     filterset_fields = ["status"]
 

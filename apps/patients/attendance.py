@@ -126,25 +126,40 @@ def service_names_by_patient(patient_ids, *, kind: str, on: date) -> dict[int, l
     a patient holding two monthly services is marked once, and the manager
     needs to see which two that single mark covers.
     """
+    return services_and_start_by_patient(patient_ids, kind=kind, on=on)[0]
+
+
+def services_and_start_by_patient(
+    patient_ids, *, kind: str, on: date
+) -> tuple[dict[int, list[str]], dict[int, date]]:
+    """
+    For each patient, the names of the services running on `on` AND the day
+    the oldest of them began -- both read from the same rows, so one query.
+    """
     rows = (
         enrollments_covering(kind=kind, on=on)
         .filter(patient_id__in=patient_ids)
-        .select_related("service")
         .order_by("patient_id", "service__name")
-        .values_list("patient_id", "service__name")
+        .values_list("patient_id", "service__name", "created_at")
     )
-    found: dict[int, list[str]] = defaultdict(list)
-    for patient_id, service_name in rows:
-        if service_name not in found[patient_id]:
-            found[patient_id].append(service_name)
-    return found
+    names: dict[int, list[str]] = defaultdict(list)
+    started: dict[int, date] = {}
+    for patient_id, service_name, created_at in rows:
+        if service_name not in names[patient_id]:
+            names[patient_id].append(service_name)
+        began = timezone.localtime(created_at).date()
+        if patient_id not in started or began < started[patient_id]:
+            started[patient_id] = began
+    return names, started
 
 
 def records_by_patient(patient_ids, *, kind: str, on: date) -> dict[int, PatientAttendance]:
     """That day's marks, keyed by patient. A missing key means not yet marked."""
+    # `marked_by` joined: every marked row on the sheet shows who marked it,
+    # which was otherwise one extra query per marked row.
     records = PatientAttendance.objects.filter(
         patient_id__in=patient_ids, service_kind=kind, date=on
-    )
+    ).select_related("marked_by")
     return {record.patient_id: record for record in records}
 
 
@@ -189,14 +204,15 @@ def open_informed_absences(patient_ids, *, kind: str, on: date) -> dict[int, dat
             status=PatientAttendance.Status.INFORMED_ABSENCE,
             date__lte=on,
         )
+        # Newest notice per patient, chosen by the database (DISTINCT ON), so
+        # only one row per patient is read, not the whole history of notices.
         .order_by("patient_id", "-date")
+        .distinct("patient_id")
         .values_list("patient_id", "date", "expected_return_on")
     )
 
     until: dict[int, date] = {}
     for patient_id, told_on, expected_return in rows:
-        if patient_id in until:
-            continue  # newest notice per patient wins
         until[patient_id] = expected_return or (told_on + grace)
     return {pid: day for pid, day in until.items() if day >= on}
 
@@ -231,7 +247,6 @@ def days_since_last_visit(last_present: date | None, *, joined_on: date, on: dat
     return (on - (last_present or joined_on)).days
 
 
-@transaction.atomic
 def mark(
     *, actor, patient: Patient, kind: str, status: str,
     on: date | None = None, note: str = "", expected_return_on: date | None = None,
@@ -239,30 +254,35 @@ def mark(
     """
     Record one patient's attendance for one day — an upsert, not an append.
 
-    `get_or_create` under a row lock on the unique key, so pressing the button
-    twice, or two managers marking the same person at once, leaves one row
-    with the last answer rather than a duplicate the constraint would reject.
+    One `INSERT ... ON CONFLICT DO UPDATE` on the unique key, so pressing the
+    button twice, or two managers marking the same person at once, leaves one
+    row with the last answer rather than a duplicate the constraint would
+    reject. The database does the lock-and-decide that a locking read plus a
+    create-or-update used to do in four statements (and a savepoint), and one
+    statement needs no transaction wrapped around it.
     """
     day = on or timezone.localdate()
 
-    record, _created = PatientAttendance.objects.select_for_update().get_or_create(
+    record = PatientAttendance(
         patient=patient,
+        branch_id=patient.branch_id,
         service_kind=kind,
         date=day,
-        defaults={"branch": patient.branch, "status": status},
+        status=status,
+        note=note,
+        # Only an informed absence carries a return date; clearing it on every
+        # other status stops a stale date from silencing the alert for someone
+        # who has since been marked absent.
+        expected_return_on=(
+            expected_return_on if status == PatientAttendance.Status.INFORMED_ABSENCE else None
+        ),
+        marked_by=actor if actor and actor.is_authenticated else None,
     )
-
-    record.status = status
-    record.note = note
-    # Only an informed absence carries a return date; clearing it on every
-    # other status stops a stale date from silencing the alert for someone
-    # who has since been marked absent.
-    record.expected_return_on = (
-        expected_return_on if status == PatientAttendance.Status.INFORMED_ABSENCE else None
-    )
-    record.marked_by = actor if actor and actor.is_authenticated else None
-    record.save(
-        update_fields=["status", "note", "expected_return_on", "marked_by", "updated_at"]
+    PatientAttendance.objects.bulk_create(
+        [record],
+        update_conflicts=True,
+        unique_fields=["patient", "service_kind", "date"],
+        update_fields=["status", "note", "expected_return_on", "marked_by", "updated_at"],
     )
     return record
 
@@ -277,11 +297,10 @@ def build_roster(*, patients, kind: str, on: date, branch_id=None) -> list[dict]
     add a query.
     """
     ids = [patient.id for patient in patients]
-    services = service_names_by_patient(ids, kind=kind, on=on)
+    services, started = services_and_start_by_patient(ids, kind=kind, on=on)
     today_records = records_by_patient(ids, kind=kind, on=on)
     last_present = last_present_by_patient(ids, kind=kind, on=on)
     excused_until = open_informed_absences(ids, kind=kind, on=on)
-    started = _service_started_by_patient(ids, kind=kind, on=on)
 
     alert_after = SystemSettings.get_solo().stopped_coming_after_days
 
@@ -314,14 +333,3 @@ def build_roster(*, patients, kind: str, on: date, branch_id=None) -> list[dict]
             }
         )
     return rows
-
-
-def _service_started_by_patient(patient_ids, *, kind: str, on: date) -> dict[int, date]:
-    """When each patient's oldest service of this kind running on `on` began."""
-    rows = (
-        enrollments_covering(kind=kind, on=on)
-        .filter(patient_id__in=patient_ids)
-        .values("patient_id")
-        .annotate(started=Min("created_at"))
-    )
-    return {row["patient_id"]: timezone.localtime(row["started"]).date() for row in rows}

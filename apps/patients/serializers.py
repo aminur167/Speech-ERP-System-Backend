@@ -66,7 +66,12 @@ class PatientSerializer(serializers.ModelSerializer):
         N+1 risk.
         """
         if not hasattr(self, "_overdue_cache"):
-            self._overdue_cache = overdue_status_by_patient([obj.id]).get(obj.id)
+            if self.context.get("just_registered"):
+                # A patient registered a moment ago has no bills or
+                # installments, so nothing can be overdue: no query needed.
+                self._overdue_cache = None
+            else:
+                self._overdue_cache = overdue_status_by_patient([obj.id]).get(obj.id)
         return self._overdue_cache
 
     def get_serviceStatus(self, obj) -> str:

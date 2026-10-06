@@ -13,7 +13,7 @@ from django.db import connection, transaction
 
 from apps.common import audit
 from apps.common.models import AuditLog, CodeSequence
-from apps.common.sequences import format_code, generate, next_value
+from apps.common.sequences import format_code, generate, next_value, next_values
 
 pytestmark = pytest.mark.django_db
 
@@ -139,6 +139,76 @@ class TestCodeSequenceConcurrency:
         assert len(results) == worker_count
         assert len(set(results)) == worker_count, f"duplicates issued: {sorted(results)}"
         assert sorted(results) == list(range(1, worker_count + 1))
+
+
+class TestNextValues:
+    """Several numbers in one statement: same guarantees, one round trip."""
+
+    def test_each_scope_counts_on_its_own(self):
+        with transaction.atomic():
+            assert next_values([("rcpt", 2026), ("txn", 2026)]) == [1, 1]
+            assert next_values([("rcpt", 2026), ("txn", 2026)]) == [2, 2]
+            assert next_value("rcpt", 2026) == 3
+
+    def test_values_come_back_in_the_order_asked(self):
+        with transaction.atomic():
+            next_value("b", 2026)
+            next_value("b", 2026)
+            assert next_values([("b", 2026), ("a", 2026)]) == [3, 1]
+
+    def test_it_is_one_statement(self):
+        from django.test.utils import CaptureQueriesContext
+
+        with transaction.atomic(), CaptureQueriesContext(connection) as ctx:
+            next_values([("one", 2026), ("two", 2026), ("three", 2026)])
+        assert len(ctx.captured_queries) == 1
+
+    def test_the_same_scope_twice_in_one_draw_is_refused(self):
+        with pytest.raises(ValueError):
+            next_values([("x", 2026), ("x", 2026)])
+
+
+@pytest.mark.slow
+@pytest.mark.money
+class TestNextValuesConcurrency:
+    """
+    Real threads on PostgreSQL. Two properties: no number is ever issued
+    twice, and callers asking for the same pair in OPPOSITE orders never
+    deadlock -- the draw takes its locks in a fixed order whatever order it
+    was asked in.
+    """
+
+    def test_concurrent_pairs_never_duplicate_and_never_deadlock(self, django_db_blocker):
+        import uuid
+
+        left, right = f"left-{uuid.uuid4()}", f"right-{uuid.uuid4()}"
+        results, errors = [], []
+        workers = 12
+
+        def worker(index):
+            pairs = [(left, 2026), (right, 2026)]
+            if index % 2:
+                pairs.reverse()  # half of them ask in the opposite order
+            try:
+                with django_db_blocker.unblock():
+                    with transaction.atomic():
+                        drawn = dict(zip(pairs, next_values(pairs)))
+                        results.append((drawn[(left, 2026)], drawn[(right, 2026)]))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(workers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        assert not errors, f"workers raised: {errors}"
+        assert len(results) == workers
+        assert sorted(a for a, _ in results) == list(range(1, workers + 1))
+        assert sorted(b for _, b in results) == list(range(1, workers + 1))
 
 
 class TestAuditLog:

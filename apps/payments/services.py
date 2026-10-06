@@ -199,16 +199,26 @@ def request_refund(
             code="already_settled",
         )
 
-    if payment.refund_requests.filter(status=RefundRequest.Status.PENDING).exists():
+    # The payment's open and approved refund requests, in one read: whether
+    # one is already pending, and how much has already been returned.
+    prior = list(
+        payment.refund_requests.filter(
+            status__in=[RefundRequest.Status.PENDING, RefundRequest.Status.APPROVED]
+        ).values_list("status", "amount")
+    )
+    if any(status == RefundRequest.Status.PENDING for status, _amount in prior):
         raise PaymentError(
             "A refund request is already pending on this payment.", code="already_pending"
         )
 
     resolved_amount, resolved_items = _resolve_refund_amount(payment, amount, items)
 
-    if resolved_amount > payment.refundable_amount:
+    refundable = payment.amount - sum(
+        (prior_amount for _status, prior_amount in prior), Decimal("0.00")
+    )
+    if resolved_amount > refundable:
         raise PaymentError(
-            f"Only {payment.refundable_amount} remains refundable on this payment.",
+            f"Only {refundable} remains refundable on this payment.",
             code="exceeds_refundable",
         )
 
@@ -370,7 +380,7 @@ def approve_refund(
         actor=actor,
         action=AuditLog.Action.REFUND_APPROVE,
         target=request,
-        branch=request.branch,
+        branch=request.payment.branch,  # same branch, already loaded with the payment
         reason=review_note or request.reason,
         changes={
             "payment": payment.receipt_number,
@@ -434,7 +444,7 @@ def _restore_material_stock(*, actor, request: RefundRequest) -> None:
             type=MaterialMovement.Type.IN,
             quantity=line.quantity,
             note=f"Refund — {request.payment.receipt_number}",
-            branch=request.branch,
+            branch_id=request.branch_id,
             created_by=actor,
         )
 
@@ -468,7 +478,7 @@ def _apply_bill_action(*, actor, request: RefundRequest) -> None:
             actor=actor,
             action=AuditLog.Action.WRITE_OFF,
             target=target,
-            branch=request.branch,
+            branch=request.payment.branch,
             reason=request.reason,
         )
         return
@@ -511,7 +521,7 @@ def reject_refund(*, actor, request: RefundRequest, review_note: str) -> RefundR
         actor=actor,
         action=AuditLog.Action.REFUND_REJECT,
         target=request,
-        branch=request.branch,
+        branch=request.payment.branch,  # same branch, already loaded with the payment
         reason=review_note,
     )
 

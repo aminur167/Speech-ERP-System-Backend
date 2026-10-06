@@ -58,6 +58,9 @@ def create_patient(
         branch=branch,
         changes={"patient_code": patient.patient_code, "name": patient.name},
     )
+    # Tells the caller this patient was registered by this very call (not a
+    # replayed key handing back an existing one): nothing can be owed yet.
+    patient.just_created = True
     return patient
 
 

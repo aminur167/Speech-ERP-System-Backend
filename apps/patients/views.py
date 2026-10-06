@@ -216,7 +216,12 @@ class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
             actor=request.user, branch=branch, data=data,
             idempotency_key=idempotency_key, client_created_at=client_created_at,
         )
-        return Response(PatientSerializer(patient).data, status=status.HTTP_201_CREATED)
+        return Response(
+            PatientSerializer(
+                patient, context={"just_registered": getattr(patient, "just_created", False)}
+            ).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     def update(self, request, *args, **kwargs):
         patient = self.get_object()

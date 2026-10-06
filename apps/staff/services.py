@@ -121,56 +121,64 @@ def _ensure_check_in_window_is_open(now) -> None:
         )
 
 
-@transaction.atomic
+def _upsert_attendance(record: StaffAttendance, *, update_fields: list[str]) -> StaffAttendance:
+    """
+    Write today's row for this staff member, creating it or updating it.
+
+    One `INSERT ... ON CONFLICT DO UPDATE` on the (staff, date) unique key:
+    the database does the lock-and-decide that a locking read, a
+    create-if-missing and a separate update used to do in several statements
+    (and a savepoint), and a single statement needs no transaction around it.
+    `record` carries the values a NEW row starts with; `update_fields` names
+    the ones an EXISTING row takes from it -- the rest of an existing row is
+    left exactly as it was.
+    """
+    StaffAttendance.objects.bulk_create(
+        [record],
+        update_conflicts=True,
+        unique_fields=["staff", "date"],
+        update_fields=update_fields,
+    )
+    return record
+
+
 def check_in(*, staff: StaffMember) -> StaffAttendance:
     now = timezone.now()
     _ensure_check_in_window_is_open(now)
-    today = timezone.localdate()
 
-    record, _created = StaffAttendance.objects.select_for_update().get_or_create(
-        staff=staff,
-        date=today,
-        defaults={"branch": staff.branch, "status": StaffAttendance.Status.PRESENT},
+    return _upsert_attendance(
+        StaffAttendance(
+            staff=staff, branch_id=staff.branch_id, date=timezone.localdate(),
+            check_in_at=now, check_out_at=None, status=StaffAttendance.Status.PRESENT,
+        ),
+        update_fields=["check_in_at", "check_out_at", "status"],
     )
-    record.check_in_at = now
-    record.check_out_at = None
-    record.status = StaffAttendance.Status.PRESENT
-    record.save(update_fields=["check_in_at", "check_out_at", "status"])
-    return record
 
 
-@transaction.atomic
 def check_out(*, staff: StaffMember) -> StaffAttendance:
     now = timezone.now()
     _ensure_office_is_open(now, action="check out")
-    today = timezone.localdate()
-    record, _created = StaffAttendance.objects.select_for_update().get_or_create(
-        staff=staff,
-        date=today,
-        defaults={
-            "branch": staff.branch,
-            "status": StaffAttendance.Status.PRESENT,
-            "check_in_at": now,
-        },
+
+    # A day with no check-in yet starts as present-since-now; the check-out
+    # itself then closes it. An existing row keeps its own check-in time.
+    return _upsert_attendance(
+        StaffAttendance(
+            staff=staff, branch_id=staff.branch_id, date=timezone.localdate(),
+            check_in_at=now, check_out_at=now, status=_status_for_check_out(now),
+        ),
+        update_fields=["check_out_at", "status"],
     )
-    record.check_out_at = now
-    record.status = _status_for_check_out(now)
-    record.save(update_fields=["check_out_at", "status"])
-    return record
 
 
-@transaction.atomic
 def mark_attendance(*, staff: StaffMember, status: str) -> StaffAttendance:
     """Manager override for a day the person didn't check in themselves — on leave or absent."""
-    today = timezone.localdate()
-    record, _created = StaffAttendance.objects.select_for_update().get_or_create(
-        staff=staff, date=today, defaults={"branch": staff.branch, "status": status}
+    return _upsert_attendance(
+        StaffAttendance(
+            staff=staff, branch_id=staff.branch_id, date=timezone.localdate(),
+            check_in_at=None, check_out_at=None, status=status,
+        ),
+        update_fields=["status", "check_in_at", "check_out_at"],
     )
-    record.status = status
-    record.check_in_at = None
-    record.check_out_at = None
-    record.save(update_fields=["status", "check_in_at", "check_out_at"])
-    return record
 
 
 def mark_no_show_absentees(staff_queryset) -> int:

@@ -574,7 +574,16 @@ def collect_bill_payment(
 
     # Lock the row so two managers collecting the same bill can't both succeed.
     bill = MonthlyBill.objects.select_for_update().get(pk=bill.pk)
+    bill.enrollment = enrollment
 
+    return _collect_locked_bill(
+        actor=actor, branch=branch, enrollment=enrollment, bill=bill,
+        method=method, idempotency_key=idempotency_key,
+    )
+
+
+def _collect_locked_bill(*, actor, branch, enrollment, bill, method, idempotency_key):
+    """The collection proper, for a bill the caller has already locked."""
     if bill.is_settled or bill.status in CLOSED_STATUSES:
         raise EnrollmentError("This bill has already been settled.", code="already_paid")
 
@@ -618,9 +627,16 @@ def collect_bill_payment_by_id(
     except MonthlyBill.DoesNotExist:
         raise EnrollmentError("Bill not found.", code="bill_not_found") from None
     bill.enrollment = enrollment
-    return collect_bill_payment.in_transaction(
-        actor=actor, branch=branch, bill=bill, method=method,
-        idempotency_key=idempotency_key,
+
+    # A replay returns the original result (see collect_bill_payment).
+    if idempotency_key:
+        existing = Payment.all_objects.filter(idempotency_key=idempotency_key).first()
+        if existing is not None:
+            return existing, bill
+
+    return _collect_locked_bill(
+        actor=actor, branch=branch, enrollment=enrollment, bill=bill,
+        method=method, idempotency_key=idempotency_key,
     )
 
 
@@ -1571,16 +1587,8 @@ def create_booking(
         service.fee * Decimal(str(settings.BOOKING_ADVANCE_RATIO))
     ).quantize(Decimal("0.01"))
 
-    booking = Booking.objects.create(
-        booking_code=code,
-        patient=patient,
-        service=service,
-        branch=branch,
-        date=booking_date,
-        time=booking_time,
-        advance_amount=advance_amount,
-    )
-
+    # The advance is taken first so the booking is written once, already
+    # pointing at its payment, instead of being written and then updated.
     payment, _ = payment_services.record_payment(
         actor=actor,
         branch=branch,
@@ -1592,8 +1600,16 @@ def create_booking(
         idempotency_key=idempotency_key,
     )
 
-    booking.payment = payment
-    booking.save(update_fields=["payment"])
+    booking = Booking.objects.create(
+        booking_code=code,
+        patient=patient,
+        service=service,
+        branch=branch,
+        date=booking_date,
+        time=booking_time,
+        advance_amount=advance_amount,
+        payment=payment,
+    )
 
     audit.record(
         actor=actor,

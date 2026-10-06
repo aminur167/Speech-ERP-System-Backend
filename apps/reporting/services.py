@@ -607,9 +607,27 @@ def branch_activity(*, branch_id=None, date_from: date, date_to: date) -> list[d
     if branch_id:
         audit_in_range = audit_in_range.filter(branch_id=branch_id)
 
-    patient_registrations = audit_in_range.filter(
-        action=AuditLog.Action.CREATE, target_type="Patient"
-    ).select_related("actor")  # read per row below -- one query, not one per patient
+    salary_action_label = {
+        AuditLog.Action.CREATE: "requested",
+        AuditLog.Action.APPROVE: "approved",
+        AuditLog.Action.REJECT: "rejected",
+    }
+    # Patient registrations, service enrollments and salary decisions all
+    # come from the audit log: read together in ONE query (with the actor
+    # joined, since each row names who did it), then told apart here.
+    audit_rows = list(
+        audit_in_range.filter(
+            Q(
+                action=AuditLog.Action.CREATE,
+                target_type__in=["Patient", "MonthlyEnrollment", "InstallmentPlan"],
+            )
+            | Q(action__in=list(salary_action_label), target_type="SalaryPayment")
+        ).select_related("actor")
+    )
+    patient_registrations = [
+        entry for entry in audit_rows
+        if entry.action == AuditLog.Action.CREATE and entry.target_type == "Patient"
+    ]
     for entry in patient_registrations:
         name = entry.changes.get("name", "")
         rows.append(
@@ -627,12 +645,11 @@ def branch_activity(*, branch_id=None, date_from: date, date_to: date) -> list[d
             }
         )
 
-    enrollment_logs = list(
-        audit_in_range.filter(
-            action=AuditLog.Action.CREATE,
-            target_type__in=["MonthlyEnrollment", "InstallmentPlan"],
-        ).select_related("actor")
-    )
+    enrollment_logs = [
+        entry for entry in audit_rows
+        if entry.action == AuditLog.Action.CREATE
+        and entry.target_type in ("MonthlyEnrollment", "InstallmentPlan")
+    ]
     monthly_by_id = {
         str(row.id): row
         for row in MonthlyEnrollment.objects.filter(
@@ -667,16 +684,7 @@ def branch_activity(*, branch_id=None, date_from: date, date_to: date) -> list[d
             }
         )
 
-    salary_action_label = {
-        AuditLog.Action.CREATE: "requested",
-        AuditLog.Action.APPROVE: "approved",
-        AuditLog.Action.REJECT: "rejected",
-    }
-    salary_logs = list(
-        audit_in_range.filter(
-            action__in=list(salary_action_label), target_type="SalaryPayment"
-        ).select_related("actor")
-    )
+    salary_logs = [entry for entry in audit_rows if entry.target_type == "SalaryPayment"]
     salary_by_id = {
         str(row.id): row
         for row in SalaryPayment.objects.filter(

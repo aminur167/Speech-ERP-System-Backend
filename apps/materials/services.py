@@ -71,7 +71,12 @@ def adjust_stock(
     if quantity <= 0:
         raise MaterialError("Quantity must be at least 1.", code="invalid_quantity")
 
+    # The branch comes from the material the caller already has (the view
+    # loaded it with the material); the locking re-read below would otherwise
+    # leave it to be fetched again for the movement and the audit entry.
+    branch = material.branch
     material = Material.objects.select_for_update().get(pk=material.pk)
+    material.branch = branch
 
     delta = quantity if movement_type == MaterialMovement.Type.IN else -quantity
     new_quantity = material.quantity + delta

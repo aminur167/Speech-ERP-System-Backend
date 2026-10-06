@@ -205,6 +205,119 @@ collect installment 36 → 27, enroll + admit fee 30 → 26, daily payment
   A paid Render instance (more CPU, never sleeps) or the VPS plan below is
   the change that makes every action several times faster.
 
+## 2026-10-06 — Pass 4: fewer database round trips per request
+
+Asked for: the same behaviour with fewer queries — one or two where several
+were used for one job. Every statement is a network round trip to the hosted
+database, so this is most of what a request costs on the clinic's server.
+
+**Measured first, then changed.** 69 endpoints, realistic data (60 patients
+with bills, payments, refunds, expenses, staff, attendance), writes counted
+in real transactions (BEGIN/COMMIT included). **454 → 305 queries** across
+the set, and — more important than the total — most reads no longer grow with
+the data. The numbers below are per request, after the login lookup.
+
+| Endpoint | Before | After |
+|---|---|---|
+| Admin branches overview (7 branches) | 26 | 4 |
+| Dashboard batch (8 summaries) | 27 | 12 |
+| Transactions summary | 9 | 4 |
+| Branch summary | 15 | 8 |
+| Expenses summary | 7 | 2 |
+| Patient directory summary | 5 | 2 |
+| Staff summary | 6 | 4 |
+| Patient directory (page) | 10 | 6 |
+| Pay an installment | 29 | 10 |
+| Enroll monthly + admit fee | 26 | 14 |
+| Pay a monthly bill | 18 | 12 |
+| Sell materials (2 items) | 19 | 12 — and flat however big the cart |
+| Book a session | 16 | 11 |
+| Register a patient | 9 | 6 |
+| Mark a patient's attendance | 10 | 6 |
+| Staff check-in | 9 | 5 |
+| Request / approve a refund | 12 / 13 | 10 / 11 |
+
+What was done, grouped by the kind of waste (rollback: `git revert` the commit
+named; each is independent of the others unless noted):
+
+1. **Same row read twice.** The branch is joined to the user at login
+   (`apps/accounts/authentication.py`) so views stop re-fetching it; refund and
+   adjust-stock reuse the branch already loaded; pay-bill / pay-installment read
+   the enrollment or plan once and re-read only what they changed.
+2. **Many figures, many queries → one conditional aggregate.** Transactions,
+   dashboard metrics, directory summary, branch summary, expenses, staff,
+   materials, and the due-payments summary each compute all their figures with
+   `Sum(..., filter=...)` / `Count(..., filter=...)` in one query.
+3. **N+1 across branches / rows.** Admin overview is grouped by branch
+   (`branch_headline_figures`); outstanding dues are one UNION query instead of
+   one per enrollment; the directory's three payment reads, two service reads
+   and two overdue reads are one each; the activity feed reads the audit log
+   once and joins the actor; refund requests join `collected_by` and their lines'
+   materials; the attendance roster joins `marked_by`.
+4. **Nested transactions.** `@transactional` (`apps/common/transactions.py`):
+   same behaviour called alone, but `.in_transaction` variants for flows already
+   inside one skip the SAVEPOINT/RELEASE pair.
+5. **Several writes → one.** A payment's receipt and transaction numbers are one
+   statement; a POS sale writes stock, sale lines and movements in one statement
+   each; an installment collection locks the plan's installments once, works out
+   every change in memory and writes them in one `UPDATE`; attendance marking and
+   staff check-in/out are single `INSERT ... ON CONFLICT DO UPDATE`s; admin
+   notifications are one `INSERT ... SELECT`; a booking is written once, already
+   linked to its payment.
+
+### The one that was a scaling problem, not just a count
+
+The dashboard calls `GET /due-payments/summary/?date=<today>`, so it always took
+the *historical* reconstruction path — which loaded **every bill and installment
+ever created** into Python and looped over them. With ten years of data that is
+the heaviest request in the app, on its most-visited page. It is now two SQL
+aggregates (`apps/duepayments/services.py`). Because it is money, equivalence is
+proven, not assumed: `test_summary_matches_reference.py` runs the original loops
+(kept as test code) against the SQL on random bills of every status, paid before
+or after the date asked about, advances, forgiven months, partial balances,
+across dates and branches.
+
+The same discipline for installment collection:
+`test_installment_collection_matches_reference.py` runs the step-by-step original
+beside the in-memory version through random payments (scheduled, short, over,
+zero, out of order, on forgiven schedules, clearing the plan so later installments
+are dropped) and requires identical installments, payments and refusals — and
+asserts the random runs actually reached each hard case.
+
+### Behaviour that changed (deliberately, and only these)
+
+* A POS cart holding the **same material twice** is now checked against its
+  *total* quantity and becomes one sale line. Before, each line was checked
+  against the same starting stock, so 3 + 3 against 5 in stock was sold. This
+  was a bug, not a rule.
+* Locking order: a sale locks its materials in id order, and an installment
+  collection locks the whole plan's installments rather than only the one being
+  paid. Concurrent collections on one plan serialise (they already had to, by the
+  oldest-first rule); the effect is only that they wait at the lock instead of at
+  the next check.
+* A branch that was soft-deleted under a logged-in manager now gets a clean
+  404 on writes instead of a server error.
+
+### Guard
+
+`apps/common/tests/test_query_budget.py` measures every list and summary with a few
+rows and again with five times as many, and fails if any endpoint's count differs
+(an N+1), and gives each read and write a budget it may not exceed. Verified it
+catches what it should: removing one `select_related` fails it with
+`query count grew with the data`.
+
+### What is not reduced, on purpose
+
+The floor for a write is its own inserts and updates, the **audit entry**, a
+sequence draw where it issues a number, BEGIN/COMMIT, and the **locks** that stop
+two managers doing the same thing at once. Those are correctness (docs/00), not
+overhead, so "everything in one or two queries" is not possible for a payment —
+a bill payment is ~12 because it must lock, check oldest-first, number, insert the
+payment, audit, update the bill, and read back the result. Not done: batching
+several audit entries into one insert (they must stay inside the transaction),
+and pushing the due-payments list and attendance roster pagination into the
+database (they assemble in Python; fine now, the next thing to move at scale).
+
 ## Planned: when moving to a VPS
 
 1. **Postgres on the same machine** as Django (or the same private network).
