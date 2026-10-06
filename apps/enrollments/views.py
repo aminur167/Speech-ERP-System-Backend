@@ -423,6 +423,13 @@ class InstallmentPlanViewSet(_EnrollmentBase):
     serializer_class = InstallmentPlanSerializer
     filterset_fields = ["status", "patient"]
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.action == "pay_installment":
+            # The installments are read once, after paying -- not also before.
+            queryset = queryset.prefetch_related(None)
+        return queryset
+
     def create(self, request, *args, **kwargs):
         serializer = InstallmentPlanCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -471,19 +478,18 @@ class InstallmentPlanViewSet(_EnrollmentBase):
         serializer.is_valid(raise_exception=True)
 
         try:
-            installment = Installment.objects.get(pk=installment_id, plan=plan)
-        except Installment.DoesNotExist:
+            installment_pk = int(installment_id)
+        except (TypeError, ValueError):
             return Response(
                 {"detail": "Installment not found."}, status=status.HTTP_404_NOT_FOUND
             )
-        # The plan already carries its patient and service — see pay_bill.
-        installment.plan = plan
 
         try:
-            payment, installment = services.collect_installment_payment(
+            payment, _installment = services.collect_installment_payment_by_id(
                 actor=request.user,
                 branch=plan.branch,
-                installment=installment,
+                plan=plan,
+                installment_id=installment_pk,
                 method=serializer.validated_data["method"],
                 idempotency_key=serializer.validated_data.get("idempotencyKey") or None,
                 # Omitted collects the scheduled figure; a smaller amount is
@@ -491,16 +497,19 @@ class InstallmentPlanViewSet(_EnrollmentBase):
                 amount=serializer.validated_data.get("amount"),
             )
         except services.EnrollmentError as exc:
+            if exc.code == "installment_not_found":
+                return Response(
+                    {"detail": "Installment not found."}, status=status.HTTP_404_NOT_FOUND
+                )
             return _error(exc)
 
+        # The plan is already loaded with its patient and service; only its
+        # installments (just changed) need reading again.
+        prefetch_related_objects([plan], "installments")
         return Response(
             {
                 "payment": PaymentSerializer(payment).data,
-                "plan": InstallmentPlanSerializer(
-                    InstallmentPlan.objects.select_related("patient", "service")
-                    .prefetch_related("installments")
-                    .get(pk=plan.pk)
-                ).data,
+                "plan": InstallmentPlanSerializer(plan).data,
             }
         )
 

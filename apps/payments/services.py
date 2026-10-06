@@ -68,6 +68,7 @@ def create_payment(
     idempotency_key: str | None = None,
     client_created_at=None,
     status: str = PaymentStatus.PAID,
+    due_after: Decimal | None = None,
 ) -> tuple[Payment, bool]:
     """
     Record a payment. Returns `(payment, created)`.
@@ -105,6 +106,7 @@ def create_payment(
         branch=branch,
         idempotency_key=idempotency_key or None,
         client_created_at=client_created_at,
+        due_after=due_after,
     )
 
     audit.record(

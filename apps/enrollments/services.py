@@ -661,40 +661,167 @@ def _promote_bill(nxt) -> None:
         nxt.save(update_fields=["status"])
 
 
-@transactional
-def _redistribute_remaining(plan, *, after_index: int) -> None:
+def _plan_after_collection(plan, rows, target, *, collecting: Decimal, short: bool, is_last: bool):
     """
-    Re-divide what's still owed across the installments after `after_index`.
+    Work out, in memory, everything one installment collection changes.
 
-    The plan's total is fixed; only how it's split moves. So when a
-    collection differs from the scheduled amount, the difference is carried
-    forward into the later installments equally rather than left stranded on
-    a closed one — paying 3,000 against a 5,000 installment on a 15,000 plan
-    leaves 12,000 over the remaining two, i.e. 6,000 each.
+    `rows` is every installment of the plan, in index order, as locked and
+    read by the caller. Returns `(changed_rows, deleted_rows, due_after)`
+    after applying the collection to `target` and the knock-on effects to the
+    others:
 
-    Nothing left to owe means the later installments aren't needed at all;
-    they're removed so the schedule matches reality (the plan was cleared in
-    fewer payments than planned) rather than sitting there at zero.
+    * the target takes the money -- closed at what was collected, or, for a
+      short payment on the LAST installment, left open for the remainder
+      (there is nothing after it to carry a shortfall into);
+    * the difference is re-divided across the later open installments, so
+      the plan's total stays fixed (`split_equally`) -- or, when nothing is
+      left to owe, those later installments are dropped, so the schedule
+      matches reality (cleared in fewer payments than planned) instead of
+      sitting there at zero;
+    * the next upcoming installment becomes due;
+    * `due_after`, what the plan still owes, is what the receipt prints.
+
+    This is the plan's whole bookkeeping done on the rows already in hand: it
+    used to be a dozen separate reads and writes against the same
+    installments (the oldest unpaid, the sum paid, "is there one after this",
+    the later open ones, the sum paid again, the next upcoming, the sum owed).
     """
-    later = list(
-        plan.installments.filter(index__gt=after_index)
-        .exclude(status__in=CLOSED_STATUSES)
-        .order_by("index")
+    changed = {target.pk: target}
+
+    target.amount_paid = target.amount_paid + collecting
+    if short and is_last:
+        # Stays open: the remainder has nowhere later to go.
+        target.status = (
+            BillStatus.OVERDUE if target.due_date < timezone.localdate() else BillStatus.DUE
+        )
+    else:
+        # Closes at what was collected; the schedule absorbs the rest.
+        target.amount = target.amount_paid
+        target.status = BillStatus.PAID
+        target.paid_at = timezone.now()
+
+    deleted = []
+    if not (short and is_last):
+        later = [
+            row for row in rows
+            if row.index > target.index and row.status not in CLOSED_STATUSES
+        ]
+        if later:
+            collected = sum((row.amount_paid for row in rows), Decimal("0.00"))
+            remaining = plan.total_amount - collected
+            if remaining <= 0:
+                deleted = later
+            else:
+                for row, amount in zip(later, split_equally(remaining, len(later))):
+                    row.amount = amount
+                    changed[row.pk] = row
+
+    alive = [row for row in rows if row not in deleted]
+
+    upcoming = next((row for row in alive if row.status == BillStatus.UPCOMING), None)
+    if upcoming is not None:
+        upcoming.status = BillStatus.DUE
+        changed[upcoming.pk] = upcoming
+
+    # What the plan still owes now that this payment has landed -- the
+    # receipt's "Remaining due". Forgiven installments excluded, the same as
+    # `outstanding_total()`.
+    owed = sum(
+        (row.amount - row.amount_paid for row in alive if row.status not in FORGIVEN_STATUSES),
+        Decimal("0.00"),
     )
-    if not later:
-        return
+    return list(changed.values()), deleted, max(Decimal("0.00"), owed)
 
-    collected = plan.installments.aggregate(s=Sum("amount_paid"))["s"] or Decimal("0.00")
-    remaining = plan.total_amount - collected
 
-    if remaining <= 0:
-        plan.installments.filter(pk__in=[row.pk for row in later]).delete()
-        return
+def _collect_installment(
+    *, actor, branch, plan, installment_id, method: str,
+    amount: Decimal | None, idempotency_key: str | None,
+):
+    """The collection itself; runs inside the caller's transaction."""
+    # See the matching guard in collect_bill_payment for why this runs first.
+    if idempotency_key:
+        existing = Payment.all_objects.filter(idempotency_key=idempotency_key).first()
+        if existing is not None:
+            return existing, Installment.objects.filter(pk=installment_id).first()
 
-    amounts = split_equally(remaining, len(later))
-    for row, amount in zip(later, amounts):
-        row.amount = amount
-    Installment.objects.bulk_update(later, ["amount"])
+    # Every installment of the plan, locked, in one statement. The collection
+    # decides on, and changes, several of them (the one being paid, the later
+    # ones it re-divides, the next one it brings forward), and every figure it
+    # needs -- what is oldest, what the plan has collected so far, whether
+    # anything comes after -- is a fact about this same small set of rows.
+    # A plan has a handful of installments, so reading them all costs less
+    # than the separate queries it replaces.
+    rows = list(
+        Installment.objects.select_for_update().filter(plan_id=plan.pk).order_by("index")
+    )
+    target = next((row for row in rows if row.pk == installment_id), None)
+    if target is None:
+        raise EnrollmentError("Installment not found.", code="installment_not_found")
+
+    # Inactive plans still accept payment for the instalments the manager
+    # chose to keep — see the note in `collect_bill_payment`.
+
+    if target.is_settled or target.status in CLOSED_STATUSES:
+        raise EnrollmentError("This installment has already been settled.", code="already_paid")
+
+    # Oldest-first (`InstallmentPlan.oldest_unpaid_installment`, on these rows).
+    oldest = next(
+        (
+            row for row in rows
+            if row.status not in CLOSED_STATUSES and row.amount_paid < row.amount
+        ),
+        None,
+    )
+    _require_oldest(oldest, target)
+
+    scheduled = target.outstanding
+    collecting = scheduled if amount is None else Decimal(amount)
+
+    if collecting <= 0:
+        raise EnrollmentError("Enter an amount greater than zero.", code="invalid_amount")
+
+    # Never take more than the plan still owes -- the surplus would have
+    # nowhere to go and would overstate collection.
+    plan_outstanding = plan.total_amount - sum(
+        (row.amount_paid for row in rows), Decimal("0.00")
+    )
+    if collecting > plan_outstanding:
+        raise EnrollmentError(
+            f"This plan only has {plan_outstanding} outstanding.",
+            code="exceeds_outstanding",
+            extra={"outstanding": str(plan_outstanding)},
+        )
+
+    is_last = not any(row.index > target.index for row in rows)
+    short = collecting < scheduled
+    label = target.label
+
+    changed, deleted, due_after = _plan_after_collection(
+        plan, rows, target, collecting=collecting, short=short, is_last=is_last
+    )
+
+    payment, created = payment_services.record_payment(
+        actor=actor,
+        branch=branch,
+        patient=plan.patient,
+        amount=collecting,
+        method=method,
+        category=PaymentCategory.INSTALLMENT,
+        description=f"{plan.service.name} — {label}",
+        idempotency_key=idempotency_key,
+        due_after=due_after,
+    )
+
+    if created:
+        target.payment = payment
+        # Everything this collection changed, in one statement.
+        Installment.objects.bulk_update(
+            changed, ["amount", "amount_paid", "status", "paid_at", "payment"]
+        )
+        if deleted:
+            Installment.objects.filter(pk__in=[row.pk for row in deleted]).delete()
+
+    return payment, target
 
 
 @transaction.atomic
@@ -712,104 +839,35 @@ def collect_installment_payment(
 
     `amount` defaults to the scheduled figure. Anything else closes this
     installment at what was actually collected and carries the difference
-    into the later ones (`_redistribute_remaining`) — under- and overpayment
+    into the later ones (`_plan_after_collection`) — under- and overpayment
     both, since both change what's left to spread.
 
     The exception is the final installment: there's nothing after it to carry
     a shortfall into, so it stays open for the remainder instead of quietly
     writing the debt off.
     """
-    plan = installment.plan
-
-    # See the matching guard in collect_bill_payment for why this runs first.
-    if idempotency_key:
-        existing = Payment.all_objects.filter(idempotency_key=idempotency_key).first()
-        if existing is not None:
-            installment.refresh_from_db()
-            return existing, installment
-
-    # Inactive plans still accept payment for the instalments the manager
-    # chose to keep — see the note in `collect_bill_payment`.
-
-    installment = Installment.objects.select_for_update().get(pk=installment.pk)
-
-    if installment.is_settled or installment.status in CLOSED_STATUSES:
-        raise EnrollmentError("This installment has already been settled.", code="already_paid")
-
-    _assert_is_oldest_unpaid(plan, installment)
-
-    scheduled = installment.outstanding
-    collecting = scheduled if amount is None else Decimal(amount)
-
-    if collecting <= 0:
-        raise EnrollmentError("Enter an amount greater than zero.", code="invalid_amount")
-
-    # Never take more than the plan still owes -- the surplus would have
-    # nowhere to go and would overstate collection.
-    plan_outstanding = plan.total_amount - (
-        plan.installments.aggregate(s=Sum("amount_paid"))["s"] or Decimal("0.00")
-    )
-    if collecting > plan_outstanding:
-        raise EnrollmentError(
-            f"This plan only has {plan_outstanding} outstanding.",
-            code="exceeds_outstanding",
-            extra={"outstanding": str(plan_outstanding)},
-        )
-
-    is_last = not plan.installments.filter(index__gt=installment.index).exists()
-    short = collecting < scheduled
-
-    payment, created = payment_services.record_payment(
-        actor=actor,
-        branch=branch,
-        patient=plan.patient,
-        amount=collecting,
-        method=method,
-        category=PaymentCategory.INSTALLMENT,
-        description=f"{plan.service.name} — {installment.label}",
-        idempotency_key=idempotency_key,
+    return _collect_installment(
+        actor=actor, branch=branch, plan=installment.plan, installment_id=installment.pk,
+        method=method, amount=amount, idempotency_key=idempotency_key,
     )
 
-    if created:
-        installment.amount_paid = installment.amount_paid + collecting
 
-        if short and is_last:
-            # Stays open: the remainder has nowhere later to go.
-            installment.status = (
-                BillStatus.OVERDUE
-                if installment.due_date < timezone.localdate()
-                else BillStatus.DUE
-            )
-            installment.payment = payment
-            installment.save(update_fields=["amount_paid", "status", "payment"])
-        else:
-            # Closes at what was collected; the schedule absorbs the rest.
-            installment.amount = installment.amount_paid
-            installment.status = BillStatus.PAID
-            installment.paid_at = timezone.now()
-            installment.payment = payment
-            installment.save(
-                update_fields=["amount", "amount_paid", "status", "paid_at", "payment"]
-            )
-            _redistribute_remaining.in_transaction(plan, after_index=installment.index)
-
-        nxt = plan.installments.filter(status=BillStatus.UPCOMING).order_by("index").first()
-        if nxt is not None:
-            nxt.status = BillStatus.DUE
-            nxt.save(update_fields=["status"])
-
-        # What the plan still owes now that this payment has landed — the
-        # receipt's "Remaining due". Stamped once, here, so a reprint reads
-        # the same however many payments follow. Summed in the database, and
-        # forgiven installments excluded, the same as `outstanding_total()`.
-        remaining = plan.installments.exclude(status__in=FORGIVEN_STATUSES).aggregate(
-            owed=Sum(F("amount") - F("amount_paid"))
-        )["owed"] or Decimal("0.00")
-        payment.due_after = max(Decimal("0.00"), remaining)
-        payment.save(update_fields=["due_after"])
-
-    installment.refresh_from_db()
-    return payment, installment
+@transactional
+def collect_installment_payment_by_id(
+    *, actor, branch, plan, installment_id, method: str,
+    amount: Decimal | None = None, idempotency_key: str | None = None,
+):
+    """
+    `collect_installment_payment` for a request that names the installment by
+    id: it is found among the plan's installments inside the collection
+    (one locking read), not looked up separately first. Raises
+    `EnrollmentError` with code `installment_not_found` for one that is not
+    this plan's.
+    """
+    return _collect_installment(
+        actor=actor, branch=branch, plan=plan, installment_id=installment_id,
+        method=method, amount=amount, idempotency_key=idempotency_key,
+    )
 
 
 # ---------------------------------------------------------------------------
