@@ -19,7 +19,9 @@ transactions (`transaction=True`) so BEGIN/COMMIT count as they do live,
 rather than the savepoints a test's own wrapping transaction would add.
 """
 
+from datetime import datetime, time
 from decimal import Decimal
+from unittest import mock
 
 import pytest
 from django.db import connection
@@ -33,6 +35,33 @@ from apps.payments import services as payment_services
 from apps.patients import attendance
 from apps.services.models import Service
 from apps.staff import services as staff_services
+
+
+@pytest.fixture(autouse=True)
+def inside_office_hours():
+    """
+    Pins the clock to 11am so the staff endpoints cost — and allow — the same
+    thing whatever time the suite happens to run.
+
+    `apps.staff.services` changes behaviour at 4pm, and both tests here touch
+    it: check-in is refused outright once the office has closed, and the staff
+    summary picks up `mark_no_show_absentees` + `auto_check_out_stragglers`,
+    which are no-ops before 4pm and three extra statements after it. Without
+    this, both tests fail for most of the day — including on CI, whose runs
+    land wherever the push happened to fall in Asia/Dhaka.
+
+    Deliberately 11am *today*, not the fixed calendar day
+    `apps/staff/tests/test_staff.py`'s own `office_hours` fixture uses: that
+    patch is global (`apps.staff.services.timezone` is the one
+    `django.utils.timezone` module), so moving the date too would drag every
+    seeded row's `created_at` out of the date windows these reads filter on.
+    Only the hour is in question here.
+    """
+    pinned = timezone.make_aware(
+        datetime.combine(timezone.localdate(), time(11, 0))
+    )
+    with mock.patch("django.utils.timezone.now", return_value=pinned):
+        yield
 
 
 class Seeder:
