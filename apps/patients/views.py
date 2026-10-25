@@ -73,6 +73,15 @@ class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
 
+        # Browsing or searching the clinic's patients: a counter buyer is not
+        # one, so they stay out of the list, the directory and every patient
+        # picker that reads them (the enrollment wizards, the sell page's own
+        # search). Detail routes are deliberately left alone -- Sell History
+        # reads a walk-in by id to show and edit who was billed, and a receipt
+        # still has to resolve the name it was issued to.
+        if self.action in {"list", "directory"}:
+            queryset = queryset.registered()
+
         search = self.request.query_params.get("search", "").strip()
         if search:
             queryset = queryset.filter(self._search_filter(search))

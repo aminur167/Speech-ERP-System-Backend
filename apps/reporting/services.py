@@ -151,7 +151,10 @@ def branch_headline_figures(branch_ids) -> dict[int, dict]:
         for branch_id in ids
     }
     for row in (
-        Patient.objects.filter(branch_id__in=ids).values("branch_id").annotate(n=Count("pk"))
+        Patient.objects.registered()
+        .filter(branch_id__in=ids)
+        .values("branch_id")
+        .annotate(n=Count("pk"))
     ):
         figures[row["branch_id"]]["patients"] = row["n"]
     for row in (
@@ -315,7 +318,8 @@ def patient_directory_summary(*, branch_id=None, as_of: date | None = None) -> d
     """
     reference = as_of or timezone.localdate()
 
-    patients = Patient.objects.all()
+    # Counter buyers are not patients and must not inflate these cards.
+    patients = Patient.objects.registered()
     if branch_id:
         patients = patients.filter(branch_id=branch_id)
 
@@ -406,7 +410,7 @@ def branch_summary(*, branch_id=None, date_from: date, date_to: date) -> dict:
     expense_stats = expenses.filter(**in_range).aggregate(total=Sum("amount"), count=Count("id"))
     expense_total = expense_stats["total"] or Decimal("0.00")
 
-    patients = Patient.objects.all()
+    patients = Patient.objects.registered()
     if branch_id:
         patients = patients.filter(branch_id=branch_id)
     patient_stats = patients.aggregate(

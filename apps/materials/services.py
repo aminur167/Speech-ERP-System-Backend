@@ -234,3 +234,147 @@ def sell_materials(
         changes={"total": str(total), "lines": len(resolved)},
     )
     return payment, sale_items, True
+
+
+# ---------------------------------------------------------------------------
+# Sell History
+# ---------------------------------------------------------------------------
+
+
+def sale_history_queryset(*, branch_id=None, params=None):
+    """
+    Past material sales, newest first, ready to serialize.
+
+    Voided sales are left out. A manager who removes a mistaken sale from this
+    list expects it gone from it; the money record itself is never destroyed
+    and the voided payment stays visible on Transactions, which is the screen
+    that exists to show everything that happened (docs/10).
+
+    The joins are explicit because this table shows the buyer, the branch and
+    every product line on each row -- without them the page would issue a
+    query per row and get slower as the clinic's history grows.
+    """
+    from apps.payments.models import Payment, PaymentCategory, PaymentStatus
+
+    params = params or {}
+
+    queryset = (
+        Payment.objects.filter(category=PaymentCategory.MATERIAL_SALE)
+        .exclude(status=PaymentStatus.VOID)
+        .select_related("patient", "branch", "collected_by")
+        .prefetch_related("sale_items__material")
+        .order_by("-created_at")
+    )
+
+    if branch_id:
+        queryset = queryset.filter(branch_id=branch_id)
+
+    queryset = _filter_sales_by_date(queryset, params)
+    queryset = _filter_sales_by_search(queryset, params)
+    return queryset
+
+
+def _filter_sales_by_date(queryset, params):
+    """
+    One day, or a range. `date` wins when both are sent, the same precedence
+    the reporting endpoints already use so the two screens can't disagree.
+    """
+    from datetime import date as date_cls
+
+    def parse(value):
+        try:
+            return date_cls.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+
+    exact = parse(params.get("date"))
+    if exact:
+        return queryset.filter(created_at__date=exact)
+
+    date_from = parse(params.get("dateFrom"))
+    if date_from:
+        queryset = queryset.filter(created_at__date__gte=date_from)
+
+    date_to = parse(params.get("dateTo"))
+    if date_to:
+        queryset = queryset.filter(created_at__date__lte=date_to)
+
+    return queryset
+
+
+def _filter_sales_by_search(queryset, params):
+    """
+    One box, searching what a person would actually type: the buyer's name or
+    phone, a product on the sale, or the receipt number.
+
+    Phone matching normalises the term first, so a number typed `+8801712...`
+    still finds a row stored as `01712...` -- the same accommodation the
+    patient search makes.
+    """
+    from django.db.models import Q
+
+    from apps.common.validators import normalize_phone
+
+    term = (params.get("search") or "").strip()
+    if not term:
+        return queryset
+
+    lookup = (
+        Q(patient__name__icontains=term)
+        | Q(patient__phone__icontains=term)
+        | Q(receipt_number__icontains=term)
+        | Q(sale_items__material__name__icontains=term)
+        | Q(sale_items__material__code__icontains=term)
+    )
+
+    normalized = normalize_phone(term)
+    if normalized and normalized != term:
+        lookup |= Q(patient__phone__icontains=normalized)
+
+    # A sale with two matching product lines would otherwise come back twice.
+    return queryset.filter(lookup).distinct()
+
+
+@transaction.atomic
+def update_sale_customer(*, actor, payment, name: str, phone: str):
+    """
+    Correct the name or phone a counter sale was billed to.
+
+    Walk-ins only. A registered patient's name and phone are their own
+    record's, edited from their profile where the change is visible for what
+    it is -- not silently rewritten from a list of sales, which would also
+    rename them on every other receipt they appear on.
+
+    Nothing financial moves: the payment, its lines, the prices and the stock
+    are all untouched.
+    """
+    patient = payment.patient
+
+    if not patient.is_walk_in:
+        raise MaterialError(
+            "This sale was billed to a registered patient. "
+            "Edit their details from their patient profile.",
+            code="not_a_walk_in",
+        )
+
+    before = {"name": patient.name, "phone": patient.phone}
+    patient.name = name
+    patient.phone = phone
+    patient.save(update_fields=["name", "phone", "updated_at"])
+
+    changes = {
+        field: {"from": before[field], "to": getattr(patient, field)}
+        for field in ("name", "phone")
+        if before[field] != getattr(patient, field)
+    }
+    if changes:
+        audit.record(
+            actor=actor,
+            action=AuditLog.Action.UPDATE,
+            target=patient,
+            branch=payment.branch,
+            reason=f"Buyer corrected on {payment.receipt_number}",
+            changes=changes,
+        )
+
+    return payment

@@ -163,15 +163,64 @@ def void_payment(*, actor, payment: Payment, reason: str) -> Payment:
     payment.status = PaymentStatus.VOID
     payment.save(update_fields=["status", "updated_at"])
 
+    # A voided sale never happened, so the goods never left the shelf.
+    # Refund approval has always put them back; void did not, which quietly
+    # lost a branch real stock every time a mistaken sale was cancelled the
+    # same day -- the exact case void exists for.
+    returned = _return_sold_stock(actor=actor, payment=payment)
+
+    changes = {"status": {"from": PaymentStatus.PAID, "to": PaymentStatus.VOID}}
+    if returned:
+        changes["stock_returned"] = returned
+
     audit.record(
         actor=actor,
         action=AuditLog.Action.VOID,
         target=payment,
         branch=payment.branch,
         reason=reason,
-        changes={"status": {"from": PaymentStatus.PAID, "to": PaymentStatus.VOID}},
+        changes=changes,
     )
     return payment
+
+
+def _return_sold_stock(*, actor, payment: Payment) -> dict[str, int]:
+    """
+    Put a voided sale's items back on the shelf, with a movement each.
+
+    A no-op for every other kind of payment -- only a material sale has lines
+    to return. Returns what went back, keyed by material name, for the audit
+    entry; an empty dict means there was nothing to return.
+    """
+    from apps.materials.models import Material, MaterialMovement, MaterialSaleItem
+
+    lines = list(
+        MaterialSaleItem.objects.filter(payment=payment).select_related("material")
+    )
+    if not lines:
+        return {}
+
+    returned: dict[str, int] = {}
+    movements = []
+    for line in lines:
+        material = Material.objects.select_for_update().get(pk=line.material_id)
+        material.quantity += line.quantity
+        material.save(update_fields=["quantity"])
+
+        returned[material.name] = returned.get(material.name, 0) + line.quantity
+        movements.append(
+            MaterialMovement(
+                material=material,
+                type=MaterialMovement.Type.IN,
+                quantity=line.quantity,
+                note=f"Sale voided — {payment.receipt_number}",
+                branch_id=payment.branch_id,
+                created_by=actor if actor and actor.is_authenticated else None,
+            )
+        )
+
+    MaterialMovement.objects.bulk_create(movements)
+    return returned
 
 
 # ---------------------------------------------------------------------------
