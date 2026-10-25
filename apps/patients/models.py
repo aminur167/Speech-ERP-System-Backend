@@ -95,6 +95,17 @@ class Patient(TimeStampedModel, SoftDeleteModel, IdempotentModel):
         max_length=16, choices=Status.choices, default=Status.ACTIVE, db_index=True
     )
 
+    # Someone who bought something at the counter without ever being
+    # registered as a patient (apps/materials -- the Sell Materials
+    # checkout). The sale still needs a patient row, because every
+    # Payment points at one and the receipt has to carry a name, but
+    # the clinic never took their history: `REQUIRED_ON_CREATE` in
+    # serializers.py is relaxed to name + phone for these, and this
+    # flag is what records that the gap was deliberate rather than a
+    # half-filled registration. Cleared automatically once the
+    # registration fields are filled in (see `update_patient`).
+    is_walk_in = models.BooleanField(default=False, db_index=True)
+
     branch = models.ForeignKey(
         "branches.Branch",
         on_delete=models.PROTECT,  # never cascade patient records away

@@ -615,3 +615,147 @@ class TestDeletion:
         assert response.status_code == 204
         assert manager_client.get(reverse("patients:patient-list")).json()["count"] == 0
         assert Patient.all_objects.filter(pk=created["id"]).exists()
+
+
+class TestWalkInCustomer:
+    """
+    Someone buying something at the counter who was never registered.
+
+    The Sell Materials checkout creates one of these so the sale and its
+    receipt carry a real name, without putting the full registration form in
+    front of a manager selling a ৳100 item.
+    """
+
+    def walk_in_payload(self, **overrides):
+        payload = {"name": "Apu Das", "phone": "01612345678", "is_walk_in": True}
+        payload.update(overrides)
+        return payload
+
+    def test_name_and_phone_alone_are_enough(self, manager_client):
+        response = manager_client.post(
+            reverse("patients:patient-list"), self.walk_in_payload()
+        )
+
+        assert response.status_code == 201, response.json()
+        body = response.json()
+        assert body["name"] == "Apu Das"
+        assert body["isWalkIn"] is True
+        # The fields the registration form demands stay genuinely empty --
+        # nothing is invented to satisfy a validator.
+        assert body["dateOfBirth"] is None
+        assert body["gender"] == ""
+        assert body["address"] == ""
+
+    @pytest.mark.parametrize("field", ["name", "phone"])
+    def test_the_two_fields_a_receipt_needs_are_still_required(
+        self, manager_client, field
+    ):
+        payload = self.walk_in_payload()
+        del payload[field]
+
+        response = manager_client.post(reverse("patients:patient-list"), payload)
+
+        assert response.status_code == 400
+        assert field in response.json()
+
+    def test_a_normal_registration_still_demands_everything(self, manager_client):
+        """The relaxation must not leak into the registration form's own path."""
+        payload = patient_payload()
+        del payload["address"]
+
+        response = manager_client.post(reverse("patients:patient-list"), payload)
+
+        assert response.status_code == 400
+        assert "address" in response.json()
+
+    def test_omitting_the_flag_is_a_normal_registration(self, manager_client):
+        """Relaxed rules are opt-in -- a bare name+phone post is still rejected."""
+        response = manager_client.post(
+            reverse("patients:patient-list"), {"name": "Apu Das", "phone": "01612345678"}
+        )
+
+        assert response.status_code == 400
+        assert "date_of_birth" in response.json()
+
+    def test_walk_in_gets_a_real_patient_code(self, manager_client, branch):
+        response = manager_client.post(
+            reverse("patients:patient-list"), self.walk_in_payload()
+        )
+
+        assert response.json()["patientCode"].startswith("PT-DHK-")
+
+    def test_a_minor_walk_in_is_not_asked_for_a_guardian(self, manager_client):
+        """
+        No date of birth means age is unknown, so the guardian rule has
+        nothing to assess -- the same existing behaviour, confirmed here
+        because the walk-in path is the one that reaches it most often.
+        """
+        response = manager_client.post(
+            reverse("patients:patient-list"), self.walk_in_payload()
+        )
+
+        assert response.status_code == 201
+
+    def test_completing_the_details_promotes_them_out_of_walk_in(self, manager_client):
+        created = manager_client.post(
+            reverse("patients:patient-list"), self.walk_in_payload()
+        ).json()
+
+        response = manager_client.patch(
+            reverse("patients:patient-detail", args=[created["id"]]),
+            {
+                "date_of_birth": years_ago(29),
+                "gender": "male",
+                "address": "Mirpur, Dhaka",
+            },
+        )
+
+        assert response.status_code == 200, response.json()
+        assert response.json()["isWalkIn"] is False
+        assert Patient.objects.get(pk=created["id"]).is_walk_in is False
+
+    def test_a_partial_edit_leaves_them_a_walk_in(self, manager_client):
+        created = manager_client.post(
+            reverse("patients:patient-list"), self.walk_in_payload()
+        ).json()
+
+        response = manager_client.patch(
+            reverse("patients:patient-detail", args=[created["id"]]),
+            {"address": "Mirpur, Dhaka"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["isWalkIn"] is True
+
+    def test_promotion_is_audited(self, manager_client):
+        created = manager_client.post(
+            reverse("patients:patient-list"), self.walk_in_payload()
+        ).json()
+        manager_client.patch(
+            reverse("patients:patient-detail", args=[created["id"]]),
+            {
+                "date_of_birth": years_ago(29),
+                "gender": "male",
+                "address": "Mirpur, Dhaka",
+            },
+        )
+
+        entry = AuditLog.objects.filter(
+            target_type="Patient", target_id=str(created["id"]),
+            action=AuditLog.Action.UPDATE,
+        ).first()
+        assert entry is not None
+        assert entry.changes["is_walk_in"] == {"from": "True", "to": "False"}
+
+    def test_other_branch_manager_cannot_see_the_walk_in(
+        self, manager_client, other_manager_client
+    ):
+        created = manager_client.post(
+            reverse("patients:patient-list"), self.walk_in_payload()
+        ).json()
+
+        response = other_manager_client.get(
+            reverse("patients:patient-detail", args=[created["id"]])
+        )
+
+        assert response.status_code == 404

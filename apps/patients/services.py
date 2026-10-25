@@ -66,13 +66,28 @@ def create_patient(
 
 @transaction.atomic
 def update_patient(*, actor, patient: Patient, data: dict) -> Patient:
-    before = {field: getattr(patient, field) for field in data}
+    # Imported here, not at module scope: serializers.py imports this module,
+    # so a top-level import would close the cycle.
+    from apps.patients.serializers import REQUIRED_ON_CREATE
+
+    tracked = dict.fromkeys(data)
+    before = {field: getattr(patient, field) for field in tracked}
 
     for field, value in data.items():
         setattr(patient, field, value)
+
+    # A walk-in who comes back and is properly registered stops being one.
+    # Promoting them on the edit that completes their details keeps the flag
+    # meaning "this person's details were never taken" rather than decaying
+    # into "this row started at the counter", which nobody needs to know.
+    if patient.is_walk_in and all(getattr(patient, field) for field in REQUIRED_ON_CREATE):
+        before["is_walk_in"] = True
+        tracked["is_walk_in"] = None
+        patient.is_walk_in = False
+
     patient.save()
 
-    after = {field: getattr(patient, field) for field in data}
+    after = {field: getattr(patient, field) for field in tracked}
 
     changes = audit.diff(before, after)
     if changes:

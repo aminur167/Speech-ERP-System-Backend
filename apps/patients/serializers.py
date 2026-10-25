@@ -21,6 +21,15 @@ GUARDIAN_FIELDS = ("guardian_name", "guardian_relation", "guardian_phone")
 # rather than in the schema so existing incomplete records stay editable.
 REQUIRED_ON_CREATE = ("name", "date_of_birth", "gender", "phone", "address")
 
+# A walk-in is someone buying something at the counter, not a patient the
+# clinic is taking on. Demanding a date of birth, gender and address
+# before they can be sold a ৳100 item is the registration form's rule
+# applied where it was never meant to go -- so the walk-in path asks for
+# the two things a receipt actually needs. Everything else about the row
+# stays identical, including the guardian rule, which already skips a
+# record whose age cannot be assessed.
+REQUIRED_ON_CREATE_WALK_IN = ("name", "phone")
+
 
 class PatientSerializer(serializers.ModelSerializer):
     """Read shape. `age` is computed, never stored."""
@@ -36,6 +45,7 @@ class PatientSerializer(serializers.ModelSerializer):
     referredBy = serializers.CharField(source="referred_by", read_only=True)
     chiefComplaint = serializers.CharField(source="chief_complaint", read_only=True)
     nationalId = serializers.CharField(source="national_id", read_only=True)
+    isWalkIn = serializers.BooleanField(source="is_walk_in", read_only=True)
     branchId = serializers.CharField(source="branch_id", read_only=True)
     branchName = serializers.CharField(source="branch.name", read_only=True)
     createdAt = serializers.DateTimeField(source="created_at", read_only=True)
@@ -50,7 +60,7 @@ class PatientSerializer(serializers.ModelSerializer):
             "phone", "email", "address",
             "guardianName", "guardianRelation", "guardianPhone", "emergencyContact",
             "referredBy", "chiefComplaint", "nationalId", "notes",
-            "status", "branchId", "branchName", "createdAt",
+            "status", "isWalkIn", "branchId", "branchName", "createdAt",
             "serviceStatus", "overdueAmount", "overdueSince",
         ]
         read_only_fields = fields
@@ -122,7 +132,7 @@ class PatientWriteSerializer(serializers.ModelSerializer):
             "phone", "email", "address",
             "guardian_name", "guardian_relation", "guardian_phone", "emergency_contact",
             "referred_by", "chief_complaint", "national_id", "notes", "status",
-            "idempotency_key", "client_created_at",
+            "is_walk_in", "idempotency_key", "client_created_at",
         ]
         extra_kwargs = {
             # All optional at field level; create-time requiredness is applied
@@ -130,7 +140,7 @@ class PatientWriteSerializer(serializers.ModelSerializer):
             # rather than one per round-trip.
             field: {"required": False, "allow_blank": True}
             for field in fields
-            if field not in {"date_of_birth", "idempotency_key", "client_created_at"}
+            if field not in {"date_of_birth", "is_walk_in", "idempotency_key", "client_created_at"}
         }
 
     date_of_birth = serializers.DateField(required=False, allow_null=True)
@@ -158,7 +168,12 @@ class PatientWriteSerializer(serializers.ModelSerializer):
         errors: dict[str, list[str]] = {}
 
         if creating:
-            for field in REQUIRED_ON_CREATE:
+            required = (
+                REQUIRED_ON_CREATE_WALK_IN
+                if attrs.get("is_walk_in")
+                else REQUIRED_ON_CREATE
+            )
+            for field in required:
                 if not attrs.get(field):
                     errors[field] = ["This field is required."]
 
