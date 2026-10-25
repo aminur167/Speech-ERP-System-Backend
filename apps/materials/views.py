@@ -3,8 +3,11 @@
 from decimal import Decimal
 
 from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import NotFound
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
@@ -18,6 +21,8 @@ from apps.materials.serializers import (
     MaterialSerializer,
     MaterialsSummarySerializer,
     MaterialWriteSerializer,
+    SaleCustomerSerializer,
+    SaleHistorySerializer,
     SellMaterialsSerializer,
 )
 from apps.patients.models import Patient
@@ -191,3 +196,123 @@ class MaterialViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
             {"payment": PaymentSerializer(payment).data},
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         )
+
+
+class SaleHistoryViewSet(viewsets.ViewSet):
+    """
+    /api/materials/sales/ — what was sold at the counter, to whom.
+
+    Branch scoping is done by hand rather than through
+    `BranchScopedQuerySetMixin`: the rows are Payments, not Materials, so the
+    mixin's model-level queryset doesn't apply, but the rule it enforces does
+    — a Manager sees their own branch and nothing else, Admin sees every
+    branch and may narrow to one with `?branch=`.
+    """
+
+    permission_classes = [IsAuthenticated]
+    # A plain ViewSet gives drf-spectacular nothing to infer a response shape
+    # from, and a view it cannot resolve is dropped from the schema silently
+    # -- which `test_openapi_schema` fails the build over. Naming the
+    # serializer here is what keeps these three endpoints in /api/docs/.
+    serializer_class = SaleHistorySerializer
+    lookup_value_regex = "[0-9]+"
+
+    def _scope_branch(self, request):
+        if request.user.is_manager:
+            return request.user.branch_id
+        return request.query_params.get("branch") or None
+
+    def _get_sale(self, request, pk):
+        """A sale this user is allowed to touch, or 404 — never 403."""
+        from apps.payments.models import Payment, PaymentCategory
+
+        queryset = Payment.objects.filter(
+            pk=pk, category=PaymentCategory.MATERIAL_SALE
+        ).select_related("patient", "branch")
+
+        if request.user.is_manager:
+            queryset = queryset.filter(branch_id=request.user.branch_id)
+
+        sale = queryset.first()
+        if sale is None:
+            raise NotFound("That sale doesn't exist.")
+        return sale
+
+    @extend_schema(
+        tags=["materials"],
+        parameters=[
+            OpenApiParameter("branch", str, description="Admin only; a Manager is always scoped to their own."),
+            OpenApiParameter("search", str, description="Buyer name or phone, product name or code, receipt number."),
+            OpenApiParameter("date", str, description="A single day, YYYY-MM-DD. Overrides the range below."),
+            OpenApiParameter("dateFrom", str),
+            OpenApiParameter("dateTo", str),
+            OpenApiParameter("pageSize", int),
+        ],
+        responses=SaleHistorySerializer(many=True),
+    )
+    def list(self, request):
+        queryset = services.sale_history_queryset(
+            branch_id=self._scope_branch(request), params=request.query_params
+        )
+
+        paginator = PageNumberPagination()
+        paginator.page_size = int(request.query_params.get("pageSize", 10) or 10)
+        page = paginator.paginate_queryset(queryset, request)
+        return paginator.get_paginated_response(
+            SaleHistorySerializer(page, many=True).data
+        )
+
+    @extend_schema(
+        tags=["materials"],
+        request=SaleCustomerSerializer,
+        responses=SaleHistorySerializer,
+    )
+    @action(detail=True, methods=["patch"])
+    def customer(self, request, pk=None):
+        """PATCH /api/materials/sales/{id}/customer/ — fix the buyer's name or phone."""
+        sale = self._get_sale(request, pk)
+
+        serializer = SaleCustomerSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            sale = services.update_sale_customer(
+                actor=request.user,
+                payment=sale,
+                name=serializer.validated_data["name"],
+                phone=serializer.validated_data["phone"],
+            )
+        except services.MaterialError as exc:
+            return _error(exc)
+
+        sale.refresh_from_db()
+        return Response(SaleHistorySerializer(sale).data)
+
+    @extend_schema(tags=["materials"], responses=SaleHistorySerializer)
+    @action(detail=True, methods=["post"])
+    def void(self, request, pk=None):
+        """
+        POST /api/materials/sales/{id}/void/ — remove a sale from the history.
+
+        The same operation and the same rules as voiding any other payment
+        (Manager: today only; Admin: any day), reached from this screen
+        instead of Transactions. The money record survives as a voided
+        payment; the goods go back on the shelf.
+        """
+        from apps.payments import services as payment_services
+
+        sale = self._get_sale(request, pk)
+        reason = (request.data.get("reason") or "").strip()
+
+        try:
+            payment_services.void_payment(
+                actor=request.user, payment=sale, reason=reason
+            )
+        except payment_services.PaymentError as exc:
+            return Response(
+                {"detail": exc.message, "code": exc.code},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        sale.refresh_from_db()
+        return Response(SaleHistorySerializer(sale).data)

@@ -16,8 +16,36 @@ from datetime import date
 
 from django.db import models
 
-from apps.common.models import IdempotentModel, SoftDeleteModel, TimeStampedModel
+from apps.common.models import (
+    IdempotentModel,
+    SoftDeleteManager,
+    SoftDeleteModel,
+    SoftDeleteQuerySet,
+    TimeStampedModel,
+)
 from apps.common.validators import normalize_phone, validate_bd_phone
+
+
+class PatientQuerySet(SoftDeleteQuerySet):
+    def registered(self):
+        """
+        People the clinic has actually taken on, excluding counter buyers.
+
+        A walk-in exists only so a material sale has a name to bill and a row
+        to hang the payment off; they were never registered and must not
+        appear anywhere the clinic counts or browses its patients. Every such
+        site goes through this method rather than repeating the filter, which
+        is how one of them ends up forgotten.
+        """
+        return self.filter(is_walk_in=False)
+
+
+class PatientManager(SoftDeleteManager):
+    def get_queryset(self):
+        return PatientQuerySet(self.model, using=self._db).filter(is_deleted=False)
+
+    def registered(self):
+        return self.get_queryset().registered()
 
 
 def calculate_age(date_of_birth: date | None, *, on: date | None = None) -> int | None:
@@ -118,6 +146,9 @@ class Patient(TimeStampedModel, SoftDeleteModel, IdempotentModel):
         on_delete=models.SET_NULL,
         related_name="registered_patients",
     )
+
+    # Overrides SoftDeleteModel's plain manager to add `registered()`.
+    objects = PatientManager()
 
     class Meta:
         ordering = ["-created_at"]

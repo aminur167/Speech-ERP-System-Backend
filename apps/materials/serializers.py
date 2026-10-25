@@ -7,6 +7,7 @@ material ids and quantities only; the server prices the sale from the database.
 
 from rest_framework import serializers
 
+from apps.common.validators import validate_bd_phone
 from apps.materials.models import Material, MaterialMovement
 from apps.payments.models import PaymentMethod
 
@@ -122,3 +123,59 @@ class MaterialsSummarySerializer(serializers.Serializer):
     totalItems = serializers.IntegerField()
     totalStockValue = serializers.DecimalField(max_digits=14, decimal_places=2)
     lowStockCount = serializers.IntegerField()
+
+
+class SaleHistoryItemSerializer(serializers.Serializer):
+    """One product line of a past sale, priced as it was sold."""
+
+    material = serializers.IntegerField(source="material_id")
+    name = serializers.CharField(source="material.name")
+    quantity = serializers.IntegerField()
+    unitPrice = serializers.DecimalField(
+        source="unit_price", max_digits=12, decimal_places=2
+    )
+    lineTotal = serializers.DecimalField(
+        source="line_total", max_digits=12, decimal_places=2
+    )
+
+
+class SaleHistorySerializer(serializers.Serializer):
+    """
+    A row of Sell History.
+
+    Built from the sale's Payment, with the buyer and the lines denormalised
+    onto it — the table shows who bought what in one row, and asking the
+    client to stitch three endpoints together to render it would be slower
+    and easier to get wrong.
+    """
+
+    id = serializers.CharField(source="pk")
+    receiptNumber = serializers.CharField(source="receipt_number")
+    customerId = serializers.CharField(source="patient_id")
+    customerName = serializers.CharField(source="patient.name")
+    customerPhone = serializers.CharField(source="patient.phone")
+    # Whether the buyer was a counter walk-in or a registered patient. The
+    # row's Edit action is offered only for a walk-in: a registered patient's
+    # name and phone belong to their own record, and quietly rewriting it
+    # from a sales list is not something this screen should be able to do.
+    isWalkIn = serializers.BooleanField(source="patient.is_walk_in")
+    branchId = serializers.CharField(source="branch_id")
+    branchName = serializers.CharField(source="branch.name")
+    method = serializers.CharField()
+    total = serializers.DecimalField(source="amount", max_digits=12, decimal_places=2)
+    soldBy = serializers.CharField(source="collected_by.name", default="")
+    soldAt = serializers.DateTimeField(source="created_at")
+    items = SaleHistoryItemSerializer(source="sale_items", many=True)
+
+
+class SaleCustomerSerializer(serializers.Serializer):
+    """
+    Correcting who a counter sale was billed to.
+
+    Name and phone only — nothing here touches the money, the products or the
+    stock, so a mistyped name at the counter can be fixed without going
+    anywhere near a financial record (docs/04: a payment is never edited).
+    """
+
+    name = serializers.CharField(max_length=150)
+    phone = serializers.CharField(max_length=20, validators=[validate_bd_phone])
