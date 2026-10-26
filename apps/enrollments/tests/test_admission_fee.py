@@ -7,7 +7,8 @@ The rules these pin (confirmed with the client, docs/05):
   * the enrollment month carries TWO bills — the one-time admit fee and that
     month's own fee (confirmed 2026-10-26, replacing the single merged bill
     confirmed 2026-09-28). Each takes its own discount, each needing its own
-    written reason;
+    written reason — the admission's is given at enrollment, the month's when
+    the month is collected, which is the step the manager decides it on;
   * only the admit fee is taken at enrollment. The first month is left `due`
     and collected afterwards, or skipped onto Due Payments;
   * enrolling and paying the admit fee are one atomic request, so there is
@@ -58,11 +59,24 @@ def by_kind(bills):
     return {bill["kind"]: bill for bill in bills}
 
 
-def pay_first_month(manager, branch, enrollment):
+def pay_first_month(manager, branch, enrollment, **extra):
     """Settle the month that enrollment leaves `due`."""
     bill = enrollment.bills.get(kind=MonthlyBill.Kind.MONTHLY)
     return services.collect_bill_payment(
-        actor=manager, branch=branch, bill=bill, method="cash"
+        actor=manager, branch=branch, bill=bill, method="cash", **extra
+    )
+
+
+def collect_month_via_api(client, enrollment, **body):
+    """POST the pay-bill endpoint for the enrollment month."""
+    bill = enrollment.bills.get(kind=MonthlyBill.Kind.MONTHLY)
+    return client.post(
+        reverse(
+            "enrollments:monthly-enrollment-pay-bill",
+            args=[enrollment.pk, bill.pk],
+        ),
+        {"method": "cash", **body},
+        format="json",
     )
 
 
@@ -315,53 +329,106 @@ class TestEnrollAndPay:
         assert bill["amount"] == "2500.00"
         assert body["payment"]["amount"] == "2500.00"
 
-    def test_the_month_takes_its_own_discount(self, manager_client, patient, package):
+    def test_the_month_is_billed_at_the_full_fee(self, manager_client, patient, package):
+        """Its discount belongs to the collection step, not to enrolling."""
         response = enroll(
-            manager_client, patient, package,
-            monthDiscount="800.00", monthDiscountReason="Half month only",
-        )
-
-        assert response.status_code == 201, response.json()
-        bills = by_kind(response.json()["enrollment"]["bills"])
-        assert bills["monthly"]["grossAmount"] == "5000.00"
-        assert bills["monthly"]["discountAmount"] == "800.00"
-        assert bills["monthly"]["discountReason"] == "Half month only"
-        assert bills["monthly"]["amount"] == "4200.00"
-        # The admit fee is untouched by the month's discount.
-        assert bills["admission"]["amount"] == "3000.00"
-
-    def test_the_two_discounts_are_independent(self, manager_client, patient, package):
-        response = enroll(
-            manager_client, patient, package,
-            discount="500.00", discountReason="Sibling",
-            monthDiscount="800.00", monthDiscountReason="Half month only",
+            manager_client, patient, package, discount="500.00", discountReason="Sibling"
         )
 
         bills = by_kind(response.json()["enrollment"]["bills"])
         assert bills["admission"]["amount"] == "2500.00"
-        assert bills["monthly"]["amount"] == "4200.00"
+        assert bills["monthly"]["amount"] == "5000.00"
+        assert bills["monthly"]["discountAmount"] == "0.00"
 
-    def test_a_month_discount_without_a_reason_is_refused(
-        self, manager_client, patient, package
+    def test_the_month_takes_its_own_discount_when_collected(
+        self, manager_client, manager, branch, patient, package
     ):
-        response = enroll(manager_client, patient, package, monthDiscount="800.00")
+        enrollment, _ = enroll_directly(manager, branch, patient, package)
+
+        response = collect_month_via_api(
+            manager_client, enrollment,
+            discount="800.00", discountReason="Joined mid-month",
+        )
+
+        assert response.status_code == 200, response.json()
+        assert response.json()["payment"]["amount"] == "4200.00"
+        bill = enrollment.bills.get(kind=MonthlyBill.Kind.MONTHLY)
+        assert bill.gross_amount == Decimal("5000.00")
+        assert bill.discount_amount == Decimal("800.00")
+        assert bill.discount_reason == "Joined mid-month"
+        assert bill.amount == Decimal("4200.00")
+        assert bill.status == BillStatus.PAID
+
+    def test_the_two_discounts_are_independent(
+        self, manager_client, manager, branch, patient, package
+    ):
+        enrollment, admission_payment = enroll_directly(
+            manager, branch, patient, package,
+            discount=Decimal("500.00"), discount_reason="Sibling",
+        )
+
+        month = collect_month_via_api(
+            manager_client, enrollment,
+            discount="800.00", discountReason="Joined mid-month",
+        ).json()
+
+        assert admission_payment.amount == Decimal("2500.00")
+        assert month["payment"]["amount"] == "4200.00"
+
+    def test_a_collection_discount_without_a_reason_is_refused(
+        self, manager_client, manager, branch, patient, package
+    ):
+        enrollment, _ = enroll_directly(manager, branch, patient, package)
+
+        response = collect_month_via_api(manager_client, enrollment, discount="800.00")
 
         assert response.status_code == 400
         assert response.json()["code"] == "discount_reason_required"
-        assert not MonthlyEnrollment.objects.exists()
+        bill = enrollment.bills.get(kind=MonthlyBill.Kind.MONTHLY)
+        assert bill.amount == Decimal("5000.00")
+        assert bill.outstanding == Decimal("5000.00")
 
-    def test_a_month_discount_above_the_monthly_fee_is_refused(
-        self, manager_client, patient, package
+    def test_a_collection_discount_above_the_bill_is_refused(
+        self, manager_client, manager, branch, patient, package
     ):
-        response = enroll(
-            manager_client, patient, package,
-            monthDiscount="5000.01", monthDiscountReason="x",
+        enrollment, _ = enroll_directly(manager, branch, patient, package)
+
+        response = collect_month_via_api(
+            manager_client, enrollment, discount="5000.01", discountReason="x",
         )
 
         assert response.status_code == 400
-        assert response.json()["code"] == "month_discount_exceeds_fee"
-        assert not MonthlyEnrollment.objects.exists()
-        assert not Payment.objects.exists()
+        assert response.json()["code"] == "discount_exceeds_bill"
+        assert enrollment.bills.get(kind=MonthlyBill.Kind.MONTHLY).outstanding == Decimal(
+            "5000.00"
+        )
+
+    def test_a_fully_discounted_month_settles_with_no_payment(
+        self, manager_client, manager, branch, patient, package
+    ):
+        enrollment, _ = enroll_directly(manager, branch, patient, package)
+        before = Payment.objects.count()
+
+        response = collect_month_via_api(
+            manager_client, enrollment, discount="5000.00", discountReason="Waived",
+        )
+
+        assert response.status_code == 200, response.json()
+        assert response.json()["payment"] is None
+        bill = enrollment.bills.get(kind=MonthlyBill.Kind.MONTHLY)
+        assert bill.amount == Decimal("0.00")
+        assert bill.status == BillStatus.PAID
+        assert bill.paid_at is not None
+        assert Payment.objects.count() == before
+
+    def test_collecting_without_a_discount_charges_the_full_fee(
+        self, manager_client, manager, branch, patient, package
+    ):
+        enrollment, _ = enroll_directly(manager, branch, patient, package)
+
+        response = collect_month_via_api(manager_client, enrollment)
+
+        assert response.json()["payment"]["amount"] == "5000.00"
 
     def test_the_discount_and_reason_are_in_the_audit_log(
         self, manager, branch, patient, package

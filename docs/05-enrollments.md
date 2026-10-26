@@ -60,10 +60,11 @@ Replaces the merged bill above. The enrollment month now carries **two bills**, 
 | kind | amount | taken |
 |---|---|---|
 | `admission` | the package's `admission_fee`, less its own discount | at enrollment, in the same atomic request |
-| `monthly` | the package's `fee`, less its own discount | afterwards, or skipped |
+| `monthly` | the package's `fee`, less any discount given **when it is collected** | afterwards, or skipped |
 
 - **Only the admit fee is collected at enrollment.** The month is created `due` and settled through the ordinary pay-bill endpoint, or left alone — in which case it appears on Due Payments like any other unpaid month. Enrolling without the admit fee is still impossible; that is what keeps the enrollment and its first payment committing together.
-- **Each charge takes its own discount**, each needing its own written reason (`discount`/`discountReason` for the admission, `monthDiscount`/`monthDiscountReason` for the month). Neither may exceed the charge it comes off.
+- **Each charge takes its own discount**, each needing its own written reason, and each is given on the step the manager decides it on. The admission's goes with the enrolling request (`discount`/`discountReason`); the month is billed at the package's full fee and discounted **at collection**, through the same `discount`/`discountReason` fields on pay-bill. Neither may exceed the charge it comes off.
+- **A discount at collection only applies to a bill nothing has been paid against.** A part-paid bill is refused (`already_part_paid`): discounting it would need reconciling against money already taken, which nothing asks for. A discount covering the whole bill settles it with no payment and no receipt, exactly as a fully discounted admission does.
 - **Skipping the month does not open the advance step.** Arrears block advance months — the oldest-first rule, unchanged — so the wizard ends at the receipt when the month is skipped.
 - **Both bills are due on the 5th**, like every month. A late-month enrollment therefore makes the skipped month immediately overdue; that is the existing rule for every month and was kept deliberately.
 - **Oldest-first now has to order within a month**: the admission is collected before the month's fee. `unpaid_bills()` orders by `(month, kind)`, pinned by a test rather than left to the alphabet.

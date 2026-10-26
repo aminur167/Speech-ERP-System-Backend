@@ -275,8 +275,6 @@ def enroll_monthly_with_admission(
     method: str,
     discount: Decimal = Decimal("0.00"),
     discount_reason: str = "",
-    month_discount: Decimal = Decimal("0.00"),
-    month_discount_reason: str = "",
     idempotency_key: str | None = None,
     client_created_at=None,
 ):
@@ -296,7 +294,10 @@ def enroll_monthly_with_admission(
     Enrollment is still impossible without the admit fee: that is what makes
     the enrollment and its first payment commit together.
 
-    Each charge takes its own discount, each needing its own written reason.
+    Each charge takes its own discount, each needing its own written reason
+    — but the month's is given **when it is collected**, not here, because
+    that is the step the manager decides it on. The month is billed at the
+    package's full fee and discounted at collection.
 
     Returns `(enrollment, payment)`; `payment` is None when the discount
     covered the whole admit fee, because a zero-taka payment is not a
@@ -350,13 +351,7 @@ def enroll_monthly_with_admission(
         discount, discount_reason, ceiling=admission_fee, what="admit fee",
         ceiling_code="discount_exceeds_fee", ceiling_key="admissionFee",
     )
-    month_discount = _validated_discount(
-        month_discount, month_discount_reason, ceiling=monthly_fee,
-        what="monthly fee", ceiling_code="month_discount_exceeds_fee",
-        ceiling_key="monthlyFee",
-    )
     discount_reason = (discount_reason or "").strip()
-    month_discount_reason = (month_discount_reason or "").strip()
 
     _assert_no_outstanding_dues(patient, action="enroll in a new service")
 
@@ -387,19 +382,17 @@ def enroll_monthly_with_admission(
     )
 
     # The enrollment month's own fee, alongside the admission rather than
-    # instead of it. Left `due`: the manager collects it next, or skips it
-    # and it joins Due Payments. Same due date as every other month -- the
-    # 5th -- which a late-month enrollment makes immediately overdue, and
-    # that is the existing rule for every month, kept deliberately.
+    # instead of it. Billed at the full fee and left `due`: the manager
+    # collects it next -- discounting it there if they choose -- or skips it
+    # and it joins Due Payments. Same due date as every other month, the
+    # 5th, which a late-month enrollment makes immediately overdue; that is
+    # the existing rule for every month, kept deliberately.
     MonthlyBill.objects.create(
         enrollment=enrollment,
         month=key,
         label=month_label(first_of_month),
         kind=MonthlyBill.Kind.MONTHLY,
-        gross_amount=monthly_fee if month_discount else None,
-        discount_amount=month_discount,
-        discount_reason=month_discount_reason,
-        amount=monthly_fee - month_discount,
+        amount=monthly_fee,
         due_date=due_date,
         status=BillStatus.DUE,
     )
@@ -416,8 +409,7 @@ def enroll_monthly_with_admission(
             "admissionFee": str(admission_fee),
             "discount": str(discount),
             "charged": str(payable),
-            "monthDiscount": str(month_discount),
-            "firstMonthBilled": str(monthly_fee - month_discount),
+            "firstMonthBilled": str(monthly_fee),
         },
     )
 
@@ -618,7 +610,8 @@ def _require_oldest(oldest, target) -> None:
 
 @transactional
 def collect_bill_payment(
-    *, actor, branch, bill, method: str, idempotency_key: str | None = None
+    *, actor, branch, bill, method: str, idempotency_key: str | None = None,
+    discount=Decimal("0.00"), discount_reason: str = "",
 ):
     """
     Take payment for a monthly bill and settle it — atomically.
@@ -655,13 +648,65 @@ def collect_bill_payment(
     return _collect_locked_bill(
         actor=actor, branch=branch, enrollment=enrollment, bill=bill,
         method=method, idempotency_key=idempotency_key,
+        discount=discount, discount_reason=discount_reason,
     )
 
 
-def _collect_locked_bill(*, actor, branch, enrollment, bill, method, idempotency_key):
+def _apply_collection_discount(bill, discount, reason: str) -> None:
+    """
+    Reduce an unpaid bill before settling it, recording why.
+
+    The enrollment month is billed at the package's full fee and discounted
+    here, at the desk, because that is the step the manager decides it on.
+    The bill keeps the original figure in `gross_amount` alongside the
+    discount and the reason, exactly as the admission does -- `amount` holds
+    what is actually owed, so refunds and every balance read it unchanged.
+
+    Only ever applied to a bill nothing has been paid against: the caller has
+    already refused a settled one, and a part-paid bill would need the
+    discount reconciled against money already taken, which nothing asks for.
+    """
+    value = _validated_discount(
+        discount, reason, ceiling=bill.amount, what="amount owed",
+        ceiling_code="discount_exceeds_bill", ceiling_key="amountOwed",
+    )
+    if value <= 0:
+        return
+
+    if bill.amount_paid > 0:
+        raise EnrollmentError(
+            "This bill is part paid and cannot be discounted now.",
+            code="already_part_paid",
+        )
+
+    bill.gross_amount = bill.amount
+    bill.discount_amount = value
+    bill.discount_reason = (reason or "").strip()
+    bill.amount = bill.amount - value
+    bill.save(
+        update_fields=["gross_amount", "discount_amount", "discount_reason", "amount"]
+    )
+
+
+def _collect_locked_bill(
+    *, actor, branch, enrollment, bill, method, idempotency_key,
+    discount=Decimal("0.00"), discount_reason: str = "",
+):
     """The collection proper, for a bill the caller has already locked."""
     if bill.is_settled or bill.status in CLOSED_STATUSES:
         raise EnrollmentError("This bill has already been settled.", code="already_paid")
+
+    _apply_collection_discount(bill, discount, discount_reason)
+
+    # Discounted to nothing: settled with no money and no receipt, the same
+    # as a fully discounted admission. A Payment must be at least 0.01.
+    if bill.amount <= 0:
+        bill.amount_paid = bill.amount
+        bill.status = bill.settled_status()
+        bill.paid_at = timezone.now()
+        bill.save(update_fields=["amount_paid", "status", "paid_at"])
+        _promote_bill(enrollment.oldest_unpaid_bill())
+        return None, bill
 
     # The two oldest unpaid bills, in one read. The first must be this one
     # (oldest-first); once it is paid, the second is the one to bring forward
@@ -685,7 +730,9 @@ def _collect_locked_bill(*, actor, branch, enrollment, bill, method, idempotency
 
 @transactional
 def collect_bill_payment_by_id(
-    *, actor, branch, enrollment, bill_id, method: str, idempotency_key: str | None = None
+    *, actor, branch, enrollment, bill_id, method: str,
+    idempotency_key: str | None = None,
+    discount=Decimal("0.00"), discount_reason: str = "",
 ):
     """
     `collect_bill_payment` for a request that names the bill by id.
@@ -713,6 +760,7 @@ def collect_bill_payment_by_id(
     return _collect_locked_bill(
         actor=actor, branch=branch, enrollment=enrollment, bill=bill,
         method=method, idempotency_key=idempotency_key,
+        discount=discount, discount_reason=discount_reason,
     )
 
 

@@ -128,9 +128,10 @@ class MonthlyEnrollAndPaySerializer(serializers.Serializer):
     from the package itself. The client sends only the discounts it is
     asking for, each checked against the charge it comes off.
 
-    `discount` is the admit fee's; `monthDiscount` is the first month's.
-    The first month is billed here but **not** paid here — it is collected
-    afterwards through pay-bill, or skipped and left on Due Payments.
+    `discount` is the admit fee's. The first month is billed here at the
+    package's full fee but **not** paid here — it is collected afterwards
+    through pay-bill, which is where its own discount is given, or skipped
+    and left on Due Payments.
     """
 
     patient = serializers.IntegerField()
@@ -141,13 +142,6 @@ class MonthlyEnrollAndPaySerializer(serializers.Serializer):
         default=Decimal("0.00"),
     )
     discountReason = serializers.CharField(
-        required=False, allow_blank=True, max_length=500, default=""
-    )
-    monthDiscount = serializers.DecimalField(
-        max_digits=12, decimal_places=2, required=False, min_value=Decimal("0.00"),
-        default=Decimal("0.00"),
-    )
-    monthDiscountReason = serializers.CharField(
         required=False, allow_blank=True, max_length=500, default=""
     )
     idempotencyKey = serializers.CharField(required=False, allow_blank=True, max_length=64)
@@ -175,6 +169,15 @@ class CollectPaymentSerializer(serializers.Serializer):
     # use (they're full-payment-by-the-5th by rule).
     amount = serializers.DecimalField(
         max_digits=12, decimal_places=2, required=False, min_value=Decimal("0.01")
+    )
+    # Monthly bills: a discount given at the desk as the bill is collected,
+    # which is where the manager decides it. Any discount needs a reason.
+    discount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, min_value=Decimal("0.00"),
+        default=Decimal("0.00"),
+    )
+    discountReason = serializers.CharField(
+        required=False, allow_blank=True, max_length=500, default=""
     )
 
 
