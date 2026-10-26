@@ -124,9 +124,13 @@ class MonthlyEnrollAndPaySerializer(serializers.Serializer):
     """
     Enroll in a monthly package and pay the admit fee, in one request.
 
-    No amount: the server prices the admission from the package's own admit
-    fee. The client sends only the discount it is asking for, which the
-    service layer checks against that fee.
+    No amounts: the server prices both the admission and the first month
+    from the package itself. The client sends only the discounts it is
+    asking for, each checked against the charge it comes off.
+
+    `discount` is the admit fee's; `monthDiscount` is the first month's.
+    The first month is billed here but **not** paid here — it is collected
+    afterwards through pay-bill, or skipped and left on Due Payments.
     """
 
     patient = serializers.IntegerField()
@@ -137,6 +141,13 @@ class MonthlyEnrollAndPaySerializer(serializers.Serializer):
         default=Decimal("0.00"),
     )
     discountReason = serializers.CharField(
+        required=False, allow_blank=True, max_length=500, default=""
+    )
+    monthDiscount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, min_value=Decimal("0.00"),
+        default=Decimal("0.00"),
+    )
+    monthDiscountReason = serializers.CharField(
         required=False, allow_blank=True, max_length=500, default=""
     )
     idempotencyKey = serializers.CharField(required=False, allow_blank=True, max_length=64)

@@ -146,6 +146,8 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
                 method=data["method"],
                 discount=data["discount"],
                 discount_reason=data["discountReason"],
+                month_discount=data["monthDiscount"],
+                month_discount_reason=data["monthDiscountReason"],
                 idempotency_key=data.get("idempotencyKey") or None,
                 client_created_at=data.get("clientCreatedAt"),
             )

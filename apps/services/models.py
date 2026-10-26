@@ -61,13 +61,15 @@ class Service(TimeStampedModel, SoftDeleteModel):
         validators=[MinValueValidator(Decimal("0.01"))],
     )
 
-    # Monthly packages only: what the enrollment month costs instead of `fee`.
-    # A new patient pays this (less any discount given at the desk) to start,
-    # and `fee` from the following month on. Nullable because other
-    # categories have no such thing; the write serializer is what makes it
-    # required for a monthly package, the same "requiredness lives in the
-    # serializer" rule as patients. A monthly package that somehow lacks one
-    # falls back to `fee` (see `Service.effective_admission_fee`).
+    # Monthly packages only: a one-time joining charge, taken **in addition
+    # to** the enrollment month's own fee rather than instead of it
+    # (confirmed 2026-10-26; before that it replaced the first month).
+    # Nullable because other categories have no such thing; the write
+    # serializer is what makes it required for a monthly package, the same
+    # "requiredness lives in the serializer" rule as patients. A monthly
+    # package that somehow lacks one is refused at enrollment rather than
+    # falling back to `fee` -- under the split that fallback would bill two
+    # months and call one of them an admission.
     admission_fee = models.DecimalField(
         max_digits=12,
         decimal_places=2,
@@ -125,7 +127,14 @@ class Service(TimeStampedModel, SoftDeleteModel):
 
     @property
     def effective_admission_fee(self) -> Decimal:
-        """What a new enrollment's first month costs, before any discount."""
+        """
+        The joining charge, before any discount.
+
+        Kept for readers that only want a number to display. The enrollment
+        flow deliberately does **not** use it: a package with no admit fee is
+        refused there, because silently charging `fee` as an admission would
+        double the enrollment month now that the month is billed separately.
+        """
         return self.admission_fee if self.admission_fee is not None else self.fee
 
     def active_enrollment_count(self) -> int:

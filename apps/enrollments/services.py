@@ -231,6 +231,35 @@ def create_monthly_enrollment(*, actor, branch, patient, service, months_ahead: 
     return enrollment
 
 
+def _validated_discount(
+    amount, reason: str, *, ceiling: Decimal, what: str,
+    ceiling_code: str, ceiling_key: str,
+) -> Decimal:
+    """
+    One discount, checked the same way wherever it is given.
+
+    Shared by the admit fee and the first month's fee so the two cannot drift
+    apart: a reason is required for any discount at all, and no discount may
+    exceed the charge it is taken off. Returns the amount as a Decimal.
+    """
+    value = Decimal(amount or 0)
+
+    if value < 0:
+        raise EnrollmentError("A discount cannot be negative.", code="invalid_discount")
+    if value > ceiling:
+        raise EnrollmentError(
+            f"The discount cannot be more than the {what} ({ceiling}).",
+            code=ceiling_code,
+            extra={ceiling_key: str(ceiling)},
+        )
+    if value > 0 and not (reason or "").strip():
+        raise EnrollmentError(
+            f"Say why a discount is being given on the {what}.",
+            code="discount_reason_required",
+        )
+    return value
+
+
 def admission_label(month_date: date) -> str:
     """`Admission — September 2026`, within the bill label's 32 characters."""
     return f"Admission — {month_label(month_date)}"
@@ -246,17 +275,32 @@ def enroll_monthly_with_admission(
     method: str,
     discount: Decimal = Decimal("0.00"),
     discount_reason: str = "",
+    month_discount: Decimal = Decimal("0.00"),
+    month_discount_reason: str = "",
     idempotency_key: str | None = None,
     client_created_at=None,
 ):
     """
     Enroll a patient in a monthly package and take the admit fee — one step.
 
-    The enrollment month is billed at the package's admit fee, less whatever
-    discount the manager gives at the desk; the monthly fee starts the month
-    after, raised by the monthly job exactly as before. Returns
-    `(enrollment, payment)`; `payment` is None when the discount covered the
-    whole admit fee, because a zero-taka payment is not a payment.
+    **The enrollment month carries two separate charges** (confirmed
+    2026-10-26, replacing the single merged bill confirmed 2026-09-28): the
+    one-time admit fee, and that same month's ordinary monthly fee. They are
+    two bills so the receipt, the refund and the due list can all speak about
+    them separately, and so the month can be left unpaid without the
+    admission being left unpaid with it.
+
+    Only the admit fee is taken here. The first month is created `due` and
+    collected afterwards through the ordinary pay-bill endpoint, or skipped —
+    in which case it appears on Due Payments like any other unpaid month.
+    Enrollment is still impossible without the admit fee: that is what makes
+    the enrollment and its first payment commit together.
+
+    Each charge takes its own discount, each needing its own written reason.
+
+    Returns `(enrollment, payment)`; `payment` is None when the discount
+    covered the whole admit fee, because a zero-taka payment is not a
+    payment.
 
     **Enrollment and payment commit together.** They used to be two requests,
     and a manager who stopped between them left an enrollment behind whose
@@ -287,22 +331,32 @@ def enroll_monthly_with_admission(
             "Only a monthly package can be enrolled here.", code="not_monthly"
         )
 
-    admission_fee = Decimal(service.effective_admission_fee)
-    discount = Decimal(discount or 0)
-    discount_reason = (discount_reason or "").strip()
+    if service.admission_fee is None:
+        # The admit fee is mandatory on a monthly package and the write
+        # serializer enforces it, so this is a package that predates the
+        # rule or was written around it. Refused rather than guessed at:
+        # the old fallback charged the monthly fee again, which under the
+        # split above would silently bill the patient for two months.
+        raise EnrollmentError(
+            f"{service.name} has no admit fee set. An Admin must add one "
+            "before anyone can enroll in it.",
+            code="admission_fee_missing",
+        )
 
-    if discount < 0:
-        raise EnrollmentError("A discount cannot be negative.", code="invalid_discount")
-    if discount > admission_fee:
-        raise EnrollmentError(
-            f"The discount cannot be more than the admit fee ({admission_fee}).",
-            code="discount_exceeds_fee",
-            extra={"admissionFee": str(admission_fee)},
-        )
-    if discount > 0 and not discount_reason:
-        raise EnrollmentError(
-            "Say why a discount is being given.", code="discount_reason_required"
-        )
+    admission_fee = Decimal(service.admission_fee)
+    monthly_fee = Decimal(service.fee)
+
+    discount = _validated_discount(
+        discount, discount_reason, ceiling=admission_fee, what="admit fee",
+        ceiling_code="discount_exceeds_fee", ceiling_key="admissionFee",
+    )
+    month_discount = _validated_discount(
+        month_discount, month_discount_reason, ceiling=monthly_fee,
+        what="monthly fee", ceiling_code="month_discount_exceeds_fee",
+        ceiling_key="monthlyFee",
+    )
+    discount_reason = (discount_reason or "").strip()
+    month_discount_reason = (month_discount_reason or "").strip()
 
     _assert_no_outstanding_dues(patient, action="enroll in a new service")
 
@@ -316,7 +370,9 @@ def enroll_monthly_with_admission(
 
     first_of_month = timezone.localdate().replace(day=1)
     key = month_key(first_of_month)
+    due_date = due_date_for_month(key)
     payable = admission_fee - discount
+
     bill = MonthlyBill.objects.create(
         enrollment=enrollment,
         month=key,
@@ -326,7 +382,25 @@ def enroll_monthly_with_admission(
         discount_amount=discount,
         discount_reason=discount_reason,
         amount=payable,
-        due_date=due_date_for_month(key),
+        due_date=due_date,
+        status=BillStatus.DUE,
+    )
+
+    # The enrollment month's own fee, alongside the admission rather than
+    # instead of it. Left `due`: the manager collects it next, or skips it
+    # and it joins Due Payments. Same due date as every other month -- the
+    # 5th -- which a late-month enrollment makes immediately overdue, and
+    # that is the existing rule for every month, kept deliberately.
+    MonthlyBill.objects.create(
+        enrollment=enrollment,
+        month=key,
+        label=month_label(first_of_month),
+        kind=MonthlyBill.Kind.MONTHLY,
+        gross_amount=monthly_fee if month_discount else None,
+        discount_amount=month_discount,
+        discount_reason=month_discount_reason,
+        amount=monthly_fee - month_discount,
+        due_date=due_date,
         status=BillStatus.DUE,
     )
 
@@ -338,10 +412,12 @@ def enroll_monthly_with_admission(
         reason=discount_reason,
         changes={
             "service": service.name,
-            "fee": str(service.fee),
+            "fee": str(monthly_fee),
             "admissionFee": str(admission_fee),
             "discount": str(discount),
             "charged": str(payable),
+            "monthDiscount": str(month_discount),
+            "firstMonthBilled": str(monthly_fee - month_discount),
         },
     )
 
@@ -1391,6 +1467,7 @@ def collect_monthly_advance(
         bill, _ = MonthlyBill.objects.get_or_create(
             enrollment=enrollment,
             month=key,
+            kind=MonthlyBill.Kind.MONTHLY,
             defaults={
                 "label": label,
                 "amount": enrollment.service.fee,
@@ -1495,9 +1572,15 @@ def generate_due_bills(*, up_to: date | None = None) -> dict:
 
         while cursor <= target:
             key = month_key(cursor)
+            # `kind` is part of the lookup, not just the defaults: the
+            # enrollment month holds an admission bill as well, and matching
+            # on (enrollment, month) alone would raise
+            # MultipleObjectsReturned the first time this job reached one --
+            # a month after the enrollment, with nobody watching.
             _, was_created = MonthlyBill.objects.get_or_create(
                 enrollment=enrollment,
                 month=key,
+                kind=MonthlyBill.Kind.MONTHLY,
                 defaults={
                     "label": month_label(cursor),
                     "amount": enrollment.service.fee,
@@ -2018,9 +2101,13 @@ def _open_cycle_from(
         key = month_key(month_date)
         status = BillStatus.DUE if offset == 0 else BillStatus.UPCOMING
 
+        # Reopening a cycle means the month's own fee, never the admission:
+        # rejoining does not charge the admit fee again, and without `kind`
+        # this lookup matches both of the enrollment month's bills.
         bill, created = MonthlyBill.objects.get_or_create(
             enrollment=enrollment,
             month=key,
+            kind=MonthlyBill.Kind.MONTHLY,
             defaults={
                 "label": month_label(month_date),
                 "amount": enrollment.service.fee,

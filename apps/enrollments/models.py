@@ -226,7 +226,12 @@ class MonthlyEnrollment(TimeStampedModel, IdempotentModel):
         return (
             self.bills.exclude(status__in=NON_OUTSTANDING_STATUSES)
             .filter(amount_paid__lt=models.F("amount"))
-            .order_by("month")
+            # Within the enrollment month there are two bills, and the
+            # admission is the older debt: joining is what the first month's
+            # fee is charged *for*. "admission" sorting before "monthly" is
+            # alphabetical luck, so `test_admission_is_collected_before_the
+            # _first_month` pins the order rather than trusting it.
+            .order_by("month", "kind")
         )
 
     def oldest_unpaid_bill(self):
@@ -274,8 +279,14 @@ class MonthlyBill(PayableMixin):
             # The monthly generation job must be safely re-runnable — running
             # it twice in a month must not produce a duplicate bill. Enforced
             # here rather than trusting the scheduler to fire exactly once.
+            #
+            # `kind` is part of it because the enrollment month carries two
+            # bills: the one-time admission charge and that month's own fee.
+            # Everything else is still one bill per month — the job only ever
+            # writes MONTHLY, so it remains as protected as it was.
             models.UniqueConstraint(
-                fields=["enrollment", "month"], name="uniq_bill_per_enrollment_month"
+                fields=["enrollment", "month", "kind"],
+                name="uniq_bill_per_enrollment_month_kind",
             )
         ]
         indexes = [models.Index(fields=["status", "due_date"])]
