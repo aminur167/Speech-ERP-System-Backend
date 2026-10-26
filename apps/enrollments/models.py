@@ -326,7 +326,21 @@ class InstallmentPlan(TimeStampedModel):
     branch = models.ForeignKey(
         "branches.Branch", on_delete=models.PROTECT, related_name="installment_plans"
     )
+    # What the plan is actually worth -- the package fee less any discount
+    # agreed at the desk. The installments are split from this figure, so
+    # every balance, collection and refund reads it unchanged, exactly as
+    # MonthlyBill.amount does.
     total_amount = models.DecimalField(max_digits=12, decimal_places=2)
+    # The package fee before that discount, kept beside it with the reason:
+    # a plan worth less than its package is not something a reconciliation
+    # should have to infer. Null when no discount was given.
+    gross_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    discount_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
+    )
+    discount_reason = models.TextField(blank=True)
     status = models.CharField(
         max_length=16, choices=EnrollmentStatus.choices,
         default=EnrollmentStatus.ACTIVE, db_index=True,

@@ -101,6 +101,15 @@ class InstallmentPlanSerializer(serializers.ModelSerializer):
     totalAmount = serializers.DecimalField(
         source="total_amount", max_digits=12, decimal_places=2, read_only=True
     )
+    # The package fee before any discount, null when none was given — the
+    # screens strike it through beside the price actually agreed.
+    grossAmount = serializers.DecimalField(
+        source="gross_amount", max_digits=12, decimal_places=2, read_only=True
+    )
+    discountAmount = serializers.DecimalField(
+        source="discount_amount", max_digits=12, decimal_places=2, read_only=True
+    )
+    discountReason = serializers.CharField(source="discount_reason", read_only=True)
     createdAt = serializers.DateTimeField(source="created_at", read_only=True)
     startsOn = serializers.DateField(source="starts_on", read_only=True)
     endsOn = serializers.DateField(source="ends_on", read_only=True)
@@ -110,7 +119,8 @@ class InstallmentPlanSerializer(serializers.ModelSerializer):
         model = InstallmentPlan
         fields = [
             "id", "patientId", "patientName", "serviceId", "serviceName",
-            "branchId", "status", "totalAmount", "installments", "createdAt",
+            "branchId", "status", "totalAmount", "grossAmount", "discountAmount",
+            "discountReason", "installments", "createdAt",
             "startsOn", "endsOn", "outstanding",
         ]
         read_only_fields = fields
@@ -149,9 +159,23 @@ class MonthlyEnrollAndPaySerializer(serializers.Serializer):
 
 
 class InstallmentPlanCreateSerializer(serializers.Serializer):
+    """
+    No amount: the server prices the plan from the package itself. The client
+    sends only the discount it is asking for, which comes off the package fee
+    before the installments are split — so the discounted figure is the
+    plan's price, not a credit applied later.
+    """
+
     patient = serializers.IntegerField()
     service = serializers.IntegerField()
     numberOfInstallments = serializers.IntegerField(min_value=2, max_value=12)
+    discount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, min_value=Decimal("0.00"),
+        default=Decimal("0.00"),
+    )
+    discountReason = serializers.CharField(
+        required=False, allow_blank=True, max_length=500, default=""
+    )
     # The window the plan must be cleared in. Optional together — omitting
     # both keeps the older monthly schedule (see create_installment_plan);
     # the service layer rejects one without the other.

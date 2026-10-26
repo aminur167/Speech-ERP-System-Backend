@@ -466,6 +466,8 @@ class InstallmentPlanViewSet(_EnrollmentBase):
                 number_of_installments=data["numberOfInstallments"],
                 starts_on=data.get("startsOn"),
                 ends_on=data.get("endsOn"),
+                discount=data["discount"],
+                discount_reason=data["discountReason"],
             )
         except services.EnrollmentError as exc:
             return _error(exc)
