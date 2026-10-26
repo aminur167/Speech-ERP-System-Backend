@@ -53,6 +53,14 @@ A monthly enrollment is created **and its first month paid in one atomic request
 
 `services.create_monthly_enrollment` (enroll without payment, first month at the monthly fee) remains as an internal function for the seed command and tests; no endpoint reaches it.
 
+### ✅ CONFIRMED (2026-10-26): an installment package can be discounted when the plan is created
+
+The discount comes off the package fee **first**, and the installments are split from what is left — so the discounted figure *is* the plan's price, not a credit applied to it later. Everything downstream already reads `total_amount`, so the collection, the balance and any refund follow with no further change.
+
+- `discount`/`discountReason` on the create-plan request, the same pair every other discount in the system uses, validated by the same `_validated_discount` helper: a reason is required for any discount, and it may not exceed the package fee.
+- `InstallmentPlan` keeps `gross_amount` (the fee before the discount, null when none was given), `discount_amount` and `discount_reason` beside `total_amount` — a plan worth less than its package is not something a reconciliation should have to infer.
+- **A discount covering the whole fee is refused** (`discount_leaves_nothing`). Every `Installment.amount` carries `MinValueValidator(0.01)`, so a zero-value plan cannot be written down; refusing in words beats letting it surface as a row-level validation error.
+
 ### ✅ CONFIRMED (2026-10-26): the admit fee and the first month are charged separately
 
 Replaces the merged bill above. The enrollment month now carries **two bills**, both dated the same month:

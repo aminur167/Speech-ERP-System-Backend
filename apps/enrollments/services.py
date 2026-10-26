@@ -475,9 +475,18 @@ def create_installment_plan(
     number_of_installments: int,
     starts_on: date | None = None,
     ends_on: date | None = None,
+    discount: Decimal = Decimal("0.00"),
+    discount_reason: str = "",
 ):
     """
     Split a service fee into equal installments across an agreed window.
+
+    A discount agreed at the desk comes off the package fee first, and the
+    installments are split from what is left — so the discounted figure is
+    the plan's price, not a credit applied somewhere later. The package fee
+    and the reason are kept beside it (`gross_amount`, `discount_reason`),
+    because a plan worth less than its package is not something anyone
+    should have to infer afterwards.
 
     Given `starts_on`/`ends_on`, due dates spread evenly across that range —
     first on the start, last on the end — so the plan clears inside it.
@@ -518,7 +527,26 @@ def create_installment_plan(
                 code="range_too_short",
             )
 
-    total = Decimal(service.fee)
+    fee = Decimal(service.fee)
+    discount = _validated_discount(
+        discount, discount_reason, ceiling=fee, what="package fee",
+        ceiling_code="discount_exceeds_fee", ceiling_key="fee",
+    )
+    discount_reason = (discount_reason or "").strip()
+
+    total = fee - discount
+    if total <= 0:
+        # Every installment carries MinValueValidator(0.01), so a plan worth
+        # nothing cannot be written down -- and a free package paid in
+        # instalments is a contradiction anyway. Refused in words rather
+        # than left to surface as a validation error on the rows.
+        raise EnrollmentError(
+            "The discount cannot cover the whole package fee — there would be "
+            "nothing left to pay in installments.",
+            code="discount_leaves_nothing",
+            extra={"fee": str(fee)},
+        )
+
     amounts = split_equally(total, number_of_installments)
 
     plan = InstallmentPlan.objects.create(
@@ -526,6 +554,9 @@ def create_installment_plan(
         service=service,
         branch=branch,
         total_amount=total,
+        gross_amount=fee if discount else None,
+        discount_amount=discount,
+        discount_reason=discount_reason,
         starts_on=starts_on,
         ends_on=ends_on,
     )
@@ -563,8 +594,11 @@ def create_installment_plan(
         action=AuditLog.Action.CREATE,
         target=plan,
         branch=branch,
+        reason=discount_reason,
         changes={
             "service": service.name,
+            "fee": str(fee),
+            "discount": str(discount),
             "total": str(total),
             "parts": number_of_installments,
             "window": f"{starts_on} → {ends_on}" if starts_on else "monthly",
