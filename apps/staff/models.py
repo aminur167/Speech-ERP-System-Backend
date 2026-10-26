@@ -17,6 +17,10 @@ from apps.common.models import SoftDeleteModel, TimeStampedModel
 class StaffMember(TimeStampedModel, SoftDeleteModel):
     class Designation(models.TextChoices):
         THERAPIST = "therapist", "Therapist"
+        # Sits next to Therapist rather than at the end of the list: both
+        # work with the children directly, and the dropdown reads better
+        # with the care roles together and "Other" still last.
+        PLAY_TEACHER = "play_teacher", "Play Teacher"
         RECEPTIONIST = "receptionist", "Receptionist"
         ACCOUNTANT = "accountant", "Accountant"
         SUPPORT_STAFF = "support_staff", "Support Staff"
