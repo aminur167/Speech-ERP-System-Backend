@@ -377,6 +377,7 @@ class Command(BaseCommand):
                 MonthlyBill.objects.get_or_create(
                     enrollment=enrollment,
                     month=key,
+                    kind=MonthlyBill.Kind.MONTHLY,
                     defaults={
                         "label": services.month_label(month_date),
                         "amount": enrollment.bills.first().amount,

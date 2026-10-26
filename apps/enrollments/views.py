@@ -185,6 +185,8 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
                 bill_id=bill_id,
                 method=serializer.validated_data["method"],
                 idempotency_key=serializer.validated_data.get("idempotencyKey") or None,
+                discount=serializer.validated_data["discount"],
+                discount_reason=serializer.validated_data["discountReason"],
             )
         except services.EnrollmentError as exc:
             if exc.code == "bill_not_found":
@@ -196,7 +198,10 @@ class MonthlyEnrollmentViewSet(_EnrollmentBase):
         prefetch_related_objects([enrollment], "bills")
         return Response(
             {
-                "payment": PaymentSerializer(payment).data,
+                # Null when a discount covered the whole bill: it is settled
+                # with no money and no receipt, the same as a fully
+                # discounted admission (a Payment must be at least 0.01).
+                "payment": PaymentSerializer(payment).data if payment else None,
                 "enrollment": MonthlyEnrollmentSerializer(enrollment).data,
             }
         )

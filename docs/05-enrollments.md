@@ -37,6 +37,8 @@ Collection endpoints currently require the **full remaining balance** — partia
 
 Bill generation: on enrollment, create the current month + next two. First is `due`, the rest `upcoming`.
 
+### ⚠️ SUPERSEDED (2026-10-26) — see the amendment below
+
 ### ✅ CONFIRMED (2026-09-28): the enrollment month is the admit fee, paid up front
 
 A monthly enrollment is created **and its first month paid in one atomic request** — `POST /api/enrollments/monthly/` with `{ patient, service, method, discount?, discountReason?, idempotencyKey? }`, returning `{ enrollment, payment }`. There is no longer any way to enroll without paying: an enrollment created first and paid later is how an abandoned screen left behind an unpaid first month that was already overdue.
@@ -50,6 +52,26 @@ A monthly enrollment is created **and its first month paid in one atomic request
 - Idempotency is keyed on the enrollment (`MonthlyEnrollment.idempotency_key`), not only the payment, so a replayed fully-discounted enrollment is also returned rather than duplicated.
 
 `services.create_monthly_enrollment` (enroll without payment, first month at the monthly fee) remains as an internal function for the seed command and tests; no endpoint reaches it.
+
+### ✅ CONFIRMED (2026-10-26): the admit fee and the first month are charged separately
+
+Replaces the merged bill above. The enrollment month now carries **two bills**, both dated the same month:
+
+| kind | amount | taken |
+|---|---|---|
+| `admission` | the package's `admission_fee`, less its own discount | at enrollment, in the same atomic request |
+| `monthly` | the package's `fee`, less any discount given **when it is collected** | afterwards, or skipped |
+
+- **Only the admit fee is collected at enrollment.** The month is created `due` and settled through the ordinary pay-bill endpoint, or left alone — in which case it appears on Due Payments like any other unpaid month. Enrolling without the admit fee is still impossible; that is what keeps the enrollment and its first payment committing together.
+- **Each charge takes its own discount**, each needing its own written reason, and each is given on the step the manager decides it on. The admission's goes with the enrolling request (`discount`/`discountReason`); the month is billed at the package's full fee and discounted **at collection**, through the same `discount`/`discountReason` fields on pay-bill. Neither may exceed the charge it comes off.
+- **A discount at collection only applies to a bill nothing has been paid against.** A part-paid bill is refused (`already_part_paid`): discounting it would need reconciling against money already taken, which nothing asks for. A discount covering the whole bill settles it with no payment and no receipt, exactly as a fully discounted admission does.
+- **Skipping the month does not open the advance step.** Arrears block advance months — the oldest-first rule, unchanged — so the wizard ends at the receipt when the month is skipped.
+- **Both bills are due on the 5th**, like every month. A late-month enrollment therefore makes the skipped month immediately overdue; that is the existing rule for every month and was kept deliberately.
+- **Oldest-first now has to order within a month**: the admission is collected before the month's fee. `unpaid_bills()` orders by `(month, kind)`, pinned by a test rather than left to the alphabet.
+- `MonthlyBill`'s unique constraint became `(enrollment, month, kind)`. Every lookup that keyed on `(enrollment, month)` alone had to name a kind — the monthly generation job, the advance collection, the resume path and the seed command — or it raises `MultipleObjectsReturned` the first time it meets an enrollment month.
+- **A monthly package with no admit fee is refused** (`admission_fee_missing`) rather than falling back to the monthly fee, which under the split would bill two months and call one of them an admission. The admit fee stays required on monthly packages.
+
+⚠️ **Deployment:** existing packages still carry `admission_fee = fee` from `services/0008`. Until an Admin revisits them, enrolling costs the admit fee **plus** a month instead of one merged month. Revise the package fees as part of the rollout, before taking enrollments.
 
 ### ✅ CONFIRMED: monthly billing rules
 

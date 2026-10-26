@@ -43,7 +43,11 @@ If the clinic ever wants a one-time signup charge later, add it deliberately as 
 
 ### ✅ CONFIRMED (2026-09-28): monthly packages carry an `admission_fee`
 
-This is **not** the dropped `registration_fee`. Registering a patient is still free. The admit fee is what a **monthly package's first month** costs instead of its monthly fee, and it is actually charged, with a receipt, as the enrollment month's bill (see `05`).
+This is **not** the dropped `registration_fee`. Registering a patient is still free. The admit fee is a **one-time joining charge on a monthly package**, charged with a receipt as its own bill in the enrollment month (see `05`).
+
+> **⚠️ Superseded (2026-10-26).** This used to read "what a monthly package's first month costs **instead of** its monthly fee". The client now wants the two taken separately — the admit fee **and** that month's own fee — so the enrollment month carries two bills. See the amendment in `05`.
+>
+> Packages still carry the `admission_fee = fee` default that migration `services/0008` gave them, which under the old rule meant "unchanged" and under the new one means "twice the old joining cost". **Every monthly package's admit fee needs revisiting**; nothing in the code can tell which value was deliberate.
 
 - `admission_fee` — Decimal, nullable in the schema; **required for `monthly` packages** by the write serializer, and dropped (stored as null) for every other category.
 - Packages that existed before the field got `admission_fee = fee` from migration `services/0008`, so enrolling in them costs what it did before until someone edits the package.

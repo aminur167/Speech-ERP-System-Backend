@@ -4,9 +4,13 @@ Monthly package admit fee, and enrolling with the admit fee paid up front.
 The rules these pin (confirmed with the client, docs/05):
 
   * every monthly package carries an admit fee; other categories never do;
-  * the enrollment month is billed at the admit fee, less any discount the
-    manager gives — with a written reason — and the monthly fee starts the
-    month after;
+  * the enrollment month carries TWO bills — the one-time admit fee and that
+    month's own fee (confirmed 2026-10-26, replacing the single merged bill
+    confirmed 2026-09-28). Each takes its own discount, each needing its own
+    written reason — the admission's is given at enrollment, the month's when
+    the month is collected, which is the step the manager decides it on;
+  * only the admit fee is taken at enrollment. The first month is left `due`
+    and collected afterwards, or skipped onto Due Payments;
   * enrolling and paying the admit fee are one atomic request, so there is
     never an enrollment whose first month was never paid;
   * reactivating a stopped service charges the monthly fee, not the admit
@@ -48,6 +52,32 @@ def patient(patient_factory):
 def enroll(client, patient, package, **extra):
     body = {"patient": patient.pk, "service": package.pk, "method": "cash", **extra}
     return client.post(ENROLL_URL, body, format="json")
+
+
+def by_kind(bills):
+    """The enrollment month's bills, keyed by kind — `admission` / `monthly`."""
+    return {bill["kind"]: bill for bill in bills}
+
+
+def pay_first_month(manager, branch, enrollment, **extra):
+    """Settle the month that enrollment leaves `due`."""
+    bill = enrollment.bills.get(kind=MonthlyBill.Kind.MONTHLY)
+    return services.collect_bill_payment(
+        actor=manager, branch=branch, bill=bill, method="cash", **extra
+    )
+
+
+def collect_month_via_api(client, enrollment, **body):
+    """POST the pay-bill endpoint for the enrollment month."""
+    bill = enrollment.bills.get(kind=MonthlyBill.Kind.MONTHLY)
+    return client.post(
+        reverse(
+            "enrollments:monthly-enrollment-pay-bill",
+            args=[enrollment.pk, bill.pk],
+        ),
+        {"method": "cash", **body},
+        format="json",
+    )
 
 
 def enroll_directly(manager, branch, patient, package, **extra):
@@ -203,23 +233,82 @@ class TestBackfillMigration:
 
 @pytest.mark.money
 class TestEnrollAndPay:
-    def test_the_first_month_is_billed_and_paid_at_the_admit_fee(
+    def test_enrollment_bills_the_admit_fee_and_the_month_separately(
         self, manager_client, patient, package
     ):
         response = enroll(manager_client, patient, package)
 
         assert response.status_code == 201, response.json()
-        body = response.json()
-        [bill] = body["enrollment"]["bills"]
-        assert bill["kind"] == "admission"
-        assert bill["month"] == services.month_key(timezone.localdate())
-        assert bill["amount"] == "3000.00"
-        assert bill["grossAmount"] == "3000.00"
-        assert bill["discountAmount"] == "0.00"
-        assert bill["status"] == "paid"
-        assert bill["outstanding"] == "0.00"
+        bills = by_kind(response.json()["enrollment"]["bills"])
+        this_month = services.month_key(timezone.localdate())
+
+        assert set(bills) == {"admission", "monthly"}
+        assert bills["admission"]["month"] == this_month
+        assert bills["monthly"]["month"] == this_month
+        assert bills["admission"]["amount"] == "3000.00"
+        assert bills["monthly"]["amount"] == "5000.00"
+
+    def test_only_the_admit_fee_is_taken_at_enrollment(
+        self, manager_client, patient, package
+    ):
+        body = enroll(manager_client, patient, package).json()
+        bills = by_kind(body["enrollment"]["bills"])
+
+        assert bills["admission"]["status"] == "paid"
+        assert bills["admission"]["outstanding"] == "0.00"
         assert body["payment"]["amount"] == "3000.00"
         assert body["payment"]["category"] == PaymentCategory.MONTHLY
+
+        # Billed but not collected -- that is the step a manager may skip.
+        assert bills["monthly"]["status"] in {"due", "overdue"}
+        assert bills["monthly"]["outstanding"] == "5000.00"
+        assert Payment.objects.count() == 1
+
+    def test_the_first_month_can_be_collected_afterwards(
+        self, manager, branch, patient, package
+    ):
+        enrollment, _ = enroll_directly(manager, branch, patient, package)
+
+        payment, bill = pay_first_month(manager, branch, enrollment)
+
+        assert payment.amount == Decimal("5000.00")
+        assert bill.status == BillStatus.PAID
+        assert enrollment.outstanding_total() == Decimal("0.00")
+
+    def test_skipping_the_first_month_leaves_it_owed(
+        self, manager, branch, patient, package
+    ):
+        """Skipping is simply not collecting it -- there is no second call."""
+        enrollment, _ = enroll_directly(manager, branch, patient, package)
+
+        assert enrollment.outstanding_total() == Decimal("5000.00")
+        assert enrollment.oldest_unpaid_bill().kind == MonthlyBill.Kind.MONTHLY
+
+    def test_admission_is_collected_before_the_first_month(
+        self, manager, branch, patient, package
+    ):
+        """
+        Oldest-first across two bills sharing a month. Pinned rather than
+        trusted: it falls out of "admission" sorting before "monthly", which
+        is alphabetical luck, not a rule anyone wrote down.
+        """
+        enrollment = MonthlyEnrollment.objects.create(
+            patient=patient, service=package, branch=branch
+        )
+        month = services.month_key(timezone.localdate())
+        due = services.due_date_for_month(month)
+        MonthlyBill.objects.create(
+            enrollment=enrollment, month=month, label="x",
+            kind=MonthlyBill.Kind.MONTHLY, amount=Decimal("5000.00"),
+            due_date=due, status=BillStatus.DUE,
+        )
+        MonthlyBill.objects.create(
+            enrollment=enrollment, month=month, label="y",
+            kind=MonthlyBill.Kind.ADMISSION, amount=Decimal("3000.00"),
+            due_date=due, status=BillStatus.DUE,
+        )
+
+        assert enrollment.oldest_unpaid_bill().kind == MonthlyBill.Kind.ADMISSION
 
     def test_the_receipt_says_it_was_the_admit_fee(self, manager_client, patient, package):
         body = enroll(manager_client, patient, package).json()
@@ -233,12 +322,113 @@ class TestEnrollAndPay:
 
         assert response.status_code == 201, response.json()
         body = response.json()
-        [bill] = body["enrollment"]["bills"]
+        bill = by_kind(body["enrollment"]["bills"])["admission"]
         assert bill["grossAmount"] == "3000.00"
         assert bill["discountAmount"] == "500.00"
         assert bill["discountReason"] == "Sibling already enrolled"
         assert bill["amount"] == "2500.00"
         assert body["payment"]["amount"] == "2500.00"
+
+    def test_the_month_is_billed_at_the_full_fee(self, manager_client, patient, package):
+        """Its discount belongs to the collection step, not to enrolling."""
+        response = enroll(
+            manager_client, patient, package, discount="500.00", discountReason="Sibling"
+        )
+
+        bills = by_kind(response.json()["enrollment"]["bills"])
+        assert bills["admission"]["amount"] == "2500.00"
+        assert bills["monthly"]["amount"] == "5000.00"
+        assert bills["monthly"]["discountAmount"] == "0.00"
+
+    def test_the_month_takes_its_own_discount_when_collected(
+        self, manager_client, manager, branch, patient, package
+    ):
+        enrollment, _ = enroll_directly(manager, branch, patient, package)
+
+        response = collect_month_via_api(
+            manager_client, enrollment,
+            discount="800.00", discountReason="Joined mid-month",
+        )
+
+        assert response.status_code == 200, response.json()
+        assert response.json()["payment"]["amount"] == "4200.00"
+        bill = enrollment.bills.get(kind=MonthlyBill.Kind.MONTHLY)
+        assert bill.gross_amount == Decimal("5000.00")
+        assert bill.discount_amount == Decimal("800.00")
+        assert bill.discount_reason == "Joined mid-month"
+        assert bill.amount == Decimal("4200.00")
+        assert bill.status == BillStatus.PAID
+
+    def test_the_two_discounts_are_independent(
+        self, manager_client, manager, branch, patient, package
+    ):
+        enrollment, admission_payment = enroll_directly(
+            manager, branch, patient, package,
+            discount=Decimal("500.00"), discount_reason="Sibling",
+        )
+
+        month = collect_month_via_api(
+            manager_client, enrollment,
+            discount="800.00", discountReason="Joined mid-month",
+        ).json()
+
+        assert admission_payment.amount == Decimal("2500.00")
+        assert month["payment"]["amount"] == "4200.00"
+
+    def test_a_collection_discount_without_a_reason_is_refused(
+        self, manager_client, manager, branch, patient, package
+    ):
+        enrollment, _ = enroll_directly(manager, branch, patient, package)
+
+        response = collect_month_via_api(manager_client, enrollment, discount="800.00")
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "discount_reason_required"
+        bill = enrollment.bills.get(kind=MonthlyBill.Kind.MONTHLY)
+        assert bill.amount == Decimal("5000.00")
+        assert bill.outstanding == Decimal("5000.00")
+
+    def test_a_collection_discount_above_the_bill_is_refused(
+        self, manager_client, manager, branch, patient, package
+    ):
+        enrollment, _ = enroll_directly(manager, branch, patient, package)
+
+        response = collect_month_via_api(
+            manager_client, enrollment, discount="5000.01", discountReason="x",
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "discount_exceeds_bill"
+        assert enrollment.bills.get(kind=MonthlyBill.Kind.MONTHLY).outstanding == Decimal(
+            "5000.00"
+        )
+
+    def test_a_fully_discounted_month_settles_with_no_payment(
+        self, manager_client, manager, branch, patient, package
+    ):
+        enrollment, _ = enroll_directly(manager, branch, patient, package)
+        before = Payment.objects.count()
+
+        response = collect_month_via_api(
+            manager_client, enrollment, discount="5000.00", discountReason="Waived",
+        )
+
+        assert response.status_code == 200, response.json()
+        assert response.json()["payment"] is None
+        bill = enrollment.bills.get(kind=MonthlyBill.Kind.MONTHLY)
+        assert bill.amount == Decimal("0.00")
+        assert bill.status == BillStatus.PAID
+        assert bill.paid_at is not None
+        assert Payment.objects.count() == before
+
+    def test_collecting_without_a_discount_charges_the_full_fee(
+        self, manager_client, manager, branch, patient, package
+    ):
+        enrollment, _ = enroll_directly(manager, branch, patient, package)
+
+        response = collect_month_via_api(manager_client, enrollment)
+
+        assert response.json()["payment"]["amount"] == "5000.00"
 
     def test_the_discount_and_reason_are_in_the_audit_log(
         self, manager, branch, patient, package
@@ -298,20 +488,28 @@ class TestEnrollAndPay:
         assert response.status_code == 201, response.json()
         body = response.json()
         assert body["payment"] is None
-        [bill] = body["enrollment"]["bills"]
+        bill = by_kind(body["enrollment"]["bills"])["admission"]
         assert bill["amount"] == "0.00"
         assert bill["status"] == "paid"
         assert bill["paidAt"] is not None
         assert not Payment.objects.exists()
 
-    def test_a_package_never_given_an_admit_fee_charges_its_monthly_fee(
+    def test_a_package_with_no_admit_fee_is_refused(
         self, manager_client, patient, service_factory
     ):
+        """
+        It used to fall back to the monthly fee. Now that the month is billed
+        separately, that fallback would charge the patient two months and
+        call one of them an admission, so the enrollment is refused instead.
+        """
         legacy = service_factory(fee=Decimal("4200.00"), admission_fee=None)
 
-        body = enroll(manager_client, patient, legacy).json()
+        response = enroll(manager_client, patient, legacy)
 
-        assert body["payment"]["amount"] == "4200.00"
+        assert response.status_code == 400
+        assert response.json()["code"] == "admission_fee_missing"
+        assert not MonthlyEnrollment.objects.exists()
+        assert not Payment.objects.exists()
 
     def test_the_monthly_fee_starts_the_following_month(
         self, manager, branch, patient, package
@@ -330,6 +528,7 @@ class TestEnrollAndPay:
         self, manager, branch, patient, package
     ):
         enrollment, _ = enroll_directly(manager, branch, patient, package)
+        pay_first_month(manager, branch, enrollment)
         ahead = services.month_key(services.add_months(timezone.localdate(), 1))
 
         payments, _ = services.collect_monthly_advance(
@@ -338,6 +537,23 @@ class TestEnrollAndPay:
         )
 
         assert payments[0].amount == Decimal("5000.00")
+
+    def test_advance_is_refused_while_the_first_month_is_skipped(
+        self, manager, branch, patient, package
+    ):
+        """
+        Skipping leaves an arrear, and arrears block advance months -- the
+        oldest-first rule, unchanged. The wizard therefore ends at the
+        receipt when the month is skipped.
+        """
+        enrollment, _ = enroll_directly(manager, branch, patient, package)
+        ahead = services.month_key(services.add_months(timezone.localdate(), 1))
+
+        with pytest.raises(services.EnrollmentError):
+            services.collect_monthly_advance(
+                actor=manager, branch=branch, enrollment=enrollment,
+                months=[ahead], method="cash",
+            )
 
     def test_a_non_monthly_package_is_refused(
         self, manager, branch, patient, service_factory
@@ -453,12 +669,29 @@ class TestLaterLife:
         self, manager, branch, patient, package
     ):
         enrollment, _ = enroll_directly(manager, branch, patient, package)
+        pay_first_month(manager, branch, enrollment)
         services.stop_monthly_service(actor=manager, enrollment=enrollment, decisions={})
 
         services.resume_monthly_service(actor=manager, enrollment=enrollment)
 
         assert enrollment.bills.filter(kind=MonthlyBill.Kind.ADMISSION).count() == 1
-        assert Payment.objects.count() == 1
+        # One for the admission, one for the month. Neither is charged again.
+        assert Payment.objects.count() == 2
+
+    def test_stopping_asks_about_a_skipped_first_month(
+        self, manager, branch, patient, package
+    ):
+        """
+        The split gives the enrollment month a bill that can still be owed
+        when the service stops, so it now needs a decision like any other
+        arrear rather than disappearing with the service.
+        """
+        enrollment, _ = enroll_directly(manager, branch, patient, package)
+
+        with pytest.raises(services.EnrollmentError):
+            services.stop_monthly_service(
+                actor=manager, enrollment=enrollment, decisions={}
+            )
 
     def test_a_resumed_cycle_bills_the_monthly_fee(self, manager, branch, patient, package):
         enrollment, _ = enroll_directly(manager, branch, patient, package)
@@ -474,12 +707,26 @@ class TestLaterLife:
         self, manager, branch, patient, package
     ):
         first, _ = enroll_directly(manager, branch, patient, package)
+        pay_first_month(manager, branch, first)
         services.stop_monthly_service(actor=manager, enrollment=first, decisions={})
 
         second, payment = enroll_directly(manager, branch, patient, package)
 
         assert second.pk != first.pk
         assert payment.amount == Decimal("3000.00")
+
+    def test_a_skipped_first_month_blocks_a_new_enrollment(
+        self, manager, branch, patient, package
+    ):
+        """
+        The existing "no new service while you owe" gate, now reachable from
+        a skipped first month -- worth pinning because skipping is offered by
+        the wizard rather than being an accident.
+        """
+        enroll_directly(manager, branch, patient, package)
+
+        with pytest.raises(services.EnrollmentError):
+            enroll_directly(manager, branch, patient, package)
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +789,6 @@ class TestBranchIsolationAndRoles:
             reverse("enrollments:monthly-enrollment-detail", args=[enrollment.pk])
         ).json()
 
-        [bill] = body["bills"]
+        bill = by_kind(body["bills"])["admission"]
         assert bill["discountAmount"] == "500.00"
         assert bill["discountReason"] == "Hardship"
