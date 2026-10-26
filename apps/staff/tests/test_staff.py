@@ -52,6 +52,53 @@ def farhana(staff_member_factory):
     return staff_member_factory(name="Farhana Akter", monthly_salary=Decimal("42000.00"))
 
 
+class TestDesignations:
+    """
+    The dropdown's values are the model's choices -- a value the frontend
+    offers but the serializer rejects fails only at the moment a manager
+    presses Save, which is the worst place to find out.
+    """
+
+    @pytest.mark.parametrize(
+        "designation",
+        ["therapist", "play_teacher", "receptionist", "accountant",
+         "support_staff", "cleaner", "other"],
+    )
+    def test_every_offered_designation_is_accepted(self, manager_client, designation):
+        response = manager_client.post(
+            reverse("staff:staffmember-list"),
+            {
+                "name": "Tanvir Hasan",
+                "designation": designation,
+                "phone": "01710000000",
+                "joined_at": "2025-01-15",
+                "monthly_salary": "38000.00",
+                "status": "active",
+            },
+            format="json",
+        )
+
+        assert response.status_code == 201, response.json()
+        assert response.json()["designation"] == designation
+
+    def test_an_unknown_designation_is_still_rejected(self, manager_client):
+        response = manager_client.post(
+            reverse("staff:staffmember-list"),
+            {
+                "name": "Tanvir Hasan",
+                "designation": "wizard",
+                "phone": "01710000000",
+                "joined_at": "2025-01-15",
+                "monthly_salary": "38000.00",
+                "status": "active",
+            },
+            format="json",
+        )
+
+        assert response.status_code == 400
+        assert "designation" in response.json()
+
+
 class TestRosterCrud:
     def test_manager_can_create_staff(self, manager_client):
         response = manager_client.post(
