@@ -16,6 +16,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.common import audit
+from apps.common.discounts import validated_discount
 from apps.common.models import AuditLog
 from apps.common.sequences import next_value
 from apps.materials.models import Material, MaterialMovement, MaterialSaleItem
@@ -116,7 +117,7 @@ def adjust_stock(
 @transaction.atomic
 def sell_materials(
     *, actor, branch, patient, items: list[dict], method: str,
-    idempotency_key: str | None = None,
+    discount=0, discount_reason: str = "", idempotency_key: str | None = None,
 ):
     """
     POS checkout: deduct stock, record the lines, and take payment — all or
@@ -124,6 +125,14 @@ def sell_materials(
 
     `items` carries only `{material_id, quantity}`. Prices come from the
     database; a client-supplied price is never used.
+
+    The discount is **one figure off the whole cart**, not per line. A
+    counter sale is settled as a total, the refund path already values a
+    return from `MaterialSaleItem.unit_price`, and per-line discounts would
+    have had to be reconciled against that on every partial return. It is
+    recorded on the Payment, which for a counter sale *is* the charge
+    record, and checked by the same rule as every other discount
+    (apps/common/discounts.py).
 
     Everything is one transaction so a failure partway can't leave stock
     deducted with no payment, or a payment with no stock movement.
@@ -183,16 +192,35 @@ def sell_materials(
 
     resolved = list(lines.values())
 
+    # One paisa short of the total: a cart discounted to nothing would leave
+    # no record of the sale at all. A Payment must be at least 0.01, and
+    # every sale line and stock movement hangs off that payment -- so stock
+    # would walk out of the branch with nothing to show where it went.
+    ceiling = max(total - Decimal("0.01"), Decimal("0.00"))
+    discount_value = validated_discount(
+        discount, discount_reason, ceiling=ceiling, what="cart total",
+        ceiling_code="discount_exceeds_total", ceiling_key="cartTotal",
+        error=MaterialError,
+    )
+    payable = total - discount_value
+
     payment, _created = payment_services.record_payment(
         actor=actor,
         branch=branch,
         patient=patient,
-        amount=total,
+        amount=payable,
         method=method,
         category=PaymentCategory.MATERIAL_SALE,
         description=", ".join(f"{r['material'].name} × {r['quantity']}" for r in resolved),
         idempotency_key=idempotency_key,
     )
+    if discount_value > 0:
+        payment.gross_amount = total
+        payment.discount_amount = discount_value
+        payment.discount_reason = (discount_reason or "").strip()
+        payment.save(
+            update_fields=["gross_amount", "discount_amount", "discount_reason"]
+        )
 
     # Stock, the sale lines and the stock movements, each written in one
     # statement however many items are in the cart.
@@ -231,7 +259,12 @@ def sell_materials(
         target=payment,
         branch=branch,
         reason="Material sale",
-        changes={"total": str(total), "lines": len(resolved)},
+        changes={
+            "total": str(total),
+            "discount": str(discount_value),
+            "collected": str(payable),
+            "lines": len(resolved),
+        },
     )
     return payment, sale_items, True
 

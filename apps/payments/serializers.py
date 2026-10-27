@@ -34,6 +34,17 @@ class PaymentSerializer(serializers.ModelSerializer):
     dueAfter = serializers.DecimalField(
         source="due_after", max_digits=12, decimal_places=2, read_only=True, allow_null=True
     )
+    # Daily sessions and counter sales: the charge before a discount given
+    # at the desk, and why. Null/zero everywhere else -- a payment against a
+    # bill, a plan or a booking carries its discount on that record instead.
+    grossAmount = serializers.DecimalField(
+        source="gross_amount", max_digits=12, decimal_places=2,
+        read_only=True, allow_null=True,
+    )
+    discountAmount = serializers.DecimalField(
+        source="discount_amount", max_digits=12, decimal_places=2, read_only=True
+    )
+    discountReason = serializers.CharField(source="discount_reason", read_only=True)
 
     class Meta:
         model = Payment
@@ -42,6 +53,7 @@ class PaymentSerializer(serializers.ModelSerializer):
             "patientId", "patientName", "patientCode",
             "amount", "method", "status", "category", "description",
             "collectedBy", "branchId", "branchName", "createdAt", "dueAfter",
+            "grossAmount", "discountAmount", "discountReason",
         ]
         read_only_fields = fields
 

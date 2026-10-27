@@ -187,6 +187,8 @@ class MaterialViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
                 patient=patient,
                 items=items,
                 method=data["method"],
+                discount=data.get("discount") or 0,
+                discount_reason=data.get("discountReason") or "",
                 idempotency_key=data.get("idempotencyKey") or None,
             )
         except services.MaterialError as exc:

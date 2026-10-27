@@ -217,6 +217,18 @@ class BookingSerializer(serializers.ModelSerializer):
     advanceAmount = serializers.DecimalField(
         source="advance_amount", max_digits=12, decimal_places=2, read_only=True
     )
+    # What the session is worth after any discount, and the fee before it.
+    # Null on bookings taken before the fee was recorded (see the model).
+    feeAmount = serializers.DecimalField(
+        source="fee_amount", max_digits=12, decimal_places=2, read_only=True
+    )
+    grossAmount = serializers.DecimalField(
+        source="gross_amount", max_digits=12, decimal_places=2, read_only=True
+    )
+    discountAmount = serializers.DecimalField(
+        source="discount_amount", max_digits=12, decimal_places=2, read_only=True
+    )
+    discountReason = serializers.CharField(source="discount_reason", read_only=True)
     # A staff-made booking (`create_booking`) always has its payment attached
     # from the moment it's created; only a website booking
     # (`create_public_booking`) can ever be confirmed with none yet.
@@ -227,6 +239,7 @@ class BookingSerializer(serializers.ModelSerializer):
         fields = [
             "id", "bookingCode", "patientId", "patientName", "patientPhone", "serviceId",
             "serviceName", "branchId", "branchName", "date", "time", "advanceAmount",
+            "feeAmount", "grossAmount", "discountAmount", "discountReason",
             "advancePaid", "status",
         ]
         read_only_fields = fields
@@ -241,9 +254,10 @@ class CollectBookingAdvanceSerializer(serializers.Serializer):
 
 class BookingCreateSerializer(serializers.Serializer):
     """
-    Deliberately no `advanceAmount` field -- see the module docstring on
-    `create_booking`. The server computes it from the service fee; there is
-    nothing here for a client to tamper with.
+    No session fee: the server prices it from the package, as everywhere
+    else. `advanceAmount` is how much of that to take today and is the
+    manager's to decide -- omitted, it falls back to the suggested ratio.
+    The discount comes off the fee and is checked against it server-side.
     """
 
     patient = serializers.IntegerField()
@@ -251,6 +265,17 @@ class BookingCreateSerializer(serializers.Serializer):
     date = serializers.DateField()
     time = serializers.CharField(max_length=16)
     method = serializers.ChoiceField(choices=PaymentMethod.choices)
+    advanceAmount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True,
+        min_value=Decimal("0.00"),
+    )
+    discount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, min_value=Decimal("0.00"),
+        default=Decimal("0.00"),
+    )
+    discountReason = serializers.CharField(
+        required=False, allow_blank=True, max_length=500, default=""
+    )
     idempotencyKey = serializers.CharField(required=False, allow_blank=True, max_length=64)
 
 
@@ -473,4 +498,27 @@ class CollectAdvanceSerializer(serializers.Serializer):
         child=serializers.CharField(max_length=7), allow_empty=False, max_length=36
     )
     method = serializers.ChoiceField(choices=PaymentMethod.choices)
+    idempotencyKey = serializers.CharField(required=False, allow_blank=True, max_length=64)
+
+
+class DailyChargeSerializer(serializers.Serializer):
+    """
+    One daily session, charged at the catalogue fee less a discount.
+
+    No `amount`: until this endpoint existed the browser posted its own
+    figure straight to `/api/payments/`, so a discount was given by typing a
+    smaller number and nothing recorded that one had been given at all. The
+    fee is the server's, as it is for every other package.
+    """
+
+    patient = serializers.IntegerField()
+    service = serializers.IntegerField()
+    method = serializers.ChoiceField(choices=PaymentMethod.choices)
+    discount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, min_value=Decimal("0.00"),
+        default=Decimal("0.00"),
+    )
+    discountReason = serializers.CharField(
+        required=False, allow_blank=True, max_length=500, default=""
+    )
     idempotencyKey = serializers.CharField(required=False, allow_blank=True, max_length=64)

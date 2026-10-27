@@ -86,6 +86,26 @@ class Payment(TimeStampedModel, SoftDeleteModel):
     # same even if the service was renamed or retired.
     description = models.CharField(max_length=255, blank=True)
 
+    # What the charge was before a discount, and why it was given.
+    #
+    # These belong on the payment only where the payment IS the charge
+    # record: a daily session and a counter sale raise no bill, so there is
+    # nowhere else for the figures to live. Monthly bills, installments and
+    # bookings carry their own (see enrollments.models) -- a payment against
+    # one of those is a settlement, not the charge, and duplicating the
+    # discount onto it would give the same reconciliation two answers.
+    #
+    # `gross_amount` is null when no discount was given, exactly as it is on
+    # InstallmentPlan; when it is set, `amount == gross_amount -
+    # discount_amount` holds, because both these flows are paid in full.
+    gross_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    discount_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
+    )
+    discount_reason = models.TextField(blank=True)
+
     # Set on the client per user-initiated action. Unique so a replayed request
     # (network retry, or an offline queue flushing) returns the original
     # payment instead of charging twice.

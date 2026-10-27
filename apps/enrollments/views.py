@@ -8,6 +8,7 @@ Admin can see everything but shouldn't transact on a branch's behalf.
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from django.db.models import Q, prefetch_related_objects
 from rest_framework import status, viewsets
+from rest_framework.views import APIView
 from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAuthenticated
@@ -33,6 +34,7 @@ from apps.enrollments.serializers import (
     BookingSerializer,
     CancelBookingSerializer,
     CollectPaymentSerializer,
+    DailyChargeSerializer,
     InstallmentPlanCreateSerializer,
     InstallmentPlanSerializer,
     MonthlyEnrollAndPaySerializer,
@@ -659,6 +661,9 @@ class BookingViewSet(_EnrollmentBase):
                 booking_date=data["date"],
                 booking_time=data["time"],
                 method=data["method"],
+                advance_amount=data.get("advanceAmount"),
+                discount=data.get("discount") or 0,
+                discount_reason=data.get("discountReason") or "",
                 idempotency_key=data.get("idempotencyKey") or None,
             )
         except services.EnrollmentError as exc:
@@ -667,7 +672,9 @@ class BookingViewSet(_EnrollmentBase):
         return Response(
             {
                 "booking": BookingSerializer(booking).data,
-                "payment": PaymentSerializer(payment).data,
+                # Null when the advance taken today was nothing -- a booking
+                # with no money against it yet, same as a website booking.
+                "payment": PaymentSerializer(payment).data if payment else None,
             },
             status=status.HTTP_201_CREATED,
         )
@@ -703,4 +710,56 @@ class BookingViewSet(_EnrollmentBase):
 
         return Response(
             {"booking": BookingSerializer(booking).data, "payment": PaymentSerializer(payment).data}
+        )
+
+
+class DailyChargeView(APIView):
+    """
+    `POST /api/enrollments/daily/` -- take payment for one daily session.
+
+    A plain view, not a ViewSet: a daily session has no row of its own to
+    list or retrieve. The Payment is the whole record of it, which is also
+    why the discount lives there and why it cannot take the entire fee (see
+    `services.charge_daily_session`).
+    """
+
+    permission_classes = [IsAuthenticated, IsManager]
+
+    @extend_schema(
+        request=DailyChargeSerializer,
+        responses={201: PaymentSerializer},
+        tags=["enrollments"],
+    )
+    def post(self, request):
+        serializer = DailyChargeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        branch = manager_branch(request)
+
+        try:
+            patient = Patient.objects.get(pk=data["patient"], branch=branch)
+            service = Service.objects.get(pk=data["service"], is_active=True)
+        except (Patient.DoesNotExist, Service.DoesNotExist):
+            return Response(
+                {"detail": "Patient or service not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+
+        try:
+            payment, created = services.charge_daily_session(
+                actor=request.user,
+                branch=branch,
+                patient=patient,
+                service=service,
+                method=data["method"],
+                discount=data.get("discount") or 0,
+                discount_reason=data.get("discountReason") or "",
+                idempotency_key=data.get("idempotencyKey") or None,
+            )
+        except services.EnrollmentError as exc:
+            return _error(exc)
+
+        return Response(
+            PaymentSerializer(payment).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         )
