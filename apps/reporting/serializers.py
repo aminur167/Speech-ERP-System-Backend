@@ -120,3 +120,33 @@ class DailyLedgerRowSerializer(serializers.Serializer):
     expenseCount = serializers.IntegerField()
     expenses = serializers.DecimalField(max_digits=14, decimal_places=2)
     netRevenue = serializers.DecimalField(max_digits=14, decimal_places=2)
+
+
+class BranchReportSerializer(serializers.Serializer):
+    """
+    The whole report, in one response.
+
+    Loosely typed on purpose: every section is already shaped by
+    `services.branch_report`, and re-declaring forty nested fields here would
+    be a second description of the same thing to keep in step. The schema
+    still names the sections so `/api/docs/` says what comes back.
+    """
+
+    dateFrom = serializers.DateField()
+    dateTo = serializers.DateField()
+    grossCollected = serializers.DecimalField(max_digits=14, decimal_places=2)
+    refunded = serializers.DecimalField(max_digits=14, decimal_places=2)
+    expenses = serializers.DecimalField(max_digits=14, decimal_places=2)
+    netRevenue = serializers.DecimalField(max_digits=14, decimal_places=2)
+    outstandingDue = serializers.DecimalField(max_digits=14, decimal_places=2)
+    byMethod = serializers.ListField(child=serializers.DictField())
+    byCategory = serializers.ListField(child=serializers.DictField())
+    expensesByCategory = serializers.ListField(child=serializers.DictField())
+    refunds = serializers.ListField(child=serializers.DictField())
+    voids = serializers.ListField(child=serializers.DictField())
+    attendance = serializers.DictField()
+    services = serializers.DictField()
+    materialsSold = serializers.ListField(child=serializers.DictField())
+    staffAttendance = serializers.DictField()
+    enquiries = serializers.DictField()
+    payments = serializers.ListField(child=serializers.DictField())

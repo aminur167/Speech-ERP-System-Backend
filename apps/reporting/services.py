@@ -27,7 +27,16 @@ disturb a closed period.
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
-from django.db.models import Count, Exists, OuterRef, Q, Sum
+from django.db.models import (
+    Count,
+    DecimalField,
+    Exists,
+    ExpressionWrapper,
+    F,
+    OuterRef,
+    Q,
+    Sum,
+)
 from django.db.models.functions import TruncDate
 from django.utils import timezone
 
@@ -717,3 +726,212 @@ def branch_activity(*, branch_id=None, date_from: date, date_to: date) -> list[d
 
     rows.sort(key=lambda row: row["occurredAt"], reverse=True)
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Branch report (the PDF the manager hands to the admin)
+# ---------------------------------------------------------------------------
+
+
+def _as_decimal_strings(value):
+    """
+    Every money figure out as a string, however deep it sits.
+
+    The other reporting views declare DRF `DecimalField`s, which honour
+    COERCE_DECIMAL_TO_STRING; this payload is nine nested sections and
+    declaring forty fields to restate what the service already shapes would
+    be a second description to keep in step. Walking it once is the smaller
+    thing -- and without it the renderer emits floats, which is the one
+    representation this codebase never uses for money.
+    """
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _as_decimal_strings(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_as_decimal_strings(item) for item in value]
+    return value
+
+
+def branch_report(*, branch_id=None, date_from: date, date_to: date) -> dict:
+    """
+    One branch's whole working period, in one read.
+
+    Composed rather than invented: the money half is `branch_summary`
+    unchanged, so the PDF and the Summary screen can never disagree about a
+    figure. What this adds is everything the Summary page does not load --
+    expenses by category, the adjustments behind the totals, patients,
+    services, materials, staff and enquiries -- plus the payment list that
+    lets an Admin trace any number back to a receipt.
+
+    Gathered server-side in one request on purpose. Fetching nine sections
+    from nine endpoints would make them nine different moments: a payment
+    taken between the first call and the last would appear in the total and
+    not in the list, and the report would be quietly wrong in a way nobody
+    could reproduce.
+    """
+    from apps.enquiries.models import Enquiry
+    from apps.enrollments.models import Booking, InstallmentPlan, MonthlyEnrollment
+    from apps.materials.models import MaterialSaleItem
+    from apps.patients.models import PatientAttendance
+    from apps.staff.models import StaffAttendance
+
+    in_range = {"created_at__date__gte": date_from, "created_at__date__lte": date_to}
+
+    def scoped(queryset, field="branch_id"):
+        return queryset.filter(**{field: branch_id}) if branch_id else queryset
+
+    # --- expenses, split the way the Expenses screen splits them ----------
+    expenses = scoped(Expense.objects.filter(**in_range))
+    expenses_by_category = [
+        {"category": row["category"], "amount": row["total"], "count": row["n"]}
+        for row in expenses.filter(status__in=COUNTED_EXPENSE_STATUSES)
+        .values("category")
+        .annotate(total=Sum("amount"), n=Count("pk"))
+        .order_by("-total")
+    ]
+    expense_status = expenses.aggregate(
+        approved=Sum("amount", filter=Q(status=Expense.Status.APPROVED)),
+        pending=Sum("amount", filter=Q(status=Expense.Status.PENDING)),
+    )
+
+    # --- adjustments: why the takings are not just the sum of receipts ----
+    #
+    # Refunds are dated by approval and voids by the payment's own date --
+    # there is no `voided_at` column -- which is exactly how `branch_summary`
+    # counts them, so the two agree.
+    refunds = [
+        {
+            "receiptNumber": r.payment.receipt_number,
+            "patientName": r.payment.patient.name,
+            "amount": r.amount,
+            "reason": r.reason,
+            "reviewedAt": r.reviewed_at,
+        }
+        for r in scoped(
+            RefundRequest.objects.filter(
+                status=RefundRequest.Status.APPROVED,
+                reviewed_at__date__gte=date_from,
+                reviewed_at__date__lte=date_to,
+            )
+        ).select_related("payment", "payment__patient")[:200]
+    ]
+    voids = [
+        {
+            "receiptNumber": p.receipt_number,
+            "patientName": p.patient.name,
+            "amount": p.amount,
+            "createdAt": p.created_at,
+        }
+        for p in scoped(
+            Payment.all_objects.filter(status=PaymentStatus.VOID, **in_range)
+        ).select_related("patient")[:200]
+    ]
+
+    # --- patients and attendance -------------------------------------------
+    attendance = scoped(
+        PatientAttendance.objects.filter(date__gte=date_from, date__lte=date_to)
+    ).aggregate(
+        present=Count("pk", filter=Q(status=PatientAttendance.Status.PRESENT)),
+        informed=Count("pk", filter=Q(status=PatientAttendance.Status.INFORMED_ABSENCE)),
+        absent=Count("pk", filter=Q(status=PatientAttendance.Status.ABSENT)),
+    )
+
+    # --- services taken up in the period -----------------------------------
+    monthly_new = scoped(MonthlyEnrollment.objects.filter(**in_range)).count()
+    plans_new = scoped(InstallmentPlan.objects.filter(**in_range)).count()
+    bookings = scoped(
+        Booking.objects.filter(date__gte=date_from, date__lte=date_to)
+    ).aggregate(
+        total=Count("pk"),
+        cancelled=Count("pk", filter=Q(status=Booking.Status.CANCELLED)),
+    )
+
+    # --- materials sold ----------------------------------------------------
+    sold = (
+        MaterialSaleItem.objects.filter(
+            payment__status=PaymentStatus.PAID,
+            payment__created_at__date__gte=date_from,
+            payment__created_at__date__lte=date_to,
+        )
+        .filter(**({"payment__branch_id": branch_id} if branch_id else {}))
+        .values("material__name")
+        # `qty`, not `quantity`: an annotation shadows the column it is named
+        # after, and `F("quantity")` below would then resolve to this very
+        # aggregate instead of the field.
+        .annotate(
+            qty=Sum("quantity"),
+            amount=Sum(
+                ExpressionWrapper(
+                    F("quantity") * F("unit_price"),
+                    output_field=DecimalField(max_digits=14, decimal_places=2),
+                )
+            ),
+        )
+        .order_by("-amount")
+    )
+    materials_sold = [
+        {"name": row["material__name"], "quantity": row["qty"], "amount": row["amount"]}
+        for row in sold
+    ]
+
+    # --- staff attendance --------------------------------------------------
+    staff = scoped(
+        StaffAttendance.objects.filter(date__gte=date_from, date__lte=date_to)
+    ).aggregate(
+        present=Count("pk", filter=Q(status=StaffAttendance.Status.PRESENT)),
+        early_leave=Count("pk", filter=Q(status=StaffAttendance.Status.EARLY_LEAVE)),
+        on_leave=Count("pk", filter=Q(status=StaffAttendance.Status.ON_LEAVE)),
+        absent=Count("pk", filter=Q(status=StaffAttendance.Status.ABSENT)),
+    )
+
+    # --- enquiries: which ads produced calls, and how many came in ---------
+    enquiries_qs = scoped(
+        Enquiry.objects.filter(called_at__date__gte=date_from, called_at__date__lte=date_to)
+    )
+    enquiries = {
+        "total": enquiries_qs.count(),
+        "converted": enquiries_qs.filter(status=Enquiry.Status.CONVERTED).count(),
+        "bySource": [
+            {"source": row["source"], "count": row["n"]}
+            for row in enquiries_qs.values("source").annotate(n=Count("pk")).order_by("-n")
+        ],
+    }
+
+    # --- every receipt, so any figure above can be traced ------------------
+    payments = [
+        {
+            "receiptNumber": p.receipt_number,
+            "patientName": p.patient.name,
+            "patientCode": p.patient.patient_code,
+            "category": p.category,
+            "method": p.method,
+            "status": p.status,
+            "amount": p.amount,
+            "collectedBy": p.collected_by.name if p.collected_by else "",
+            "createdAt": p.created_at,
+        }
+        for p in scoped(
+            Payment.objects.filter(status=PaymentStatus.PAID, **in_range)
+        ).select_related("patient", "collected_by").order_by("created_at")
+    ]
+
+    return _as_decimal_strings({
+        **branch_summary(branch_id=branch_id, date_from=date_from, date_to=date_to),
+        "expensesByCategory": expenses_by_category,
+        "expensesApproved": expense_status["approved"] or Decimal("0.00"),
+        "expensesPending": expense_status["pending"] or Decimal("0.00"),
+        "refunds": refunds,
+        "voids": voids,
+        "attendance": attendance,
+        "services": {
+            "newMonthly": monthly_new,
+            "newInstallmentPlans": plans_new,
+            "bookings": bookings["total"],
+            "bookingsCancelled": bookings["cancelled"],
+        },
+        "materialsSold": materials_sold,
+        "staffAttendance": staff,
+        "enquiries": enquiries,
+        "payments": payments,
+    })
