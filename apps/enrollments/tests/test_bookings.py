@@ -109,14 +109,19 @@ class TestBookingCreation:
 
 
 @pytest.mark.money
-class TestAdvanceRecomputedServerSide:
+class TestTheAdvanceIsTheDesksDecision:
     """
-    The escalation this endpoint used to be wide open to: the mock's
-    `advanceAmount` field, posted straight from the client with nothing
-    checking it against the service fee.
+    The advance used to be `fee x BOOKING_ADVANCE_RATIO`, recomputed here and
+    refused from the client; the clinic asked for the desk to set it, so the
+    ratio is now only what the form suggests.
+
+    What is still the server's, and what these pin, is the *fee*: a request
+    may say how much to take today, never what the session costs. That was
+    always the half that mattered -- a client-chosen advance is a manager
+    undercollecting, a client-chosen fee is a changed price.
     """
 
-    def test_advance_is_half_the_service_fee(
+    def test_the_ratio_is_the_default_when_no_advance_is_given(
         self, manager_client, patient, online_service
     ):
         response = manager_client.post(
@@ -126,21 +131,186 @@ class TestAdvanceRecomputedServerSide:
         assert Decimal(response.json()["payment"]["amount"]) == Decimal("2000.00")
         assert Decimal(response.json()["booking"]["advanceAmount"]) == Decimal("2000.00")
 
-    def test_the_serializer_has_no_advance_amount_field_to_tamper_with(
+    def test_a_manager_can_set_the_advance(
         self, manager_client, patient, online_service
     ):
-        """
-        Posting a client-chosen amount is simply ignored -- there is no field
-        for it, the same pattern as the materials sale endpoint.
-        """
         response = manager_client.post(
             LIST_URL,
-            payload(patient, online_service, advanceAmount="1.00"),
+            payload(patient, online_service, advanceAmount="1500.00"),
             format="json",
         )
 
         assert response.status_code == 201
-        assert Decimal(response.json()["payment"]["amount"]) == Decimal("2000.00")
+        assert Decimal(response.json()["payment"]["amount"]) == Decimal("1500.00")
+        body = response.json()["booking"]
+        assert Decimal(body["advanceAmount"]) == Decimal("1500.00")
+        # And the fee is untouched by it -- the session still costs 4000.
+        assert Decimal(body["feeAmount"]) == Decimal("4000.00")
+
+    def test_an_advance_of_nothing_books_the_slot_and_takes_no_payment(
+        self, manager_client, patient, online_service
+    ):
+        """
+        Allowed on purpose: the Booking row records the session either way,
+        and `collect-advance` is the path for taking the money later -- the
+        same state a website booking arrives in.
+        """
+        response = manager_client.post(
+            LIST_URL, payload(patient, online_service, advanceAmount="0"), format="json"
+        )
+
+        assert response.status_code == 201
+        assert response.json()["payment"] is None
+        booking = Booking.objects.get(pk=response.json()["booking"]["id"])
+        assert booking.advance_amount == Decimal("0.00")
+        assert booking.payment_id is None
+        assert booking.status == Booking.Status.CONFIRMED
+
+    def test_an_advance_of_nothing_is_replay_safe(
+        self, manager_client, patient, online_service
+    ):
+        """
+        The replay guard reads the Booking, not its payment. Keyed on the
+        payment -- as it was -- a zero advance would find nothing on retry
+        and mint a second booking_code for the same slot.
+        """
+        body = payload(
+            patient, online_service, advanceAmount="0", idempotencyKey="zero-advance-1"
+        )
+
+        first = manager_client.post(LIST_URL, body, format="json")
+        second = manager_client.post(LIST_URL, body, format="json")
+
+        assert first.status_code == 201 and second.status_code == 201
+        assert first.json()["booking"]["id"] == second.json()["booking"]["id"]
+        assert Booking.objects.count() == 1
+
+    def test_an_advance_over_the_fee_is_refused(
+        self, manager_client, patient, online_service
+    ):
+        response = manager_client.post(
+            LIST_URL,
+            payload(patient, online_service, advanceAmount="4500.00"),
+            format="json",
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "advance_exceeds_fee"
+        assert Booking.objects.count() == 0
+
+    def test_the_fee_is_not_accepted_from_the_client(
+        self, manager_client, patient, online_service
+    ):
+        """There is no field for it; a posted one is ignored, not honoured."""
+        response = manager_client.post(
+            LIST_URL,
+            payload(patient, online_service, fee="10.00", feeAmount="10.00"),
+            format="json",
+        )
+
+        assert response.status_code == 201
+        assert Decimal(response.json()["booking"]["feeAmount"]) == Decimal("4000.00")
+
+
+@pytest.mark.money
+class TestTheOnlineDiscount:
+    """
+    A discount comes off the session fee, and the advance is taken against
+    what is left. Checked by the shared rule every other discount follows
+    (apps/common/discounts.py): a reason is required, and the fee is the
+    ceiling.
+    """
+
+    def test_the_discount_reduces_the_fee_not_the_advance(
+        self, manager_client, patient, online_service
+    ):
+        response = manager_client.post(
+            LIST_URL,
+            payload(
+                patient, online_service, discount="400.00",
+                discountReason="Long-standing patient", advanceAmount="1000.00",
+            ),
+            format="json",
+        )
+
+        assert response.status_code == 201
+        booking = response.json()["booking"]
+        assert Decimal(booking["grossAmount"]) == Decimal("4000.00")
+        assert Decimal(booking["discountAmount"]) == Decimal("400.00")
+        assert Decimal(booking["feeAmount"]) == Decimal("3600.00")
+        assert booking["discountReason"] == "Long-standing patient"
+        # Only 1000 was collected; a discount is not money that moved.
+        assert Decimal(response.json()["payment"]["amount"]) == Decimal("1000.00")
+
+    def test_no_discount_leaves_the_gross_null(
+        self, manager_client, patient, online_service
+    ):
+        response = manager_client.post(
+            LIST_URL, payload(patient, online_service), format="json"
+        )
+
+        booking = response.json()["booking"]
+        assert booking["grossAmount"] is None
+        assert Decimal(booking["discountAmount"]) == Decimal("0.00")
+
+    def test_the_suggested_advance_follows_the_discounted_fee(
+        self, manager_client, patient, online_service
+    ):
+        """Half of what the patient actually owes, not half the list price."""
+        response = manager_client.post(
+            LIST_URL,
+            payload(
+                patient, online_service, discount="1000.00", discountReason="Staff family"
+            ),
+            format="json",
+        )
+
+        assert Decimal(response.json()["booking"]["advanceAmount"]) == Decimal("1500.00")
+
+    def test_a_discount_without_a_reason_is_refused(
+        self, manager_client, patient, online_service
+    ):
+        response = manager_client.post(
+            LIST_URL, payload(patient, online_service, discount="400.00"), format="json"
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "discount_reason_required"
+        assert Booking.objects.count() == 0
+
+    def test_a_discount_over_the_fee_is_refused(
+        self, manager_client, patient, online_service
+    ):
+        response = manager_client.post(
+            LIST_URL,
+            payload(patient, online_service, discount="5000.00", discountReason="No"),
+            format="json",
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "discount_exceeds_fee"
+
+    def test_a_fee_discounted_to_nothing_still_books_the_session(
+        self, manager_client, patient, online_service
+    ):
+        """
+        Allowed here, unlike a daily charge: the Booking records the free
+        session, so nothing is lost by taking no payment for it.
+        """
+        response = manager_client.post(
+            LIST_URL,
+            payload(
+                patient, online_service, discount="4000.00",
+                discountReason="Goodwill, complaint settled",
+            ),
+            format="json",
+        )
+
+        assert response.status_code == 201
+        assert response.json()["payment"] is None
+        booking = Booking.objects.get(pk=response.json()["booking"]["id"])
+        assert booking.fee_amount == Decimal("0.00")
+        assert booking.advance_amount == Decimal("0.00")
 
     @override_settings(BOOKING_ADVANCE_RATIO=0.25)
     def test_the_ratio_is_configurable(self, manager_client, patient, online_service):

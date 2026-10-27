@@ -5,6 +5,8 @@ Note what the sale payload does **not** accept: a price. The client sends
 material ids and quantities only; the server prices the sale from the database.
 """
 
+from decimal import Decimal
+
 from rest_framework import serializers
 
 from apps.common.validators import validate_bd_phone
@@ -111,6 +113,15 @@ class SellMaterialsSerializer(serializers.Serializer):
     patient = serializers.IntegerField()
     items = SaleItemSerializer(many=True)
     method = serializers.ChoiceField(choices=PaymentMethod.choices)
+    # One discount off the whole cart; the server checks it against the total
+    # it priced itself (see sell_materials).
+    discount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, min_value=Decimal("0.00"),
+        default=Decimal("0.00"),
+    )
+    discountReason = serializers.CharField(
+        required=False, allow_blank=True, max_length=500, default=""
+    )
     idempotencyKey = serializers.CharField(required=False, allow_blank=True, max_length=64)
 
     def validate_items(self, value):

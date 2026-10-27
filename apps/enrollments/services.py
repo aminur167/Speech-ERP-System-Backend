@@ -23,6 +23,7 @@ from django.db.models import CharField, F, Sum, Value
 from django.utils import timezone
 
 from apps.common import audit
+from apps.common.discounts import validated_discount
 from apps.common.models import AuditLog
 from apps.common.sequences import next_value
 from apps.common.transactions import transactional
@@ -235,29 +236,12 @@ def _validated_discount(
     amount, reason: str, *, ceiling: Decimal, what: str,
     ceiling_code: str, ceiling_key: str,
 ) -> Decimal:
-    """
-    One discount, checked the same way wherever it is given.
-
-    Shared by the admit fee and the first month's fee so the two cannot drift
-    apart: a reason is required for any discount at all, and no discount may
-    exceed the charge it is taken off. Returns the amount as a Decimal.
-    """
-    value = Decimal(amount or 0)
-
-    if value < 0:
-        raise EnrollmentError("A discount cannot be negative.", code="invalid_discount")
-    if value > ceiling:
-        raise EnrollmentError(
-            f"The discount cannot be more than the {what} ({ceiling}).",
-            code=ceiling_code,
-            extra={ceiling_key: str(ceiling)},
-        )
-    if value > 0 and not (reason or "").strip():
-        raise EnrollmentError(
-            f"Say why a discount is being given on the {what}.",
-            code="discount_reason_required",
-        )
-    return value
+    """Enrolment's spelling of the shared rule (apps/common/discounts.py)."""
+    return validated_discount(
+        amount, reason, ceiling=ceiling, what=what,
+        ceiling_code=ceiling_code, ceiling_key=ceiling_key,
+        error=EnrollmentError,
+    )
 
 
 def admission_label(month_date: date) -> str:
@@ -1682,6 +1666,71 @@ def generate_due_bills(*, up_to: date | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Daily sessions
+# ---------------------------------------------------------------------------
+
+
+@transaction.atomic
+def charge_daily_session(
+    *, actor, branch, patient, service, method: str,
+    discount=0, discount_reason: str = "", idempotency_key: str | None = None,
+):
+    """
+    Take payment for one daily session, at the catalogue fee less any
+    discount agreed at the desk.
+
+    The fee now comes from the database. Until this existed the browser
+    posted its own `amount` straight to `/api/payments/`, which meant a
+    discount was given simply by typing a smaller number -- and nothing
+    anywhere recorded that one had been given, how much, or why. The money
+    was right; the explanation was missing from the receipt, the branch
+    report and the audit trail alike.
+
+    A daily session raises no bill, so the Payment is the only record of the
+    charge -- which is why the discount cannot take the whole fee. A free
+    session would leave no row at all: no payment (a Payment must be at
+    least 0.01) and no enrolment to settle for nothing, unlike a fully
+    discounted admission or monthly bill.
+    """
+    if service.category != service.Category.DAILY:
+        raise EnrollmentError(
+            "Only a daily service can be charged here.", code="not_daily"
+        )
+
+    gross = service.fee
+    # One paisa short of the fee: see the docstring.
+    ceiling = max(gross - Decimal("0.01"), Decimal("0.00"))
+    discount_value = _validated_discount(
+        discount, discount_reason, ceiling=ceiling, what="session fee",
+        ceiling_code="discount_exceeds_fee", ceiling_key="sessionFee",
+    )
+    amount = gross - discount_value
+
+    payment, created = payment_services.record_payment(
+        actor=actor,
+        branch=branch,
+        patient=patient,
+        amount=amount,
+        method=method,
+        category=PaymentCategory.DAILY,
+        description=service.name,
+        idempotency_key=idempotency_key,
+    )
+    if not created:
+        return payment, False
+
+    if discount_value > 0:
+        payment.gross_amount = gross
+        payment.discount_amount = discount_value
+        payment.discount_reason = (discount_reason or "").strip()
+        payment.save(
+            update_fields=["gross_amount", "discount_amount", "discount_reason"]
+        )
+
+    return payment, True
+
+
+# ---------------------------------------------------------------------------
 # Bookings
 # ---------------------------------------------------------------------------
 
@@ -1721,26 +1770,38 @@ def _validate_booking_slot(booking_date: date, booking_time: str) -> None:
 @transaction.atomic
 def create_booking(
     *, actor, branch, patient, service, booking_date, booking_time,
-    method: str, idempotency_key: str | None = None,
+    method: str, advance_amount=None, discount=0, discount_reason: str = "",
+    idempotency_key: str | None = None,
 ):
     """
     Book an online session and take the advance in one transaction.
 
-    The advance is always `BOOKING_ADVANCE_RATIO` of the service fee,
-    computed here and never accepted from the client -- the same reason
-    material-sale pricing is server-side (docs/06). A tampered or stale
-    client-supplied amount could otherwise undercharge, or overcharge, a
-    patient at the moment of booking.
+    The advance is **what the manager agreed**, not a ratio of the fee. It
+    used to be `fee x BOOKING_ADVANCE_RATIO`, computed here and refused from
+    the client; the clinic asked for it to be the desk's decision, so the
+    ratio is now only the figure the form suggests. Omitting it still falls
+    back to the ratio, which is what the public website path relies on.
+
+    What is still refused from the client is the *fee*: it comes from the
+    catalogue, and the discount is checked against it by the same rule every
+    other discount follows (apps/common/discounts.py). So a tampered request
+    can decide how much to collect today -- a manager may always do that --
+    but not what the session costs or how big a discount went unexplained.
+
+    A fee discounted to nothing, or an advance of nothing, is allowed and
+    takes no payment: the Booking row records the session either way, which
+    is why this can be permitted here and not on a daily charge.
     """
-    # A replay must return the ORIGINAL booking, not a second one. The old
-    # code created the Booking unconditionally before ever consulting the
-    # idempotency key -- only the Payment underneath it was replay-safe, so a
-    # retried request minted a second booking_code and a second calendar
-    # slot for the same appointment even though it charged only once.
+    # A replay must return the ORIGINAL booking, not a second one. Looked up
+    # on the Booking, not on its payment: an advance of nothing takes no
+    # payment, and a payment-keyed check would find nothing and mint a
+    # second booking_code and a second calendar slot for the same
+    # appointment. (It was payment-keyed until the advance became the desk's
+    # decision and could be zero.)
     if idempotency_key:
-        existing_payment = Payment.all_objects.filter(idempotency_key=idempotency_key).first()
-        if existing_payment is not None:
-            return existing_payment.bookings.first(), existing_payment
+        existing = Booking.objects.filter(idempotency_key=idempotency_key).first()
+        if existing is not None:
+            return existing, existing.payment
 
     _validate_booking_slot(booking_date, booking_time)
 
@@ -1748,22 +1809,45 @@ def create_booking(
     value = next_value(f"booking:{branch.code}", year)
     code = f"BKG-{branch.short_code}-{year}-{str(value).zfill(5)}"
 
-    advance_amount = (
-        service.fee * Decimal(str(settings.BOOKING_ADVANCE_RATIO))
-    ).quantize(Decimal("0.01"))
+    gross_fee = service.fee
+    discount_value = _validated_discount(
+        discount, discount_reason, ceiling=gross_fee, what="session fee",
+        ceiling_code="discount_exceeds_fee", ceiling_key="sessionFee",
+    )
+    fee_amount = gross_fee - discount_value
+
+    advance = (
+        (fee_amount * Decimal(str(settings.BOOKING_ADVANCE_RATIO))).quantize(Decimal("0.01"))
+        if advance_amount is None
+        else Decimal(advance_amount)
+    )
+    if advance < 0:
+        raise EnrollmentError(
+            "The advance cannot be negative.", code="invalid_advance"
+        )
+    if advance > fee_amount:
+        raise EnrollmentError(
+            f"The advance cannot be more than the session fee ({fee_amount}).",
+            code="advance_exceeds_fee",
+            extra={"sessionFee": str(fee_amount)},
+        )
 
     # The advance is taken first so the booking is written once, already
     # pointing at its payment, instead of being written and then updated.
-    payment, _ = payment_services.record_payment(
-        actor=actor,
-        branch=branch,
-        patient=patient,
-        amount=advance_amount,
-        method=method,
-        category=PaymentCategory.ONLINE,
-        description=f"{service.name} — advance for {booking_date}",
-        idempotency_key=idempotency_key,
-    )
+    # Nothing to collect means no payment at all -- a Payment must be at
+    # least 0.01, and `collect-advance` is the path for taking it later.
+    payment = None
+    if advance > 0:
+        payment, _ = payment_services.record_payment(
+            actor=actor,
+            branch=branch,
+            patient=patient,
+            amount=advance,
+            method=method,
+            category=PaymentCategory.ONLINE,
+            description=f"{service.name} — advance for {booking_date}",
+            idempotency_key=idempotency_key,
+        )
 
     booking = Booking.objects.create(
         booking_code=code,
@@ -1772,8 +1856,13 @@ def create_booking(
         branch=branch,
         date=booking_date,
         time=booking_time,
-        advance_amount=advance_amount,
+        fee_amount=fee_amount,
+        gross_amount=gross_fee if discount_value > 0 else None,
+        discount_amount=discount_value,
+        discount_reason=(discount_reason or "").strip() if discount_value > 0 else "",
+        advance_amount=advance,
         payment=payment,
+        idempotency_key=idempotency_key or None,
     )
 
     audit.record(
@@ -1781,7 +1870,12 @@ def create_booking(
         action=AuditLog.Action.CREATE,
         target=booking,
         branch=branch,
-        changes={"booking_code": code, "advance": str(advance_amount)},
+        changes={
+            "booking_code": code,
+            "fee": str(fee_amount),
+            "advance": str(advance),
+            "discount": str(discount_value),
+        },
     )
     return booking, payment
 
@@ -1911,6 +2005,11 @@ def create_public_booking(
     value = next_value(f"booking:{branch.code}", year)
     code = f"BKG-{branch.short_code}-{year}-{str(value).zfill(5)}"
 
+    # Still the fixed ratio here, deliberately. A manager may now set the
+    # advance at the desk, but a website visitor deciding their own deposit
+    # is a different thing entirely -- there is no staff account behind this
+    # request and nothing to hold accountable for the figure. No discount
+    # either: a discount needs someone to give it and a reason to record.
     advance_amount = (
         service.fee * Decimal(str(settings.BOOKING_ADVANCE_RATIO))
     ).quantize(Decimal("0.01"))
@@ -1922,6 +2021,7 @@ def create_public_booking(
         branch=branch,
         date=booking_date,
         time=booking_time,
+        fee_amount=service.fee,
         advance_amount=advance_amount,
     )
 

@@ -6,7 +6,7 @@ receipt numbering, idempotency and audit behave identically whether the money
 came from a daily service, a bill, a booking or the materials counter.
 """
 
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from django.db import transaction
 from django.utils import timezone
@@ -323,6 +323,14 @@ def _resolve_refund_amount(payment: Payment, amount, items) -> tuple[Decimal, li
     sale prices — never from the request body. Same rule as the sale itself:
     prices come from the server's records, so a tampered payload can't refund
     more than was charged.
+
+    A cart sold with a discount is returned at its discounted worth: the
+    discount applied to the whole cart, so every line in it was effectively
+    sold for less, and refunding the shelf price would hand back money that
+    was never taken. (The refundable ceiling in `request_refund` would have
+    caught the worst of that, but by refusing to return the whole cart --
+    "only 450 remains refundable" on a 500 cart -- rather than by returning
+    the right figure.)
     """
     if not items:
         return Decimal(amount), []
@@ -382,6 +390,15 @@ def _resolve_refund_amount(payment: Payment, amount, items) -> tuple[Decimal, li
                 "quantity": quantity,
                 "unit_price": line.unit_price,
             }
+        )
+
+    # The cart's discount, shared out by what each returned line was worth.
+    # `unit_price` on the refund lines stays the shelf price it was sold at,
+    # because that is what the stock movement and the sale history show; only
+    # the money handed back is scaled.
+    if payment.discount_amount > 0 and payment.gross_amount:
+        total = (total * payment.amount / payment.gross_amount).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
         )
 
     return total, resolved

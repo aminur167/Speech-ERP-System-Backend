@@ -404,8 +404,15 @@ class Installment(PayableMixin):
         return f"{self.label} — {self.amount}"
 
 
-class Booking(TimeStampedModel):
-    """Online session booking with an advance payment."""
+class Booking(TimeStampedModel, IdempotentModel):
+    """
+    Online session booking, with whatever advance the desk agreed.
+
+    Idempotent on its own key rather than on its payment's: an advance of
+    nothing takes no payment, so a replayed request would have nothing to
+    find and would mint a second booking for the same slot. The same reason
+    MonthlyEnrollment carries the key instead of its admission payment.
+    """
 
     class Status(models.TextChoices):
         CONFIRMED = "confirmed", "Confirmed"
@@ -423,6 +430,25 @@ class Booking(TimeStampedModel):
     )
     date = models.DateField(db_index=True)
     time = models.CharField(max_length=16)
+    # What the session is worth, less any discount agreed at the desk. The
+    # advance is taken against this, so `advance_amount` is no longer
+    # derivable from the service fee and had to become a stored figure of
+    # its own. Null on bookings made before the fee was recorded -- those
+    # were all `fee x BOOKING_ADVANCE_RATIO` and nothing reads back further.
+    fee_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    # The package fee before that discount, with the reason, as on
+    # InstallmentPlan. Null when no discount was given.
+    gross_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    discount_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
+    )
+    discount_reason = models.TextField(blank=True)
+    # What was actually collected at booking time: anything from nothing to
+    # the whole fee, as the manager agreed it. Not a ratio of the fee.
     advance_amount = models.DecimalField(max_digits=12, decimal_places=2)
     status = models.CharField(
         max_length=16, choices=Status.choices, default=Status.CONFIRMED, db_index=True
