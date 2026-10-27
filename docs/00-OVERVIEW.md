@@ -141,4 +141,5 @@ This is a substantial piece of work — larger than any single module in `01`–
 | `08-expenses.md` | Expense model, auto-approve threshold rule |
 | `09-daily-closing.md` | **Removed (2026-10-01)** — why, and where its data still lives |
 | `10-transactions-reporting.md` | All reporting/analytics/dashboard endpoints |
+| `11-enquiries.md` | Calls that came in off an ad — recorded, followed up, and linked to the patient they become |
 | `ROADMAP.md` | Build order across all of the above |
