@@ -24,6 +24,7 @@ its original day entirely. Voids are same-day-only precisely so this can never
 disturb a closed period.
 """
 
+from collections import Counter, defaultdict
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
@@ -752,6 +753,12 @@ def _as_decimal_strings(value):
         return [_as_decimal_strings(item) for item in value]
     return value
 
+# Money that belongs to no package: a daily visit or a counter sale goes
+# through the generic payment endpoint, which records a description and no
+# service. Named rather than dropped so "collected by service" still adds up
+# to Collected.
+UNLINKED_SERVICE_LABEL = "Other (daily visits, materials)"
+
 
 def branch_report(*, branch_id=None, date_from: date, date_to: date) -> dict:
     """
@@ -760,8 +767,8 @@ def branch_report(*, branch_id=None, date_from: date, date_to: date) -> dict:
     Composed rather than invented: the money half is `branch_summary`
     unchanged, so the PDF and the Summary screen can never disagree about a
     figure. What this adds is everything the Summary page does not load --
-    expenses by category, the adjustments behind the totals, patients,
-    services, materials, staff and enquiries -- plus the payment list that
+    expenses by category, what each service earned, the patients taken on,
+    attendance, materials, staff and enquiries -- plus the payment list that
     lets an Admin trace any number back to a receipt.
 
     Gathered server-side in one request on purpose. Fetching nine sections
@@ -771,7 +778,13 @@ def branch_report(*, branch_id=None, date_from: date, date_to: date) -> dict:
     could reproduce.
     """
     from apps.enquiries.models import Enquiry
-    from apps.enrollments.models import Booking, InstallmentPlan, MonthlyEnrollment
+    from apps.enrollments.models import (
+        Booking,
+        Installment,
+        InstallmentPlan,
+        MonthlyBill,
+        MonthlyEnrollment,
+    )
     from apps.materials.models import MaterialSaleItem
     from apps.patients.models import PatientAttendance
     from apps.staff.models import StaffAttendance
@@ -795,47 +808,62 @@ def branch_report(*, branch_id=None, date_from: date, date_to: date) -> dict:
         pending=Sum("amount", filter=Q(status=Expense.Status.PENDING)),
     )
 
-    # --- adjustments: why the takings are not just the sum of receipts ----
-    #
-    # Refunds are dated by approval and voids by the payment's own date --
-    # there is no `voided_at` column -- which is exactly how `branch_summary`
-    # counts them, so the two agree.
-    refunds = [
-        {
-            "receiptNumber": r.payment.receipt_number,
-            "patientName": r.payment.patient.name,
-            "amount": r.amount,
-            "reason": r.reason,
-            "reviewedAt": r.reviewed_at,
-        }
-        for r in scoped(
-            RefundRequest.objects.filter(
-                status=RefundRequest.Status.APPROVED,
-                reviewed_at__date__gte=date_from,
-                reviewed_at__date__lte=date_to,
-            )
-        ).select_related("payment", "payment__patient")[:200]
-    ]
-    voids = [
-        {
-            "receiptNumber": p.receipt_number,
-            "patientName": p.patient.name,
-            "amount": p.amount,
-            "createdAt": p.created_at,
-        }
-        for p in scoped(
-            Payment.all_objects.filter(status=PaymentStatus.VOID, **in_range)
-        ).select_related("patient")[:200]
-    ]
-
     # --- patients and attendance -------------------------------------------
-    attendance = scoped(
-        PatientAttendance.objects.filter(date__gte=date_from, date__lte=date_to)
-    ).aggregate(
-        present=Count("pk", filter=Q(status=PatientAttendance.Status.PRESENT)),
-        informed=Count("pk", filter=Q(status=PatientAttendance.Status.INFORMED_ABSENCE)),
-        absent=Count("pk", filter=Q(status=PatientAttendance.Status.ABSENT)),
+    #
+    # Split by service kind rather than totalled. The two are different
+    # rosters on different billing rules, and a combined "9 absent" says
+    # nothing about which group stopped turning up -- which is the only
+    # question the figure is read to answer.
+    attendance = {
+        kind: {"present": 0, "informed": 0, "absent": 0}
+        for kind in PatientAttendance.ServiceKind.values
+    }
+    for row in (
+        scoped(PatientAttendance.objects.filter(date__gte=date_from, date__lte=date_to))
+        .values("service_kind")
+        .annotate(
+            present=Count("pk", filter=Q(status=PatientAttendance.Status.PRESENT)),
+            informed=Count(
+                "pk", filter=Q(status=PatientAttendance.Status.INFORMED_ABSENCE)
+            ),
+            absent=Count("pk", filter=Q(status=PatientAttendance.Status.ABSENT)),
+        )
+    ):
+        attendance[row["service_kind"]] = {
+            "present": row["present"],
+            "informed": row["informed"],
+            "absent": row["absent"],
+        }
+
+    # Who was taken on, not just how many. `registered()` because a walk-in
+    # buyer is a billing row, never a new patient (docs/02, docs/06).
+    new_patients = scoped(Patient.objects.registered().filter(**in_range)).order_by(
+        "created_at"
     )
+    # What each of them signed up for, so the list answers "and for what?"
+    # without an Admin having to open the system. First enrolment wins: the
+    # service they were registered *for*.
+    signed_up: dict = {}
+    for queryset in (
+        scoped(MonthlyEnrollment.objects.filter(**in_range)),
+        scoped(InstallmentPlan.objects.filter(**in_range)),
+    ):
+        for patient_id, service_name in queryset.values_list(
+            "patient_id", "service__name"
+        ):
+            signed_up.setdefault(patient_id, service_name)
+    newly_registered = [
+        {
+            "code": patient.patient_code,
+            "name": patient.name,
+            "age": patient.age,
+            "gender": patient.gender,
+            "phone": patient.phone,
+            "service": signed_up.get(patient.pk, ""),
+            "createdAt": patient.created_at,
+        }
+        for patient in new_patients
+    ]
 
     # --- services taken up in the period -----------------------------------
     monthly_new = scoped(MonthlyEnrollment.objects.filter(**in_range)).count()
@@ -899,6 +927,11 @@ def branch_report(*, branch_id=None, date_from: date, date_to: date) -> dict:
     }
 
     # --- every receipt, so any figure above can be traced ------------------
+    paid_payments = list(
+        scoped(Payment.objects.filter(status=PaymentStatus.PAID, **in_range))
+        .select_related("patient", "collected_by")
+        .order_by("created_at")
+    )
     payments = [
         {
             "receiptNumber": p.receipt_number,
@@ -911,19 +944,70 @@ def branch_report(*, branch_id=None, date_from: date, date_to: date) -> dict:
             "collectedBy": p.collected_by.name if p.collected_by else "",
             "createdAt": p.created_at,
         }
-        for p in scoped(
-            Payment.objects.filter(status=PaymentStatus.PAID, **in_range)
-        ).select_related("patient", "collected_by").order_by("created_at")
+        for p in paid_payments
     ]
+
+    # --- what each service earned, and how many signed up for it -----------
+    #
+    # A Payment has no service FK -- only the free-text description that
+    # prints on the receipt (payments/models.py) -- so the name is reached
+    # through whichever table booked the money: a monthly bill, an
+    # installment, or an online booking.
+    #
+    # The amount summed is the *payment*, not the bill's `amount_paid`: it is
+    # the money that actually came through the desk, so these rows total to
+    # Collected exactly. Anything with no package behind it lands in the
+    # unlinked row for the same reason.
+    service_of: dict = {}
+    for queryset, name_path in (
+        (MonthlyBill.objects, "enrollment__service__name"),
+        (Installment.objects, "plan__service__name"),
+        (Booking.objects, "service__name"),
+    ):
+        for payment_id, service_name in queryset.filter(
+            payment_id__in=[p.pk for p in paid_payments]
+        ).values_list("payment_id", name_path):
+            service_of[payment_id] = service_name
+
+    collected_by_service: dict = defaultdict(lambda: Decimal("0.00"))
+    for payment in paid_payments:
+        collected_by_service[
+            service_of.get(payment.pk, UNLINKED_SERVICE_LABEL)
+        ] += payment.amount
+
+    enrolled_by_service: Counter = Counter()
+    for queryset in (
+        scoped(MonthlyEnrollment.objects.filter(**in_range)),
+        scoped(InstallmentPlan.objects.filter(**in_range)),
+    ):
+        enrolled_by_service.update(queryset.values_list("service__name", flat=True))
+
+    by_service = sorted(
+        (
+            {
+                "service": service_name,
+                "enrolled": enrolled_by_service.get(service_name, 0),
+                "amount": collected_by_service.get(service_name, Decimal("0.00")),
+            }
+            for service_name in set(collected_by_service) | set(enrolled_by_service)
+        ),
+        # Biggest earner first; the unlinked row always last, because it is a
+        # footnote and would otherwise read as the branch's best seller.
+        key=lambda row: (
+            row["service"] == UNLINKED_SERVICE_LABEL,
+            -row["amount"],
+            row["service"],
+        ),
+    )
 
     return _as_decimal_strings({
         **branch_summary(branch_id=branch_id, date_from=date_from, date_to=date_to),
         "expensesByCategory": expenses_by_category,
         "expensesApproved": expense_status["approved"] or Decimal("0.00"),
         "expensesPending": expense_status["pending"] or Decimal("0.00"),
-        "refunds": refunds,
-        "voids": voids,
+        "byService": by_service,
         "attendance": attendance,
+        "newlyRegistered": newly_registered,
         "services": {
             "newMonthly": monthly_new,
             "newInstallmentPlans": plans_new,

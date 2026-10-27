@@ -7,11 +7,12 @@ What these guard:
    unchanged; a test pins that, because the whole reason for composing rather
    than re-deriving is that a report and a screen must never disagree about a
    figure someone is about to be asked to explain.
-2. **The adjustments are there.** Refunds and voids are what make the takings
-   differ from the sum of receipts. Without them an Admin adding the list up
-   gets a different number and has no way to find out why.
+2. **"Collected by service" adds up.** A Payment has no service FK, so each
+   row is reached through the bill, installment or booking that took the
+   money — and anything with no package behind it still has to appear, or
+   the column silently stops totalling to Collected.
 3. **Every receipt is listed**, and only the ones that count — a voided
-   payment belongs in the adjustments, not in the day's collection.
+   payment is money that never arrived, so it is in neither.
 4. **Branch isolation**, as everywhere.
 """
 
@@ -80,8 +81,8 @@ class TestItAgreesWithTheSummaryScreen:
         body = manager_client.get(URL, {"dateFrom": today(), "dateTo": today()}).json()
 
         for section in (
-            "expensesByCategory", "refunds", "voids", "attendance", "services",
-            "materialsSold", "staffAttendance", "enquiries", "payments",
+            "expensesByCategory", "byService", "attendance", "newlyRegistered",
+            "services", "materialsSold", "staffAttendance", "enquiries", "payments",
         ):
             assert section in body, section
 
@@ -109,7 +110,7 @@ class TestTheReceiptList:
         listed = sum(Decimal(row["amount"]) for row in body["payments"])
         assert listed == Decimal(body["grossCollected"])
 
-    def test_a_voided_payment_leaves_the_list_and_appears_as_an_adjustment(
+    def test_a_voided_payment_leaves_the_list_and_the_total(
         self, manager_client, manager, paid
     ):
         kept = paid("800.00")
@@ -121,11 +122,9 @@ class TestTheReceiptList:
         body = manager_client.get(URL, {"dateFrom": today(), "dateTo": today()}).json()
 
         assert [row["receiptNumber"] for row in body["payments"]] == [kept.receipt_number]
-        assert [row["receiptNumber"] for row in body["voids"]] == [
-            scrapped.receipt_number
-        ]
         # And the headline no longer counts it.
         assert Decimal(body["grossCollected"]) == Decimal("800.00")
+        assert scrapped.receipt_number
 
 
 class TestTheOtherSections:
@@ -178,6 +177,125 @@ class TestTheOtherSections:
 
         assert body["materialsSold"] == [
             {"name": "Flashcards", "quantity": 2, "amount": "700.00"}
+        ]
+
+
+class TestCollectedByService:
+    def test_a_package_is_named_with_its_intake_and_its_takings(
+        self, manager_client, manager, branch, patient_factory, service_factory
+    ):
+        from apps.enrollments import services as enrollment_services
+
+        service = service_factory(name="Speech Therapy — Monthly")
+        enrollment_services.enroll_monthly_with_admission(
+            actor=manager, branch=branch, patient=patient_factory(),
+            service=service, method="cash",
+        )
+
+        body = manager_client.get(URL, {"dateFrom": today(), "dateTo": today()}).json()
+
+        row = next(r for r in body["byService"] if r["service"] == service.name)
+        assert row["enrolled"] == 1
+        assert Decimal(row["amount"]) > 0
+
+    def test_money_with_no_package_behind_it_is_still_reported(
+        self, manager_client, paid
+    ):
+        """A daily visit reaches Payment with a description and no service."""
+        paid("800.00")
+
+        body = manager_client.get(URL, {"dateFrom": today(), "dateTo": today()}).json()
+
+        assert [row["service"] for row in body["byService"]] == [
+            services.UNLINKED_SERVICE_LABEL
+        ]
+        assert Decimal(body["byService"][0]["amount"]) == Decimal("800.00")
+
+    def test_the_column_totals_to_the_collected_figure(
+        self, manager_client, manager, branch, patient_factory, service_factory, paid
+    ):
+        """The reason the unlinked row exists: this has to hold."""
+        from apps.enrollments import services as enrollment_services
+
+        enrollment_services.enroll_monthly_with_admission(
+            actor=manager, branch=branch, patient=patient_factory(),
+            service=service_factory(), method="cash",
+        )
+        paid("800.00")
+        paid("250.00", method="bkash")
+
+        body = manager_client.get(URL, {"dateFrom": today(), "dateTo": today()}).json()
+
+        assert sum(Decimal(row["amount"]) for row in body["byService"]) == Decimal(
+            body["grossCollected"]
+        )
+
+
+class TestAttendanceAndNewPatients:
+    def test_attendance_is_counted_per_service_kind(
+        self, manager_client, branch, patient_factory
+    ):
+        from apps.patients.models import PatientAttendance
+
+        for kind, status in (
+            ("monthly", PatientAttendance.Status.PRESENT),
+            ("monthly", PatientAttendance.Status.ABSENT),
+            ("installment", PatientAttendance.Status.PRESENT),
+        ):
+            PatientAttendance.objects.create(
+                patient=patient_factory(), branch=branch, service_kind=kind,
+                date=timezone.localdate(), status=status,
+            )
+
+        body = manager_client.get(URL, {"dateFrom": today(), "dateTo": today()}).json()
+
+        assert body["attendance"]["monthly"] == {
+            "present": 1, "informed": 0, "absent": 1
+        }
+        assert body["attendance"]["installment"] == {
+            "present": 1, "informed": 0, "absent": 0
+        }
+
+    def test_both_kinds_are_reported_even_when_nobody_was_marked(self, manager_client):
+        """The PDF prints both rows; a missing key would print a blank."""
+        body = manager_client.get(URL, {"dateFrom": today(), "dateTo": today()}).json()
+
+        assert set(body["attendance"]) == {"monthly", "installment"}
+
+    def test_the_new_patients_are_listed_with_what_they_enrolled_in(
+        self, manager_client, manager, branch, patient_factory, service_factory
+    ):
+        from apps.enrollments import services as enrollment_services
+
+        service = service_factory(name="Autism Care — Monthly")
+        patient = patient_factory(name="Rafi Ahmed")
+        enrollment_services.enroll_monthly_with_admission(
+            actor=manager, branch=branch, patient=patient,
+            service=service, method="cash",
+        )
+
+        body = manager_client.get(URL, {"dateFrom": today(), "dateTo": today()}).json()
+
+        listed = next(
+            row for row in body["newlyRegistered"] if row["code"] == patient.patient_code
+        )
+        assert listed["name"] == "Rafi Ahmed"
+        assert listed["service"] == service.name
+        assert listed["phone"]
+        # The count and the list are the same people.
+        assert len(body["newlyRegistered"]) == body["newPatients"]
+
+    def test_a_walk_in_buyer_is_not_a_new_patient(
+        self, manager_client, patient_factory
+    ):
+        """A counter sale creates a Patient row; it is not an intake."""
+        patient_factory(name="Counter Buyer", is_walk_in=True)
+        registered = patient_factory(name="Real Patient")
+
+        body = manager_client.get(URL, {"dateFrom": today(), "dateTo": today()}).json()
+
+        assert [row["code"] for row in body["newlyRegistered"]] == [
+            registered.patient_code
         ]
 
 
