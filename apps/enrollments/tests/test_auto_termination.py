@@ -251,12 +251,15 @@ class TestReactivating:
         assert caught.value.extra["total"] == "10000.00"
         assert len(caught.value.extra["items"]) == 2
 
-    def test_a_due_on_another_service_blocks_it_too(
+    def test_a_due_on_another_service_does_not_block_it(
         self, manager, branch, lapsed, service_factory, settle_dues
     ):
         """
-        The gate is the patient's whole balance, not this service's. Otherwise
-        a patient walks away from one debt and reactivates around it.
+        The gate is this service's own arrears, not the patient's whole
+        balance (changed 2026-10-27). Keeping speech therapy switched off
+        because occupational therapy is unpaid punishes the wrong service and
+        collects nothing; this service's own arrears still have to be cleared
+        before it comes back, which is the debt reactivating it would revive.
         """
         settle_dues(lapsed.patient)
         other = services.create_monthly_enrollment(
@@ -265,9 +268,9 @@ class TestReactivating:
         )
         assert other.outstanding_total() > 0
 
-        with pytest.raises(services.EnrollmentError) as caught:
-            services.resume_monthly_service(actor=manager, enrollment=lapsed)
-        assert caught.value.code == "outstanding_dues"
+        resumed = services.resume_monthly_service(actor=manager, enrollment=lapsed)
+
+        assert resumed.status == EnrollmentStatus.ACTIVE
 
     def test_clearing_the_arrears_allows_it(self, manager, lapsed, settle_dues):
         settle_dues(lapsed.patient)

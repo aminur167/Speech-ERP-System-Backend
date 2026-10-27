@@ -256,12 +256,15 @@ def test_writes_stay_in_budget(
         ("daily payment", 7, lambda: post("/api/payments/", {
             "patient": payer.pk, "amount": "800", "method": "cash", "category": "daily"},
             format="json")),
-        ("enroll monthly + admit fee", 14, lambda: post("/api/enrollments/monthly/", {
+        # 15, not 14: enrolling now reads whether this patient already
+        # holds a running package for this service (_assert_not_already_enrolled).
+        ("enroll monthly + admit fee", 15, lambda: post("/api/enrollments/monthly/", {
             "patient": fresh[0].pk, "service": seeder.monthly.pk, "method": "cash"}, format="json")),
         ("pay a bill", 12, lambda: post(
             f"/api/enrollments/monthly/{bill_enrollment.pk}/bills/{bill.pk}/pay/",
             {"method": "cash"}, format="json")),
-        ("enroll installment", 11, lambda: post("/api/enrollments/installments/", {
+        # 12, not 11: same duplicate-enrollment read as the monthly path.
+        ("enroll installment", 12, lambda: post("/api/enrollments/installments/", {
             "patient": fresh[1].pk, "service": seeder.plan_service.pk,
             "numberOfInstallments": 3}, format="json")),
         ("pay an installment", 10, lambda: post(

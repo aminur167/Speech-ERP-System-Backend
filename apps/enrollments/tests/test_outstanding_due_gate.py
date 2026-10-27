@@ -2,12 +2,27 @@
 The outstanding-due gate, and making one service inactive without touching the
 others.
 
-Two rules, and both have to hold on the server rather than only on the screen:
+**The gate is per service** (changed 2026-10-27). It used to be patient-wide:
+one unpaid month anywhere stopped the patient starting anything at all. That
+left a manager unable to sell speech therapy to someone who owed for
+occupational therapy — the debt was real, but refusing the sale did not
+collect it. Now:
 
-  * **a patient who owes anything cannot start a new service or have one
-    reactivated.** The screen explains it; the service layer enforces it, so
-    calling the API directly with the screen bypassed is refused on exactly
-    the same terms as the button.
+  * a due on a service blocks **that** service — re-selling someone the very
+    package they have not paid for is how a debt gets buried under a second
+    one — and blocks reactivating it;
+  * every other service may be sold, with the whole balance shown on the
+    confirm step so the manager sees it and sells anyway, rather than being
+    stopped with no figure;
+  * a **running** package blocks its own service outright, due or not: two
+    live packages for one service would bill the patient twice. A *stopped*
+    one does not — re-joining charges the admit fee again, which is a real
+    thing the clinic does.
+
+All of it holds on the server, not only on the screen: a request straight to
+the API with the screen bypassed is refused on exactly the same terms as the
+button.
+
   * **inactivation is per service.** Stopping monthly therapy leaves an
     installment package running, and never deactivates the patient.
 """
@@ -60,36 +75,15 @@ def outstanding_url(patient):
     return reverse("patients:patient-outstanding-dues", args=[patient.pk])
 
 
-class TestTheGateOnNewEnrollment:
-    def test_a_second_monthly_service_is_refused_while_the_first_is_unpaid(
+class TestADueBlocksItsOwnServiceOnly:
+    """
+    The change itself. `owing` leaves this month's Individual Therapy fee
+    unpaid; Group Therapy and the assessment package are unaffected by it.
+    """
+
+    def test_another_service_can_still_be_sold(
         self, manager, branch, owing, patient, other_monthly_service
     ):
-        with pytest.raises(services.EnrollmentError) as caught:
-            services.create_monthly_enrollment(
-                actor=manager, branch=branch, patient=patient,
-                service=other_monthly_service,
-            )
-
-        assert caught.value.code == "outstanding_dues"
-        assert caught.value.extra["total"] == "5000.00"
-
-    def test_an_installment_plan_is_refused_too(
-        self, manager, branch, owing, patient, installment_service
-    ):
-        """Both kinds of enrollment go through the same gate."""
-        with pytest.raises(services.EnrollmentError) as caught:
-            services.create_installment_plan(
-                actor=manager, branch=branch, patient=patient,
-                service=installment_service, number_of_installments=3,
-            )
-
-        assert caught.value.code == "outstanding_dues"
-
-    def test_clearing_the_due_allows_it(
-        self, manager, branch, owing, patient, other_monthly_service, settle_dues
-    ):
-        settle_dues(patient)
-
         second = services.create_monthly_enrollment(
             actor=manager, branch=branch, patient=patient,
             service=other_monthly_service,
@@ -98,24 +92,137 @@ class TestTheGateOnNewEnrollment:
         assert second.is_active
         assert patient.monthly_enrollments.count() == 2
 
-    def test_the_api_refuses_it_as_well_as_the_screen(
+    def test_an_installment_package_can_still_be_sold(
+        self, manager, branch, owing, patient, installment_service
+    ):
+        """A monthly due is no reason to refuse a different package."""
+        plan = services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient,
+            service=installment_service, number_of_installments=3,
+        )
+
+        assert plan.is_active
+
+    def test_the_api_allows_it_too(
         self, manager_client, owing, patient, other_monthly_service
     ):
-        """
-        The rule cannot live in the UI. A request straight to the endpoint has
-        to be turned away with the same explanation.
-        """
         response = manager_client.post(
             reverse("enrollments:monthly-enrollment-list"),
             {"patient": patient.pk, "service": other_monthly_service.pk, "method": "cash"},
             format="json",
         )
 
-        assert response.status_code == 400
-        body = response.json()
-        assert body["code"] == "outstanding_dues"
-        assert body["total"] == "5000.00"
-        assert len(body["items"]) == 1
+        assert response.status_code == 201, response.json()
+
+    def test_the_owed_service_itself_is_still_refused(
+        self, manager, branch, owing, patient, monthly_service
+    ):
+        """
+        Re-selling the package they have not paid for is the one thing the
+        gate still stops: the first due would be buried under a second.
+        """
+        with pytest.raises(services.EnrollmentError) as caught:
+            services.create_monthly_enrollment(
+                actor=manager, branch=branch, patient=patient, service=monthly_service,
+            )
+
+        # Refused as already enrolled before the due is even reached -- the
+        # package is still running. The due-specific refusal is pinned below
+        # on a stopped one, which is the case where it can be reached.
+        assert caught.value.code == "already_enrolled"
+
+    def test_a_stopped_service_with_a_due_is_refused_by_the_due(
+        self, manager, branch, owing, patient, monthly_service
+    ):
+        services.terminate(actor=manager, container=owing, waivers={})
+        owing.refresh_from_db()
+        assert owing.status == EnrollmentStatus.TERMINATED
+
+        with pytest.raises(services.EnrollmentError) as caught:
+            services.create_monthly_enrollment(
+                actor=manager, branch=branch, patient=patient, service=monthly_service,
+            )
+
+        assert caught.value.code == "outstanding_dues"
+        assert caught.value.extra["total"] == "5000.00"
+        assert caught.value.extra["serviceName"] == "Individual Therapy"
+        # Only this service's items, not the patient's whole balance.
+        assert len(caught.value.extra["items"]) == 1
+
+    def test_clearing_the_due_allows_the_same_service_again(
+        self, manager, branch, owing, patient, monthly_service, settle_dues
+    ):
+        settle_dues(patient)
+        services.terminate(actor=manager, container=owing, waivers={})
+
+        again = services.create_monthly_enrollment(
+            actor=manager, branch=branch, patient=patient, service=monthly_service,
+        )
+
+        assert again.is_active
+        assert again.pk != owing.pk
+
+
+class TestARunningPackageBlocksItsOwnService:
+    """
+    Nothing enforced this before: the patient-wide due gate refused a second
+    enrollment as a side effect, because the first one's unpaid months were a
+    due. Narrowing the gate removed the accident.
+    """
+
+    def test_a_second_live_package_for_one_service_is_refused(
+        self, manager, branch, patient, monthly_service, settle_dues
+    ):
+        first = services.create_monthly_enrollment(
+            actor=manager, branch=branch, patient=patient, service=monthly_service
+        )
+        settle_dues(patient)
+
+        with pytest.raises(services.EnrollmentError) as caught:
+            services.create_monthly_enrollment(
+                actor=manager, branch=branch, patient=patient, service=monthly_service
+            )
+
+        assert caught.value.code == "already_enrolled"
+        assert caught.value.extra["refId"] == str(first.pk)
+        assert patient.monthly_enrollments.count() == 1
+
+    def test_an_installment_package_is_refused_the_same_way(
+        self, manager, branch, patient, installment_service
+    ):
+        services.create_installment_plan(
+            actor=manager, branch=branch, patient=patient,
+            service=installment_service, number_of_installments=3,
+        )
+
+        with pytest.raises(services.EnrollmentError) as caught:
+            services.create_installment_plan(
+                actor=manager, branch=branch, patient=patient,
+                service=installment_service, number_of_installments=3,
+            )
+
+        assert caught.value.code == "already_enrolled"
+
+    def test_a_stopped_package_does_not_block(
+        self, manager, branch, patient, monthly_service, settle_dues
+    ):
+        """
+        Re-joining is a real thing, and it charges the admit fee again --
+        the difference from reactivating, which charges nothing. The enrolment
+        screen points out that the stopped row exists so the manager chooses.
+        """
+        first = services.create_monthly_enrollment(
+            actor=manager, branch=branch, patient=patient, service=monthly_service
+        )
+        settle_dues(patient)
+        services.terminate(actor=manager, container=first, waivers={})
+
+        again = services.create_monthly_enrollment(
+            actor=manager, branch=branch, patient=patient, service=monthly_service
+        )
+
+        assert again.is_active
+        assert patient.monthly_enrollments.count() == 2
 
 
 class TestOutstandingDuesEndpoint:

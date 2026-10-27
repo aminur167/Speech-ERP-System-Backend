@@ -108,7 +108,8 @@ def patient_outstanding_dues(patient) -> dict:
         .filter(amount_paid__lt=F("amount"))
         .annotate(owed_type=Value("monthly", output_field=CharField()))
         .values_list(
-            "owed_type", "enrollment_id", "id", "enrollment__service__name", "month",
+            "owed_type", "enrollment_id", "id", "enrollment__service_id",
+            "enrollment__service__name", "month",
             "label", "amount", "amount_paid", "enrollment__status",
         )
     )
@@ -118,15 +119,17 @@ def patient_outstanding_dues(patient) -> dict:
         .filter(amount_paid__lt=F("amount"))
         .annotate(owed_type=Value("installment", output_field=CharField()), blank_month=Value("", output_field=CharField()))
         .values_list(
-            "owed_type", "plan_id", "id", "plan__service__name", "blank_month",
+            "owed_type", "plan_id", "id", "plan__service_id",
+            "plan__service__name", "blank_month",
             "label", "amount", "amount_paid", "plan__status",
         )
     )
 
     items: list[dict] = []
-    for kind, ref_id, item_id, service_name, month, label, amount, paid, parent_status in (
-        bills.union(installments, all=True)
-    ):
+    for (
+        kind, ref_id, item_id, service_id, service_name, month, label,
+        amount, paid, parent_status,
+    ) in bills.union(installments, all=True):
         owed = amount - paid
         if owed <= 0:
             continue
@@ -135,6 +138,9 @@ def patient_outstanding_dues(patient) -> dict:
                 "type": kind,
                 "refId": str(ref_id),
                 "itemId": str(item_id),
+                # The gate matches on this, not on the name: two services can
+                # share a name, and the wrong one would be blocked.
+                "serviceId": str(service_id),
                 "serviceName": service_name,
                 "month": month,
                 "label": label,
@@ -150,27 +156,100 @@ def patient_outstanding_dues(patient) -> dict:
     }
 
 
-def _assert_no_outstanding_dues(patient, *, action: str) -> None:
+def service_outstanding_dues(patient, service) -> dict:
     """
-    Refuse the action while anything is owed.
+    What this patient owes **on one service**, in the shape of the full dues
+    payload so one screen component can render either.
+
+    Filtered in Python rather than as a second query: the caller has just
+    read every owed item for the patient to show it, and asking the database
+    again for a subset of what is already in memory buys nothing.
+    """
+    items = [
+        row
+        for row in patient_outstanding_dues(patient)["items"]
+        if row["serviceId"] == str(service.pk)
+    ]
+    return {
+        "items": items,
+        "total": sum((row["amount"] for row in items), Decimal("0.00")),
+    }
+
+
+def _assert_service_dues_clear(patient, service, *, action: str) -> None:
+    """
+    Refuse the action while **this service** is owed money.
+
+    The rule used to be patient-wide: one unpaid month anywhere stopped the
+    patient starting anything at all. The clinic asked for that to be
+    narrowed (2026-10-27), because it left a manager unable to sell speech
+    therapy to someone who owed for occupational therapy -- the debt was real
+    but it was not this service's debt, and refusing the sale did not collect
+    it. A due still blocks the service it belongs to: re-selling someone the
+    very package they have not paid for is how a debt gets buried under a
+    second one.
+
+    The other dues are not hidden. They are shown on the confirm step
+    (OutstandingDueNotice), which is the point -- the manager sees the whole
+    balance and sells anyway, instead of being stopped with no figure.
 
     Enforced in the service layer rather than the view, because the rule has
-    to hold for every caller — a request straight to the API with the screen
-    bypassed must be refused on exactly the same terms as the button.
+    to hold for every caller: a request straight to the API with the screen
+    bypassed is refused on exactly the same terms as the button.
     """
-    outstanding = patient_outstanding_dues(patient)
+    outstanding = service_outstanding_dues(patient, service)
     if outstanding["total"] <= 0:
         return
     raise EnrollmentError(
-        "This patient has outstanding due payments. Please clear the due "
-        f"payments before they can {action}.",
+        f"This patient has outstanding due payments on {service.name}. "
+        f"Please clear them before they can {action}.",
         code="outstanding_dues",
         extra={
+            "serviceId": str(service.pk),
+            "serviceName": service.name,
             "total": str(outstanding["total"]),
             "items": [
                 {**row, "amount": str(row["amount"])} for row in outstanding["items"]
             ],
         },
+    )
+
+
+def _assert_not_already_enrolled(patient, service, *, manager, kind: str) -> None:
+    """
+    One **running** package per patient per service.
+
+    Nothing enforced this before — there is no unique constraint on
+    (patient, service), only an index — and nothing needed to, because the
+    patient-wide due gate blocked a second enrollment as a side effect: the
+    first one's unpaid months were a due, so the second was refused.
+    Narrowing that gate to one service removed the accident, so the rule it
+    had been standing in for is now written down.
+
+    Two live packages for the same service would bill the patient twice for
+    one course of therapy.
+
+    A **stopped** package does not block. Re-joining a service someone left
+    is a real thing the clinic does, and it charges the admit fee again — the
+    difference from reactivating, which keeps the old row and charges
+    nothing. Both are offered, and the enrolment screen points out that a
+    stopped enrollment exists, so a manager does not take a joining fee from
+    someone who only needed their old service switched back on.
+
+    `manager` is the caller's **own** model manager, not both of them. A
+    monthly enrolment can only collide with another monthly enrolment for
+    that service, so looking in the installment table as well would be a
+    second query answering a question nobody asked.
+    """
+    existing = manager.filter(
+        patient=patient, service=service, status=EnrollmentStatus.ACTIVE
+    ).first()
+    if existing is None:
+        return
+    raise EnrollmentError(
+        f"This patient is already enrolled in {service.name}.",
+        code="already_enrolled",
+        extra={"kind": kind, "refId": str(existing.pk), "serviceName": service.name},
     )
 
 
@@ -197,7 +276,10 @@ def create_monthly_enrollment(*, actor, branch, patient, service, months_ahead: 
     Checked here rather than only in the view, so no other caller can slip
     past it.
     """
-    _assert_no_outstanding_dues(patient, action="enroll in a new service")
+    _assert_not_already_enrolled(
+        patient, service, manager=MonthlyEnrollment.objects, kind="monthly"
+    )
+    _assert_service_dues_clear(patient, service, action="enroll in it again")
 
     enrollment = MonthlyEnrollment.objects.create(
         patient=patient, service=service, branch=branch
@@ -337,7 +419,10 @@ def enroll_monthly_with_admission(
     )
     discount_reason = (discount_reason or "").strip()
 
-    _assert_no_outstanding_dues(patient, action="enroll in a new service")
+    _assert_not_already_enrolled(
+        patient, service, manager=MonthlyEnrollment.objects, kind="monthly"
+    )
+    _assert_service_dues_clear(patient, service, action="enroll in it again")
 
     enrollment = MonthlyEnrollment.objects.create(
         patient=patient,
@@ -484,7 +569,10 @@ def create_installment_plan(
     the same gate `create_monthly_enrollment` applies, checked in the service
     layer so the API cannot be used to step around the screen.
     """
-    _assert_no_outstanding_dues(patient, action="enroll in a new service")
+    _assert_not_already_enrolled(
+        patient, service, manager=InstallmentPlan.objects, kind="installment"
+    )
+    _assert_service_dues_clear(patient, service, action="enroll in it again")
 
     if number_of_installments < 2:
         raise EnrollmentError(
@@ -2192,8 +2280,10 @@ def resume_monthly_service(*, actor, enrollment: MonthlyEnrollment):
             "This service is already active.", code="not_terminated"
         )
 
-    _assert_no_outstanding_dues(
-        enrollment.patient, action="have a service reactivated"
+    # This service's own unpaid months, not the patient's whole balance: a
+    # due on some other package is no reason to keep this one stopped.
+    _assert_service_dues_clear(
+        enrollment.patient, enrollment.service, action="have it reactivated"
     )
 
     enrollment.status = EnrollmentStatus.ACTIVE
@@ -2234,7 +2324,9 @@ def resume_installment_plan(*, actor, plan):
     if plan.status != EnrollmentStatus.TERMINATED:
         raise EnrollmentError("This service is already active.", code="not_terminated")
 
-    _assert_no_outstanding_dues(plan.patient, action="have a service reactivated")
+    _assert_service_dues_clear(
+        plan.patient, plan.service, action="have it reactivated"
+    )
 
     plan.status = EnrollmentStatus.ACTIVE
     plan.terminated_at = None

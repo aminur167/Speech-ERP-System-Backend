@@ -564,13 +564,35 @@ class TestEnrollAndPay:
             enroll_directly(manager, branch, patient, daily)
         assert exc.value.code == "not_monthly"
 
-    def test_outstanding_dues_still_block_it(
+    def test_a_due_on_another_service_no_longer_blocks_it(
         self, manager, branch, manager_client, patient, package, service_factory
     ):
+        """
+        The gate is per service since 2026-10-27. A patient who owes for one
+        package may still join a different one — the debt is shown on the
+        confirm step, but refusing the sale never collected it.
+        """
         other = service_factory(fee=Decimal("1000.00"))
         services.create_monthly_enrollment(
             actor=manager, branch=branch, patient=patient, service=other
         )
+
+        response = enroll(manager_client, patient, package)
+
+        assert response.status_code == 201, response.json()
+        assert patient.monthly_enrollments.count() == 2
+
+    def test_a_due_on_this_service_does_block_it(
+        self, manager, branch, manager_client, patient, package
+    ):
+        """
+        What the gate still stops: re-selling the very package that has not
+        been paid for, which buries the first due under a second. Reached on
+        a stopped enrollment -- a running one is refused as already enrolled
+        before the due is consulted.
+        """
+        first, _ = enroll_directly(manager, branch, patient, package)
+        services.terminate(actor=manager, container=first, waivers={})
 
         response = enroll(manager_client, patient, package)
 
