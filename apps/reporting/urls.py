@@ -15,6 +15,7 @@ urlpatterns = [
     path("refunds-voids/", views.RefundsAndVoidsView.as_view(), name="refunds-voids"),
     path("net-revenue/", views.NetRevenueView.as_view(), name="net-revenue"),
     path("branch-summary/", views.BranchSummaryView.as_view(), name="branch-summary"),
+    path("branch-report/", views.BranchReportView.as_view(), name="branch-report"),
     path(
         "branch-summary/daily/",
         views.BranchDailyLedgerView.as_view(),

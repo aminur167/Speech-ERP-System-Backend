@@ -22,6 +22,7 @@ from apps.payments.serializers import PaymentSerializer
 from apps.reporting import services
 from apps.reporting.serializers import (
     BranchActivityRowSerializer,
+    BranchReportSerializer,
     BranchSummarySerializer,
     CollectionForDateSerializer,
     DailyLedgerRowSerializer,
@@ -379,6 +380,44 @@ class BranchActivityView(_ReportView):
 
         return Response(
             services.branch_activity(
+                branch_id=_branch_id_for(request),
+                date_from=date_from,
+                date_to=date_to,
+            )
+        )
+
+
+class BranchReportView(_ReportView):
+    """
+    GET /api/transactions/branch-report/
+
+    Everything one branch did between two dates, in one read — the payload
+    behind the PDF a Manager hands to the Admin.
+
+    One request rather than nine on purpose: separate calls would each see a
+    different moment, so a payment taken between the first and the last would
+    land in the total and not in the list, and the report would be quietly
+    wrong in a way nobody could reproduce.
+    """
+
+    @extend_schema(
+        tags=["reporting"],
+        parameters=[_BRANCH_PARAM, *_RANGE_PARAMS],
+        responses=BranchReportSerializer,
+    )
+    def get(self, request):
+        today = timezone.localdate()
+        date_from = _parse_date(request.query_params.get("dateFrom")) or today
+        date_to = _parse_date(request.query_params.get("dateTo")) or today
+
+        if date_to < date_from:
+            return Response(
+                {"detail": "The end date cannot be before the start date."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(
+            services.branch_report(
                 branch_id=_branch_id_for(request),
                 date_from=date_from,
                 date_to=date_to,
