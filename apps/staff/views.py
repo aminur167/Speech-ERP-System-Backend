@@ -266,7 +266,10 @@ class StaffMemberViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         member = self.get_object()
         year, month = _parse_month_param(request)
         start, end = services.month_range(year, month)
-        records = member.attendance_records.filter(date__gte=start, date__lt=end)
+        # select_related: the serializer names the staff member on every row.
+        records = member.attendance_records.filter(
+            date__gte=start, date__lt=end
+        ).select_related("staff")
         return Response(StaffAttendanceSerializer(records, many=True).data)
 
     @action(detail=True, methods=["post"], url_path="check-in", permission_classes=[IsManager])

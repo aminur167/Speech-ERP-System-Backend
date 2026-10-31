@@ -65,13 +65,22 @@ class StaffMemberWriteSerializer(serializers.ModelSerializer):
 
 class StaffAttendanceSerializer(serializers.ModelSerializer):
     staffId = serializers.CharField(source="staff_id", read_only=True)
+    # Carried on the record, not left to be joined against the roster: a past
+    # day includes staff who have since left the clinic, and they are absent
+    # from the roster the screen holds. Without this their row would have an
+    # id and no name.
+    staffName = serializers.CharField(source="staff.name", read_only=True)
+    staffCode = serializers.CharField(source="staff.staff_code", read_only=True)
     branchId = serializers.CharField(source="branch_id", read_only=True)
     checkInAt = serializers.DateTimeField(source="check_in_at", read_only=True)
     checkOutAt = serializers.DateTimeField(source="check_out_at", read_only=True)
 
     class Meta:
         model = StaffAttendance
-        fields = ["id", "staffId", "branchId", "date", "checkInAt", "checkOutAt", "status"]
+        fields = [
+            "id", "staffId", "staffName", "staffCode", "branchId", "date",
+            "checkInAt", "checkOutAt", "status",
+        ]
         read_only_fields = fields
 
 
