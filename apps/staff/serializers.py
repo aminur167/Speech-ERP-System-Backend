@@ -5,7 +5,13 @@ from decimal import Decimal
 from rest_framework import serializers
 
 from apps.payments.models import PaymentMethod
-from apps.staff.models import SalaryPayment, StaffAttendance, StaffBonus, StaffMember
+from apps.staff.models import (
+    SalaryPayment,
+    StaffAdvance,
+    StaffAttendance,
+    StaffBonus,
+    StaffMember,
+)
 from apps.staff.photos import shrink_photo
 
 
@@ -120,12 +126,22 @@ class SalaryPaymentSerializer(serializers.ModelSerializer):
     expenseId = serializers.CharField(source="expense_id", read_only=True, default=None)
     expenseCode = serializers.CharField(source="expense.expense_code", read_only=True, default="")
     createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+    # Salary + bonus before advances came off, and what they took. `amount`
+    # is the net. Null/zero on requests made before advances existed.
+    grossAmount = serializers.DecimalField(
+        source="gross_amount", max_digits=12, decimal_places=2,
+        read_only=True, allow_null=True,
+    )
+    advanceDeduction = serializers.DecimalField(
+        source="advance_deduction", max_digits=12, decimal_places=2, read_only=True
+    )
 
     class Meta:
         model = SalaryPayment
         fields = [
             "id", "staffId", "staffName", "staffCode", "staffPhotoUrl", "branchId", "branchName",
-            "month", "amount", "status", "requestedBy", "reviewNote", "reviewedBy",
+            "month", "amount", "grossAmount", "advanceDeduction",
+            "status", "requestedBy", "reviewNote", "reviewedBy",
             "reviewedAt", "paymentMethod", "paidAt", "expenseId", "expenseCode", "createdAt",
         ]
         read_only_fields = fields
@@ -171,3 +187,58 @@ class StaffMonthlyReportRowSerializer(serializers.Serializer):
     earlyLeaveCount = serializers.IntegerField()
     absentCount = serializers.IntegerField()
     leaveCount = serializers.IntegerField()
+
+
+class StaffAdvanceSerializer(serializers.ModelSerializer):
+    staffId = serializers.CharField(source="staff_id", read_only=True)
+    staffName = serializers.CharField(source="staff.name", read_only=True)
+    staffCode = serializers.CharField(source="staff.staff_code", read_only=True)
+    staffPhotoUrl = serializers.CharField(source="staff.photo_url", read_only=True)
+    branchId = serializers.CharField(source="branch_id", read_only=True)
+    branchName = serializers.CharField(source="branch.name", read_only=True)
+    recoveredAmount = serializers.DecimalField(
+        source="recovered_amount", max_digits=12, decimal_places=2, read_only=True
+    )
+    # What is still to come out of future salary. A property, not a column --
+    # see StaffAdvance.outstanding.
+    outstanding = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True
+    )
+    requestedBy = serializers.CharField(source="requested_by.name", read_only=True, default="")
+    reviewNote = serializers.CharField(source="review_note", read_only=True)
+    reviewedBy = serializers.CharField(source="reviewed_by.name", read_only=True, default="")
+    reviewedAt = serializers.DateTimeField(source="reviewed_at", read_only=True)
+    paymentMethod = serializers.CharField(source="payment_method", read_only=True)
+    paidAt = serializers.DateTimeField(source="paid_at", read_only=True)
+    expenseId = serializers.CharField(source="expense_id", read_only=True, default=None)
+    expenseCode = serializers.CharField(source="expense.expense_code", read_only=True, default="")
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        model = StaffAdvance
+        fields = [
+            "id", "staffId", "staffName", "staffCode", "staffPhotoUrl",
+            "branchId", "branchName", "amount", "reason", "recoveredAmount",
+            "outstanding", "status", "requestedBy", "reviewNote", "reviewedBy",
+            "reviewedAt", "paymentMethod", "paidAt", "expenseId", "expenseCode",
+            "createdAt",
+        ]
+        read_only_fields = fields
+
+
+class RequestAdvanceSerializer(serializers.Serializer):
+    """No staff id: the advance is requested on a staff member's own URL."""
+
+    amount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal("0.01")
+    )
+    reason = serializers.CharField(max_length=255)
+
+
+class ReviewAdvanceSerializer(serializers.Serializer):
+    approve = serializers.BooleanField()
+    reviewNote = serializers.CharField(required=False, allow_blank=True)
+
+
+class DisburseAdvanceSerializer(serializers.Serializer):
+    paymentMethod = serializers.ChoiceField(choices=PaymentMethod.choices)

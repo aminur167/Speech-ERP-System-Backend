@@ -27,14 +27,20 @@ from datetime import date, time
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count, Q, Sum
+from django.db.models import Count, F, Q, Sum
 from django.utils import timezone
 
 from apps.common import audit
 from apps.common.models import AuditLog
 from apps.common.sequences import next_value
 from apps.notifications.inapp import notify, notify_many
-from apps.staff.models import SalaryPayment, StaffAttendance, StaffBonus, StaffMember
+from apps.staff.models import (
+    SalaryPayment,
+    StaffAdvance,
+    StaffAttendance,
+    StaffBonus,
+    StaffMember,
+)
 
 # Office hours: 9am-4pm. Anyone still unmarked once the end hour passes is
 # auto-marked absent (see `mark_no_show_absentees`); checking out before the
@@ -355,6 +361,13 @@ def request_salary_payment(*, actor, staff: StaffMember, month: str) -> SalaryPa
     (base salary plus any bonus already awarded), computed the same way the
     monthly report computes it, and frozen onto the request at the moment
     it's made.
+
+    Outstanding advances come off it here, oldest first, and the subtraction
+    is frozen alongside the figures it was made from. The advances are *not*
+    marked recovered yet — that happens when the salary is actually paid
+    (`disburse_salary_payment`). A rejected request hands over no money, so
+    recording a repayment against it would write off a debt the clinic never
+    collected.
     """
     # Locks any existing row for this staff+month first, so two concurrent
     # requests can't both see "nothing active yet" and both insert.
@@ -371,10 +384,15 @@ def request_salary_payment(*, actor, staff: StaffMember, month: str) -> SalaryPa
 
     year, month_number = (int(part) for part in month.split("-"))
     rows = monthly_report([staff], year=year, month=month_number)
-    amount = rows[0]["netPayable"] if rows else staff.monthly_salary
+    gross = rows[0]["netPayable"] if rows else staff.monthly_salary
+
+    deduction, _rows = _recover_advances(staff, min(gross, _recoverable_now(staff)))
+    amount = gross - deduction
 
     payment = SalaryPayment.objects.create(
-        staff=staff, branch=staff.branch, month=month, amount=amount, requested_by=actor,
+        staff=staff, branch=staff.branch, month=month,
+        amount=amount, gross_amount=gross, advance_deduction=deduction,
+        requested_by=actor,
     )
 
     audit.record(
@@ -382,7 +400,13 @@ def request_salary_payment(*, actor, staff: StaffMember, month: str) -> SalaryPa
         action=AuditLog.Action.CREATE,
         target=payment,
         branch=staff.branch,
-        changes={"amount": str(amount), "month": month, "staff": staff.name},
+        changes={
+            "amount": str(amount),
+            "gross": str(gross),
+            "advanceDeduction": str(deduction),
+            "month": month,
+            "staff": staff.name,
+        },
     )
 
     from apps.accounts.models import User
@@ -452,30 +476,25 @@ def disburse_salary_payment(*, actor, payment: SalaryPayment, payment_method: st
     approval gate would be redundant and would understate payroll while it
     waited.
     """
-    from apps.expenses.models import Expense
-
     if payment.status != SalaryPayment.Status.APPROVED:
         raise SalaryPaymentError(
             "This salary payment must be approved before it can be paid.", code="not_approved"
         )
 
-    year = timezone.localdate().year
-    value = next_value("expense", year)
+    # The advances this month's salary pays back. Applied here, where the
+    # money actually changed hands, not at request time -- a request that is
+    # rejected or left pending must not have written off anybody's debt.
+    _apply_advance_recovery(payment)
 
-    expense = Expense.objects.create(
-        expense_code=f"EXP-{year}-{str(value).zfill(5)}",
-        category=Expense.Category.SALARIES,
-        amount=payment.amount,
-        description=f"Salary — {payment.staff.name} ({payment.month})",
-        paid_to=payment.staff.name,
-        payment_method=payment_method,
-        branch=payment.branch,
-        submitted_by=actor,
-        status=Expense.Status.APPROVED,
-        reviewed_by=payment.reviewed_by,
-        reviewed_at=timezone.now(),
-        review_note=f"Salary payment approved by {payment.reviewed_by.name if payment.reviewed_by else 'Admin'}.",
-    )
+    # Nothing left the till when advances took the whole month, so there is
+    # no expense to record -- the advance's own Expense already accounted for
+    # that money when it was handed over. Writing a zero-value expense here
+    # would put a meaningless line in the branch's books.
+    expense = None
+    if payment.amount > 0:
+        expense = _write_salary_expense(
+            actor=actor, payment=payment, payment_method=payment_method
+        )
 
     payment.status = SalaryPayment.Status.PAID
     payment.payment_method = payment_method
@@ -486,10 +505,17 @@ def disburse_salary_payment(*, actor, payment: SalaryPayment, payment_method: st
     audit.record(
         actor=actor,
         action=AuditLog.Action.CREATE,
-        target=expense,
+        # The payment itself when no expense was written -- an audit entry
+        # pointing at nothing would lose the event entirely.
+        target=expense or payment,
         branch=payment.branch,
         reason="Salary disbursement",
-        changes={"amount": str(payment.amount), "staff": payment.staff.name, "month": payment.month},
+        changes={
+            "amount": str(payment.amount),
+            "advanceRecovered": str(payment.advance_deduction),
+            "staff": payment.staff.name,
+            "month": payment.month,
+        },
     )
     return payment
 
@@ -534,3 +560,335 @@ def salary_payments_branch_summary(queryset, *, month: str | None = None) -> lis
             }
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Advances
+# ---------------------------------------------------------------------------
+
+
+class AdvanceError(Exception):
+    def __init__(self, message: str, *, code: str = "invalid"):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+#: An advance at one of these has been promised or handed over, so it is
+#: real money the branch is committed to. REJECTED ones are not.
+_LIVE_ADVANCE_STATUSES = [
+    StaffAdvance.Status.PENDING_APPROVAL,
+    StaffAdvance.Status.APPROVED,
+    StaffAdvance.Status.PAID,
+]
+
+
+def outstanding_advances(staff: StaffMember):
+    """
+    Paid advances this person has not finished repaying, oldest first.
+
+    Only PAID ones: an advance still waiting on Admin, or approved but not
+    yet handed over, is not money the person has, so taking it out of their
+    salary would be collecting a debt that does not exist yet.
+
+    Oldest first is the recovery order and the model's own ordering, so this
+    is a filter, not a re-sort.
+    """
+    return staff.advances.filter(
+        status=StaffAdvance.Status.PAID, recovered_amount__lt=F("amount")
+    )
+
+
+def outstanding_advance_total(staff: StaffMember) -> Decimal:
+    return sum(
+        (advance.outstanding for advance in outstanding_advances(staff)),
+        Decimal("0.00"),
+    )
+
+
+@transaction.atomic
+def request_advance(*, actor, staff: StaffMember, amount, reason: str) -> StaffAdvance:
+    """
+    A Manager's ask to pay one staff member early. Nothing moves until Admin
+    approves it, exactly as a salary request.
+
+    Several advances may be open at once -- a second emergency does not wait
+    on the first being repaid -- so there is no duplicate guard here. What
+    there is instead is a ceiling: see `_assert_advance_is_recoverable`.
+    """
+    value = Decimal(amount or 0)
+    if value <= 0:
+        raise AdvanceError("An advance must be more than zero.", code="invalid_amount")
+    if not (reason or "").strip():
+        raise AdvanceError(
+            "Say why the advance is being given.", code="reason_required"
+        )
+
+    _assert_advance_is_recoverable(staff, value)
+
+    advance = StaffAdvance.objects.create(
+        staff=staff, branch=staff.branch, amount=value,
+        reason=reason.strip(), requested_by=actor,
+    )
+
+    audit.record(
+        actor=actor,
+        action=AuditLog.Action.CREATE,
+        target=advance,
+        branch=staff.branch,
+        reason=advance.reason,
+        changes={"amount": str(value), "staff": staff.name},
+    )
+
+    from apps.accounts.models import User
+
+    notify_many(
+        recipients=User.objects.filter(role=User.Role.ADMIN),
+        title="New salary advance request",
+        message=(
+            f"{staff.branch.name} requested BDT {value} as an advance for "
+            f"{staff.name}."
+        ),
+        link="/admin/salary-approvals",
+    )
+    return advance
+
+
+def _assert_advance_is_recoverable(staff: StaffMember, amount: Decimal) -> None:
+    """
+    Refuse an advance the salary cannot take back.
+
+    Everything already owed, plus this, has to stay inside one month's pay.
+    Recovery comes out of a single month, and whatever will not fit is
+    carried -- so without a ceiling an advance could be granted that quietly
+    takes several months of someone's entire salary to clear, leaving them
+    nothing to live on in the meantime. Which is a decision for a person to
+    make deliberately, not something a form should wave through.
+    """
+    already = outstanding_advance_total(staff)
+    committed = StaffAdvance.objects.filter(
+        staff=staff, status__in=[
+            StaffAdvance.Status.PENDING_APPROVAL, StaffAdvance.Status.APPROVED,
+        ],
+    ).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+
+    ceiling = staff.monthly_salary
+    if already + committed + amount > ceiling:
+        remaining = max(ceiling - already - committed, Decimal("0.00"))
+        raise AdvanceError(
+            f"That is more than {staff.name}'s salary can recover. "
+            f"At most {remaining} can be advanced right now.",
+            code="exceeds_recoverable",
+        )
+
+
+@transaction.atomic
+def review_advance(
+    *, actor, advance: StaffAdvance, approve: bool, review_note: str = ""
+) -> StaffAdvance:
+    """Admin approves or rejects. Rejecting requires a reason, as a salary rejection does."""
+    if advance.status != StaffAdvance.Status.PENDING_APPROVAL:
+        raise AdvanceError(
+            f"This advance is already {advance.get_status_display().lower()}.",
+            code="no_change",
+        )
+    if not approve and not review_note.strip():
+        raise AdvanceError(
+            "A reason is required when rejecting an advance.", code="note_required"
+        )
+
+    advance.status = (
+        StaffAdvance.Status.APPROVED if approve else StaffAdvance.Status.REJECTED
+    )
+    advance.review_note = review_note
+    advance.reviewed_by = actor
+    advance.reviewed_at = timezone.now()
+    advance.save(update_fields=["status", "review_note", "reviewed_by", "reviewed_at"])
+
+    audit.record(
+        actor=actor,
+        action=AuditLog.Action.APPROVE if approve else AuditLog.Action.REJECT,
+        target=advance,
+        branch=advance.branch,
+        reason=review_note,
+        changes={
+            "status": {
+                "from": StaffAdvance.Status.PENDING_APPROVAL, "to": advance.status
+            }
+        },
+    )
+
+    if advance.requested_by_id:
+        if approve:
+            title = "Advance approved"
+            message = (
+                f"The advance for {advance.staff.name} was approved — "
+                "you can pay it out now."
+            )
+        else:
+            title = "Advance rejected"
+            message = (
+                f"The advance for {advance.staff.name} was rejected: {review_note}"
+            )
+        notify(
+            recipient=advance.requested_by, title=title, message=message,
+            link="/manager/staff/payroll",
+        )
+    return advance
+
+
+@transaction.atomic
+def disburse_advance(*, actor, advance: StaffAdvance, payment_method: str) -> StaffAdvance:
+    """
+    The Manager hands the money over. The Expense is written here, for the
+    same reason `disburse_salary_payment` writes it here: this is the moment
+    the money genuinely leaves.
+
+    Filed under SALARIES, because that is what it is -- salary, early. A
+    category of its own would split one month's payroll across two lines of
+    the expense report and make the total answer to nothing.
+    """
+    from apps.expenses.models import Expense
+
+    if advance.status != StaffAdvance.Status.APPROVED:
+        raise AdvanceError(
+            "This advance must be approved before it can be paid.",
+            code="not_approved",
+        )
+
+    year = timezone.localdate().year
+    value = next_value("expense", year)
+
+    expense = Expense.objects.create(
+        expense_code=f"EXP-{year}-{str(value).zfill(5)}",
+        category=Expense.Category.SALARIES,
+        amount=advance.amount,
+        description=f"Salary advance — {advance.staff.name}",
+        paid_to=advance.staff.name,
+        payment_method=payment_method,
+        branch=advance.branch,
+        submitted_by=actor,
+        status=Expense.Status.APPROVED,
+        reviewed_by=advance.reviewed_by,
+        reviewed_at=timezone.now(),
+        review_note=(
+            f"Advance approved by "
+            f"{advance.reviewed_by.name if advance.reviewed_by else 'Admin'}."
+        ),
+    )
+
+    advance.status = StaffAdvance.Status.PAID
+    advance.payment_method = payment_method
+    advance.paid_at = timezone.now()
+    advance.expense = expense
+    advance.save(update_fields=["status", "payment_method", "paid_at", "expense"])
+
+    audit.record(
+        actor=actor,
+        action=AuditLog.Action.CREATE,
+        target=expense,
+        branch=advance.branch,
+        reason="Salary advance disbursement",
+        changes={"amount": str(advance.amount), "staff": advance.staff.name},
+    )
+    return advance
+
+
+def _recover_advances(staff: StaffMember, payable: Decimal) -> tuple[Decimal, list]:
+    """
+    Take what this month's salary can off the outstanding advances.
+
+    Returns `(deducted, rows)` without writing anything — the caller decides
+    whether this is a preview or a real salary request.
+
+    Oldest first, and never past what is payable: a month can only give back
+    what it holds, and the remainder stays outstanding for the next one.
+    `Payment`/`Expense` cannot be negative and a staff member cannot be asked
+    to hand money back, so clamping here is the only correct shape.
+    """
+    budget = payable
+    deducted = Decimal("0.00")
+    rows = []
+
+    for advance in outstanding_advances(staff):
+        if budget <= 0:
+            break
+        take = min(advance.outstanding, budget)
+        budget -= take
+        deducted += take
+        rows.append({"advance": advance, "amount": take})
+
+    return deducted, rows
+
+
+def _recoverable_now(staff: StaffMember) -> Decimal:
+    """
+    Outstanding advances, less whatever other open salary requests have
+    already promised to take back.
+
+    Without this, requesting two months at once before paying either would
+    deduct the same advance twice: both requests would look at the same
+    untouched `recovered_amount`, because recovery is only written at
+    disbursement.
+    """
+    committed = SalaryPayment.objects.filter(
+        staff=staff,
+        status__in=[
+            SalaryPayment.Status.PENDING_APPROVAL, SalaryPayment.Status.APPROVED,
+        ],
+    ).aggregate(total=Sum("advance_deduction"))["total"] or Decimal("0.00")
+
+    return max(outstanding_advance_total(staff) - committed, Decimal("0.00"))
+
+
+def _apply_advance_recovery(payment: SalaryPayment) -> None:
+    """
+    Write the repayment this salary makes, oldest advance first.
+
+    Recomputed from the live advances rather than replayed from a stored
+    allocation: `advance_deduction` is the total that was agreed, and this
+    spreads exactly that much over whatever is still outstanding now. If an
+    advance was settled some other way in between, the rest simply lands on
+    the next one instead of failing.
+    """
+    budget = payment.advance_deduction
+    if budget <= 0:
+        return
+
+    touched = []
+    for advance in outstanding_advances(payment.staff).select_for_update():
+        if budget <= 0:
+            break
+        take = min(advance.outstanding, budget)
+        advance.recovered_amount += take
+        budget -= take
+        touched.append(advance)
+
+    if touched:
+        StaffAdvance.objects.bulk_update(touched, ["recovered_amount"])
+
+
+def _write_salary_expense(*, actor, payment: SalaryPayment, payment_method: str):
+    """The Expense a disbursed salary leaves behind. Split out so the zero case can skip it."""
+    from apps.expenses.models import Expense
+
+    year = timezone.localdate().year
+    value = next_value("expense", year)
+
+    return Expense.objects.create(
+        expense_code=f"EXP-{year}-{str(value).zfill(5)}",
+        category=Expense.Category.SALARIES,
+        amount=payment.amount,
+        description=f"Salary — {payment.staff.name} ({payment.month})",
+        paid_to=payment.staff.name,
+        payment_method=payment_method,
+        branch=payment.branch,
+        submitted_by=actor,
+        status=Expense.Status.APPROVED,
+        reviewed_by=payment.reviewed_by,
+        reviewed_at=timezone.now(),
+        review_note=(
+            f"Salary payment approved by "
+            f"{payment.reviewed_by.name if payment.reviewed_by else 'Admin'}."
+        ),
+    )

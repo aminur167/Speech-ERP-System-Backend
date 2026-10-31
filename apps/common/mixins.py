@@ -26,8 +26,16 @@ class BranchScopedQuerySetMixin:
 
     branch_field = "branch"
 
-    def get_queryset(self):
-        queryset = super().get_queryset()
+    def scope_to_branch(self, queryset):
+        """
+        The branch rule, applied to a queryset the viewset did not start from.
+
+        Split out of `get_queryset` so a view can scope a *different* manager
+        of the same model -- `all_objects` rather than the soft-delete default
+        -- without restating the Manager/Admin rule and risking the two
+        drifting apart. Reading history needs exactly that: see
+        `StaffMemberViewSet.today_attendance`.
+        """
         user = self.request.user
 
         if user.is_manager:
@@ -42,6 +50,9 @@ class BranchScopedQuerySetMixin:
         if requested_branch:
             return queryset.filter(**{f"{self.branch_field}_id": requested_branch})
         return queryset
+
+    def get_queryset(self):
+        return self.scope_to_branch(super().get_queryset())
 
     def get_effective_branch_id(self):
         """

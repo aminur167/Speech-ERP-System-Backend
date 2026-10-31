@@ -764,3 +764,54 @@ class TestAbsentByDefault:
         row = self.row_for(manager_client, monthly_patient)
 
         assert row["status"] == "informed_absence"
+
+
+class TestAPastSheetKeepsRemovedPatients:
+    """
+    `Patient` is soft-delete, so removing someone from the directory hid them
+    from the roster read as well — including on days they actually attended.
+    The `PatientAttendance` rows were never touched; nothing could see them,
+    so a past day's sheet came back quietly short of the people who were
+    there.
+
+    `roster_patient_ids` already decides who a day covers, from the
+    enrollment windows. Resolving those ids through the soft-delete manager
+    was second-guessing that decision with a list about *today*.
+    """
+
+    def test_a_removed_patient_is_still_on_the_day_they_attended(
+        self, manager_client, monthly_patient, patient_factory, manager, branch,
+        monthly_service,
+    ):
+        from apps.enrollments import services as enrollment_services
+
+        leaving = patient_factory(name="Shahana Begum")
+        enrollment_services.create_monthly_enrollment(
+            actor=manager, branch=branch, patient=leaving, service=monthly_service
+        )
+        leaving.delete()
+
+        body = manager_client.get(ROSTER_URL, {"kind": "monthly"}).json()
+
+        names = {row["patientName"] for row in body["results"]}
+        assert names == {"Nusrat Jahan", "Shahana Begum"}
+
+    def test_they_stay_out_of_the_patient_directory(
+        self, manager_client, patient_factory
+    ):
+        """The fix is about the attendance sheet, not about un-deleting anyone."""
+        gone = patient_factory(name="Shahana Begum")
+        gone.delete()
+
+        body = manager_client.get(reverse("patients:patient-list")).json()
+
+        listed = body["results"] if isinstance(body, dict) else body
+        assert all(row["name"] != "Shahana Begum" for row in listed)
+
+    @pytest.mark.isolation
+    def test_another_branch_is_still_out_of_scope(
+        self, other_manager_client, monthly_patient
+    ):
+        body = other_manager_client.get(ROSTER_URL, {"kind": "monthly"}).json()
+
+        assert body["count"] == 0

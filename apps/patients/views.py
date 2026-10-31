@@ -344,7 +344,17 @@ class PatientViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         roster_ids = attendance_services.roster_patient_ids(
             kind=kind, on=on, branch_id=branch_id
         )
-        queryset = self.get_queryset().filter(id__in=roster_ids).order_by("name")
+        # `all_objects`, not `get_queryset()`: a patient removed from the
+        # directory since still attended the days they attended. Scoping the
+        # sheet by today's visible list dropped them from their own history,
+        # leaving a past day's export quietly short of the people who were
+        # actually there. `roster_patient_ids` has already decided who the
+        # day covers -- this read only resolves those ids to names.
+        queryset = (
+            self.scope_to_branch(Patient.all_objects.select_related("branch"))
+            .filter(id__in=roster_ids)
+            .order_by("name")
+        )
 
         search = request.query_params.get("search", "").strip()
         if search:
