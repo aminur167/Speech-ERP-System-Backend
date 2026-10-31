@@ -1,8 +1,9 @@
 """Staff HR endpoints: roster, attendance, bonuses, and the monthly report."""
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from django.db.models import Count, Q, Sum
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -15,7 +16,13 @@ from apps.common.mixins import BranchScopedQuerySetMixin, manager_branch
 from apps.common.ordering import pending_first
 from apps.common.permissions import IsAdmin, IsManager
 from apps.staff import services
-from apps.staff.models import SalaryPayment, StaffAttendance, StaffBonus, StaffMember
+from apps.staff.models import (
+    SalaryPayment,
+    StaffAdvance,
+    StaffAttendance,
+    StaffBonus,
+    StaffMember,
+)
 from apps.staff.serializers import (
     AddBonusSerializer,
     DisburseSalaryPaymentSerializer,
@@ -30,9 +37,29 @@ from apps.staff.serializers import (
     StaffMemberWriteSerializer,
     StaffMonthlyReportRowSerializer,
     StaffSummarySerializer,
+    StaffAdvanceSerializer,
+    RequestAdvanceSerializer,
+    ReviewAdvanceSerializer,
+    DisburseAdvanceSerializer,
 )
 from apps.common import audit
 from apps.common.models import AuditLog
+
+
+def _parse_date(value):
+    """
+    `?date=YYYY-MM-DD`, or None when absent.
+
+    Refuses a malformed value rather than falling back to today, the same way
+    `_parse_month_param` does: a typo'd date that quietly returned the live
+    sheet would be read as that day's record.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        raise ValidationError({"date": ["Expected YYYY-MM-DD."]}) from None
 
 
 def _parse_month_param(request) -> tuple[int, int]:
@@ -138,6 +165,20 @@ class StaffMemberViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
             )
         return Response(StaffMemberSerializer(member).data)
 
+    def _roster_including_departed(self):
+        """
+        The branch's roster as it was, not as it is.
+
+        `get_queryset()` runs through StaffMember's soft-delete manager, so
+        anyone who has left the clinic is absent from it. That is right for
+        the roster screen and wrong for every backward-looking read: somebody
+        who worked a day still worked it, and their attendance row and that
+        month's salary are facts about the branch that do not stop being true
+        when they resign. Filtering history by today's active list silently
+        dropped them from both.
+        """
+        return self.scope_to_branch(StaffMember.all_objects.select_related("branch"))
+
     @action(detail=False, methods=["get"])
     def summary(self, request):
         queryset = self.get_queryset()
@@ -178,14 +219,43 @@ class StaffMemberViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
             ).data
         )
 
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                "date", str, description="YYYY-MM-DD. Defaults to today."
+            )
+        ]
+    )
     @action(detail=False, methods=["get"], url_path="today-attendance")
     def today_attendance(self, request):
-        """`{staffId: attendanceRecord}` for the requesting scope's roster — missing keys mean not yet marked today."""
-        queryset = self.get_queryset()
-        services.mark_no_show_absentees(queryset)
-        services.auto_check_out_stragglers(queryset)
-        today = timezone.localdate()
-        records = StaffAttendance.objects.filter(staff__in=queryset, date=today)
+        """
+        `{staffId: attendanceRecord}` for one day.
+
+        Today is the live sheet: the auto-close jobs run first, so a missing
+        key means "not checked in yet" and the screen offers the button.
+
+        Any other date is **history**, and two things change. The auto-close
+        jobs do not run -- marking someone absent for a day that is already
+        over, long after the fact, would invent a fact nobody observed. And
+        the roster includes staff who have since left: they worked that day,
+        so their row belongs on that day's sheet (see
+        `_roster_including_departed`). A missing key on a past date therefore
+        means "no record exists", which the screen shows as nobody at all
+        rather than as an absence.
+        """
+        on = _parse_date(request.query_params.get("date")) or timezone.localdate()
+        is_today = on == timezone.localdate()
+
+        if is_today:
+            roster = self.get_queryset()
+            services.mark_no_show_absentees(roster)
+            services.auto_check_out_stragglers(roster)
+        else:
+            roster = self._roster_including_departed()
+
+        records = StaffAttendance.objects.filter(staff__in=roster, date=on).select_related(
+            "staff"
+        )
         return Response(
             {str(record.staff_id): StaffAttendanceSerializer(record).data for record in records}
         )
@@ -196,7 +266,10 @@ class StaffMemberViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
         member = self.get_object()
         year, month = _parse_month_param(request)
         start, end = services.month_range(year, month)
-        records = member.attendance_records.filter(date__gte=start, date__lt=end)
+        # select_related: the serializer names the staff member on every row.
+        records = member.attendance_records.filter(
+            date__gte=start, date__lt=end
+        ).select_related("staff")
         return Response(StaffAttendanceSerializer(records, many=True).data)
 
     @action(detail=True, methods=["post"], url_path="check-in", permission_classes=[IsManager])
@@ -252,15 +325,55 @@ class StaffMemberViewSet(BranchScopedQuerySetMixin, viewsets.ModelViewSet):
             StaffBonusSerializer(bonus).data, status=status.HTTP_201_CREATED
         )
 
+    @action(detail=True, methods=["get"])
+    def advances(self, request, pk=None):
+        """Every advance for one staff member, oldest first — the recovery order."""
+        member = self.get_object()
+        records = member.advances.select_related(
+            "requested_by", "reviewed_by", "expense", "branch", "staff"
+        ).all()
+        return Response(StaffAdvanceSerializer(records, many=True).data)
+
+    @action(
+        detail=True, methods=["post"], url_path="request-advance",
+        permission_classes=[IsManager],
+    )
+    def request_advance(self, request, pk=None):
+        member = self.get_object()
+        serializer = RequestAdvanceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            advance = services.request_advance(
+                actor=request.user,
+                staff=member,
+                amount=serializer.validated_data["amount"],
+                reason=serializer.validated_data["reason"],
+            )
+        except services.AdvanceError as exc:
+            return Response(
+                {"detail": exc.message, "code": exc.code},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(
+            StaffAdvanceSerializer(advance).data, status=status.HTTP_201_CREATED
+        )
+
     @action(detail=False, methods=["get"], url_path="monthly-report")
     def monthly_report(self, request):
         """
         `?month=YYYY-MM` (defaults to the current month) — one row per staff
         member with salary, bonuses, and present/early-leave/absent/leave
         counts for that month. Powers the frontend's PDF export.
+
+        Includes staff who have since left the clinic. Somebody who worked
+        half of March is owed for half of March, and their bonuses and
+        attendance that month are part of the branch's payroll whatever their
+        status is by the time the report is pulled.
         """
         year, month = _parse_month_param(request)
-        rows = services.monthly_report(self.get_queryset(), year=year, month=month)
+        rows = services.monthly_report(
+            self._roster_including_departed(), year=year, month=month
+        )
         return Response(StaffMonthlyReportRowSerializer(rows, many=True).data)
 
     @action(
@@ -377,3 +490,72 @@ class SalaryPaymentViewSet(BranchScopedQuerySetMixin, viewsets.ReadOnlyModelView
             )
 
         return Response(SalaryPaymentSerializer(payment).data)
+
+
+class StaffAdvanceViewSet(BranchScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet):
+    """
+    /api/staff/advances/
+
+    The same shape as SalaryPaymentViewSet, and for the same reasons: an
+    advance is created on a staff member's own URL and moved forward by
+    `review`/`disburse`, never edited directly. Admin approves, Manager pays.
+    """
+
+    queryset = StaffAdvance.objects.select_related(
+        "staff", "branch", "requested_by", "reviewed_by", "expense"
+    ).all()
+    serializer_class = StaffAdvanceSerializer
+    filterset_fields = ["status", "staff"]
+    ordering_fields = ["created_at"]
+
+    def get_permissions(self):
+        if self.action == "review":
+            return [IsAdmin()]
+        if self.action == "disburse":
+            return [IsManager()]
+        return [IsAuthenticated()]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.action == "list":
+            queryset = pending_first(
+                queryset, pending=StaffAdvance.Status.PENDING_APPROVAL
+            )
+        return queryset
+
+    @action(detail=True, methods=["post"])
+    def review(self, request, pk=None):
+        advance = self.get_object()
+        serializer = ReviewAdvanceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            advance = services.review_advance(
+                actor=request.user,
+                advance=advance,
+                approve=serializer.validated_data["approve"],
+                review_note=serializer.validated_data.get("reviewNote", ""),
+            )
+        except services.AdvanceError as exc:
+            return Response(
+                {"detail": exc.message, "code": exc.code},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(StaffAdvanceSerializer(advance).data)
+
+    @action(detail=True, methods=["post"])
+    def disburse(self, request, pk=None):
+        advance = self.get_object()
+        serializer = DisburseAdvanceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            advance = services.disburse_advance(
+                actor=request.user,
+                advance=advance,
+                payment_method=serializer.validated_data["paymentMethod"],
+            )
+        except services.AdvanceError as exc:
+            return Response(
+                {"detail": exc.message, "code": exc.code},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(StaffAdvanceSerializer(advance).data)

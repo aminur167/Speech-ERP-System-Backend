@@ -159,8 +159,26 @@ class SalaryPayment(TimeStampedModel):
     # Snapshot at request time (base salary + that month's bonuses so far) —
     # never recomputed later, so approving this request always pays exactly
     # what the Manager asked for, even if a bonus is added afterwards.
+    #
+    # `amount` is what will actually be handed over: gross less whatever
+    # outstanding advances this month takes back. The two figures beside it
+    # are kept so a payslip can show the subtraction instead of a number
+    # nobody can reconcile — the same gross/deduction/net shape the bills use
+    # for discounts. `gross_amount` is null on requests made before advances
+    # existed; there was nothing to deduct, so `amount` was already gross.
+    # Zero is allowed, unlike a bonus or an advance: a month whose advances
+    # take all of it is a real payroll event that moved no money, the same
+    # shape a fully discounted bill has (enrollments: settled, no payment, no
+    # receipt). Refusing it instead would deadlock -- the salary could never
+    # be requested, so the advance could never be recovered.
     amount = models.DecimalField(
-        max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))]
+        max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal("0.00"))]
+    )
+    gross_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    advance_deduction = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
     )
 
     status = models.CharField(
@@ -197,3 +215,88 @@ class SalaryPayment(TimeStampedModel):
 
     def __str__(self):
         return f"{self.staff_id} {self.month} {self.status}"
+
+
+class StaffAdvance(TimeStampedModel):
+    """
+    Salary paid early, recovered from a later month.
+
+    Runs the same three steps as SalaryPayment — Manager asks, Admin
+    approves, Manager disburses — for the same reason: no money leaves a
+    branch on one person's say-so, and the Expense is written at the moment
+    it actually leaves, not when it is promised.
+
+    What makes this its own model rather than a `kind` on SalaryPayment is
+    `recovered_amount`. A salary request is settled the moment it is paid; an
+    advance stays open afterwards, shrinking across however many months it
+    takes to recover. Folding a running balance into a table whose rows are
+    finished when they reach PAID would have meant every read of a salary row
+    carrying a field that is meaningless for it.
+    """
+
+    class Status(models.TextChoices):
+        PENDING_APPROVAL = "pending_approval", "Pending Approval"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+        PAID = "paid", "Paid"
+
+    staff = models.ForeignKey(
+        StaffMember, on_delete=models.PROTECT, related_name="advances"
+    )
+    branch = models.ForeignKey(
+        "branches.Branch", on_delete=models.PROTECT, related_name="staff_advances"
+    )
+    amount = models.DecimalField(
+        max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))]
+    )
+    # Required, unlike a salary request's amount -- that one the server
+    # computes from the roster, this one somebody chose, and an unexplained
+    # early payment is exactly what an audit asks about.
+    reason = models.CharField(max_length=255)
+
+    # How much of `amount` later salary has already taken back. Advances are
+    # recovered oldest-first, so this is the only field that moves after the
+    # advance is paid; `amount` is what was handed over and never changes.
+    recovered_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
+    )
+
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.PENDING_APPROVAL,
+        db_index=True,
+    )
+
+    requested_by = models.ForeignKey(
+        "accounts.User", null=True, on_delete=models.SET_NULL,
+        related_name="staff_advances_requested",
+    )
+    review_note = models.TextField(blank=True)
+    reviewed_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="staff_advances_reviewed",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+
+    payment_method = models.CharField(max_length=20, blank=True)
+    paid_at = models.DateTimeField(null=True, blank=True)
+    expense = models.ForeignKey(
+        "expenses.Expense", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="staff_advance",
+    )
+
+    class Meta:
+        # Oldest first is the recovery order, so the default ordering is the
+        # order the deduction walks -- nothing has to re-sort to be correct.
+        ordering = ["created_at", "id"]
+        indexes = [
+            models.Index(fields=["branch", "status"]),
+            models.Index(fields=["staff", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.staff_id} advance {self.amount} ({self.status})"
+
+    @property
+    def outstanding(self) -> Decimal:
+        """What is still to come out of future salary."""
+        return self.amount - self.recovered_amount
